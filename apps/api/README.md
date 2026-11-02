@@ -11,7 +11,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Express app with health check, Vitest + Supertest | `apps/api` | Done (Day 1) |
 | Worker process with clean shutdown | `apps/worker` | Done (Day 1) |
 | Postgres, MongoDB, Redis, MinIO in Docker with healthchecks | `infra/docker-compose.yml` | Done (Day 1) |
-| Database schema, CHECK constraints, seed | `packages/db` | Planned (Day 2) |
+| Database schema, CHECK constraints, seed | `packages/db` | Done (Day 2) |
 | Env validation, structured errors, request IDs, readiness checks | `apps/api` | Planned (Day 3) |
 | Auth with rotating refresh tokens | `apps/api` | Planned (Day 4) |
 | Organizations and role-based access | `apps/api`, `packages/shared` | Planned (Day 5) |
@@ -60,9 +60,26 @@ apps/api/
   tsconfig.build.json    Build config (src only, output to dist/)
 apps/worker/
   src/index.ts           Starts, logs "worker started", exits cleanly on SIGTERM/SIGINT
-packages/shared|db|mongo/
-  src/index.ts           Empty for now; filled from Days 2–3
+packages/db/
+  prisma/schema.prisma   All Postgres tables, enums, relations and indexes (snake_case via @map/@@map)
+  prisma/migrations/     *_init (generated from the schema) and *_check_constraints (hand-written SQL)
+  prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
+  src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
+  src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/generated/         Generated Prisma client (git-ignored, rebuilt by `prisma generate` on install)
+  test/                  constraints.test.ts, seed.test.ts (need a running Postgres)
+packages/shared|mongo/
+  src/index.ts           Empty for now; filled from Day 3
 ```
+
+### Postgres schema (`packages/db`)
+
+- **Prisma 7** with the `prisma-client` generator and `@prisma/adapter-pg`. Prisma 7 no longer ships a Rust query engine; it talks to Postgres through the standard `pg` driver, which is why the adapter is a dependency.
+- **IDs** default to `gen_random_uuid()` in Postgres itself, so rows inserted by raw SQL (the booking path) get IDs the same way as rows created through Prisma.
+- **CHECK constraints** (`*_check_constraints/migration.sql`): `ticket_tiers.sold_count` between 0 and `capacity`, `capacity > 0`, `price_paise >= 0`, `per_user_limit` 1–10, `events.ends_at > starts_at`, plus `orders.amount_paise >= 0` and `order_items.qty > 0`. Prisma can't express CHECKs, so they live in SQL and Prisma's drift check simply ignores them.
+- **Unique keys that make retries safe:** `payments.razorpay_payment_id`, `orders.razorpay_order_id`, `tickets(order_id, seq)`, `tickets.code`.
+- **Delete rules:** children that mean nothing alone cascade (tiers with their event, order items with their order, memberships). Orders, payments and tickets never cascade, so deleting an event or tier that has sales fails instead of silently erasing money records.
+- **Seed** (`src/seed.ts`): every write is an `upsert` with an empty `update`, so a second run inserts nothing and never resets live counters like `sold_count`. Seed users get a placeholder password hash and can't log in until Day 4 adds bcrypt.
 
 Planned layout inside `apps/api/src` (Day 3): `config/`, `lib/`, `middleware/`, `modules/<feature>/{routes,controller,service,repository,schemas}.ts`, `sockets/`. Controllers handle HTTP only, services hold business rules, and repositories are the only code that touches the database.
 
@@ -138,6 +155,8 @@ From the repo root (see the [project README](../../README.md#getting-started) fo
 
 ```bash
 pnpm infra:up                          # Postgres, MongoDB, Redis, MinIO
+pnpm db:migrate && pnpm db:seed        # tables, CHECK constraints, demo data
+pnpm --filter @festpass/db test        # constraint + seed tests (need Postgres)
 pnpm dev                               # API on :4000, worker, web
 pnpm --filter @festpass/api dev        # only the API
 pnpm --filter @festpass/worker dev     # only the worker
@@ -145,12 +164,13 @@ pnpm --filter @festpass/api test       # API tests
 curl localhost:4000/api/v1/health
 ```
 
-Tests use Vitest and Supertest. `test/health.test.ts` checks the health route and that unknown routes return 404, without opening a port.
+Tests use Vitest and Supertest. `test/health.test.ts` checks the health route and that unknown routes return 404, without opening a port. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). Today the API reads only `API_PORT` (default 4000), loaded from the root `.env` with Node's `--env-file-if-exists`. From Day 3 every variable is validated at startup and the process refuses to start if any is missing or invalid.
+See the full table in the [project README](../../README.md#environment-variables). `packages/db` reads `DATABASE_URL` (Prisma CLI, seed and tests load the root `.env` themselves). Today the API reads only `API_PORT` (default 4000), loaded from the root `.env` with Node's `--env-file-if-exists`. From Day 3 every variable is validated at startup and the process refuses to start if any is missing or invalid.
 
 ## Change history
 
 - **Day 1:** Express app with `GET /api/v1/health` and its test; worker entry point with clean shutdown; Docker Compose for the four data services.
+- **Day 2:** Prisma 7 schema for all Postgres tables in `packages/db`, CHECK-constraint migration, hot-path indexes, idempotent seed, `db:*` scripts, constraint and seed tests.
