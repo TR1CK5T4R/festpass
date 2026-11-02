@@ -5,7 +5,9 @@ import tseslint from 'typescript-eslint';
 
 // One config for the whole monorepo, so every package follows the same rules.
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/.next/**', '**/coverage/**', '**/next-env.d.ts'] },
+  {
+    ignores: ['**/dist/**', '**/.next/**', '**/coverage/**', '**/next-env.d.ts', '**/generated/**'],
+  },
   js.configs.recommended,
   tseslint.configs.recommended,
   {
