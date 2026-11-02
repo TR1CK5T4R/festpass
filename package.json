@@ -14,7 +14,11 @@
     "test": "pnpm -r test",
     "format": "prettier --write .",
     "infra:up": "docker compose --project-directory . -f infra/docker-compose.yml up -d --wait",
-    "infra:down": "docker compose --project-directory . -f infra/docker-compose.yml down"
+    "infra:down": "docker compose --project-directory . -f infra/docker-compose.yml down",
+    "db:migrate": "pnpm --filter @festpass/db exec prisma migrate dev",
+    "db:reset": "pnpm --filter @festpass/db exec prisma migrate reset --force",
+    "db:seed": "pnpm --filter @festpass/db exec prisma db seed",
+    "db:studio": "pnpm --filter @festpass/db exec prisma studio"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
