@@ -1,6 +1,7 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { prisma } from '../src/index.js';
 import { seed } from '../src/seed.js';
+import { truncateAll } from '../src/testing.js';
 
 const countAll = async () => ({
   users: await prisma.user.count(),
@@ -13,15 +14,26 @@ const countAll = async () => ({
   booths: await prisma.booth.count(),
 });
 
+beforeEach(() => truncateAll(prisma));
 afterAll(() => prisma.$disconnect());
 
 describe('seed', () => {
   it('creates the demo data and does not duplicate it when run twice', async () => {
-    await seed(prisma);
-    const afterFirst = await countAll();
-    await seed(prisma);
+    const expected = {
+      users: 4,
+      orgs: 1,
+      members: 2,
+      events: 1,
+      tiers: 3,
+      sponsors: 1,
+      sponsorMembers: 1,
+      booths: 1,
+    };
 
-    expect(await countAll()).toEqual(afterFirst);
+    await seed(prisma);
+    expect(await countAll()).toEqual(expected);
+    await seed(prisma);
+    expect(await countAll()).toEqual(expected);
 
     const event = await prisma.event.findUniqueOrThrow({
       where: { slug: 'mait-alumni-meet-2026' },
@@ -33,5 +45,13 @@ describe('seed', () => {
     expect(event.status).toBe('PUBLISHED');
     expect(event.tiers.map((t) => t.name)).toEqual(['Early bird', 'Regular', 'VIP']);
     expect(event.sponsors[0]?.booths).toHaveLength(1);
+  });
+});
+
+describe('truncateAll', () => {
+  it('refuses to run against a database that is not *_test', async () => {
+    const fake = { $queryRaw: async () => [{ name: 'festpass' }] } as unknown as typeof prisma;
+
+    await expect(truncateAll(fake)).rejects.toThrow(/refusing to truncate "festpass"/);
   });
 });
