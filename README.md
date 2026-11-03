@@ -90,9 +90,9 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | Layer | Technology |
 |---|---|
 | Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3 |
-| API | Node.js 22, Express 5.3, Socket.IO, Zod, pino |
+| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, Socket.IO |
 | Jobs | BullMQ worker |
-| Data | PostgreSQL (Prisma + raw SQL), MongoDB (Mongoose), Redis |
+| Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
 | Storage and email | S3-compatible storage (MinIO / Cloudflare R2), SendGrid dynamic templates |
 | Payments | Razorpay (test mode) |
 | Testing | Vitest 5.0, Supertest 7.3, k6 |
@@ -208,7 +208,9 @@ pnpm db:seed     # demo org, users, a published event with three tiers, a sponso
 pnpm dev        # web on :3000, API on :4000, worker in the background
 ```
 
-Check it: open http://localhost:3000, and `curl http://localhost:4000/api/v1/health` should return `{"status":"ok"}`.
+Check it: open http://localhost:3000, and `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
+
+If the MinIO image fails to pull (MinIO stopped publishing free images in 2025), start the other three services with `docker compose --project-directory . -f infra/docker-compose.yml up -d --wait postgres mongo redis`. Nothing uses MinIO until banner uploads (Day 8).
 
 The containers use host ports 5433, 27018 and 6380 instead of the defaults, so they don't clash with a Postgres, MongoDB or Redis already installed on your machine. Change them in `.env` if needed. The MinIO console is at http://localhost:9001.
 
@@ -217,12 +219,15 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | Variable | Used by | Description |
 |---|---|---|
 | `API_PORT` | api | Port the API listens on (default 4000) |
+| `NODE_ENV` | api | `development`, `test` or `production` (default `development`). Only `development` shows error messages and stacks in responses |
+| `LOG_LEVEL` | api | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent` (default `info`) |
 | `POSTGRES_PORT` | docker compose | Host port for Postgres (default 5433) |
-| `DATABASE_URL` | db (Prisma CLI, seed, tests), api, worker | Postgres connection string |
+| `DATABASE_URL` | api, db (Prisma CLI, seed) | Postgres connection string |
+| `DATABASE_URL_TEST` | tests (`packages/db`, `apps/api`) | Separate Postgres database for tests; must end in `_test`, because tests truncate every table |
 | `MONGO_PORT` | docker compose | Host port for MongoDB (default 27018) |
-| `MONGODB_URI` | api, worker (Day 3+) | MongoDB connection string |
+| `MONGODB_URI` | api | MongoDB connection string |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
-| `REDIS_URL` | api, worker (Day 3+) | Redis connection string |
+| `REDIS_URL` | api (worker from Day 13) | Redis connection string |
 | `MINIO_API_PORT` | docker compose | Host port for the MinIO S3 API (default 9000) |
 | `MINIO_CONSOLE_PORT` | docker compose | Host port for the MinIO web console (default 9001) |
 | `MINIO_ROOT_USER` | docker compose | MinIO admin user (local only) |
@@ -248,21 +253,36 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 
 ## API reference
 
-_Grows as endpoints are added._
+### Conventions
+
+- **Base path:** every endpoint lives under `/api/v1` and speaks JSON.
+- **Errors** always have one shape, produced by a single error handler (`apps/api/src/middleware/error-handler.ts`):
+  ```json
+  { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
+  ```
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), conflict codes such as `SOLD_OUT` (409), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
+- **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
+- **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
+- **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20; schema `paginationQuerySchema` in `packages/shared`). First list endpoint: Day 6.
+
+### Endpoints
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/v1/health` | none | Returns `{ "status": "ok" }` when the process is up |
+| GET | `/api/v1/health/live` | none | Liveness: `200 { "status": "ok" }` whenever the process can answer. Checks no dependencies |
+| GET | `/api/v1/health/ready` | none | Readiness: pings Postgres, Redis and MongoDB in parallel (1 s timeout each). `200` with `{ "status": "ok", "checks": { "postgres": "up", ... } }`, or `503` with `"status": "unavailable"` and the down dependency marked `"down"` |
 
 ## Testing
 
 _How to run the tests and what the key tests prove._
 
-Run `pnpm test`. The `packages/db` tests need Postgres running (`pnpm infra:up && pnpm db:migrate`), because constraints can only be proven by the real database.
+Run `pnpm test`. The `packages/db` tests need Postgres running, because constraints can only be proven by the real database. They use a separate database (`DATABASE_URL_TEST`, default `festpass_test`): Vitest's global setup creates and migrates it automatically, and `truncateAll` (`packages/db/src/testing.ts`) empties it between tests. `truncateAll` refuses to run on any database whose name doesn't end in `_test`, so tests can never wipe dev data.
 
-- `apps/api/test/health.test.ts`: the health endpoint and 404 for unknown routes, using Supertest without opening a port.
-- `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL. Creates and deletes its own event.
-- `packages/db/test/seed.test.ts`: running the seed twice leaves every table's row count unchanged.
+- `apps/api/test/errors.test.ts`: a bad body or query returns 400 with every invalid field and the request ID; unknown routes return 404 in the standard shape; invalid JSON returns 400; an `AppError` keeps its status and code; an unexpected error returns a generic 500 with no internal message or stack; incoming `X-Request-Id` values are reused only when safe.
+- `apps/api/test/health.test.ts`: liveness; readiness returns 200 when all checks pass, and 503 naming the dependency when a check fails or hangs (checks are injected fakes, so no real outage is needed).
+- `apps/api/test/env.test.ts`: env parsing applies defaults, coerces numbers and lists every invalid variable in one message.
+- `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL.
+- `packages/db/test/seed.test.ts`: on an empty database the seed creates exactly the demo rows, and a second run changes nothing; `truncateAll` refuses a non-`_test` database.
 
 ## Load test results
 
@@ -279,7 +299,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 <!-- TRACKER:START -->
 - [x] Day 01 (Fri 30 Oct): Monorepo and local infrastructure
 - [x] Day 02 (Sat 31 Oct): Database schema v1
-- [ ] Day 03 (Sun 01 Nov): API foundation
+- [x] Day 03 (Sun 01 Nov): API foundation
 - [ ] Day 04 (Mon 02 Nov): Authentication with refresh-token rotation
 - [ ] Day 05 (Tue 03 Nov): Organizations and role-based access
 - [ ] Day 06 (Wed 04 Nov): Events and ticket tiers API
@@ -333,6 +353,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** capacity is enforced by a Postgres CHECK constraint, not just application code, because the booking path uses raw SQL and one buggy `UPDATE` must not be able to oversell; the database rejects it no matter which code path wrote it.
 **Verify:** `pnpm infra:up && pnpm db:reset && pnpm db:seed && pnpm test`.
 **Next:** Day 3 adds env validation, structured errors, request IDs and a readiness check that pings Postgres through this client.
+
+### Day 03: API foundation (2026-11-01)
+**Built:**
+- `apps/api/src` split into `config/`, `lib/`, `middleware/` and `modules/health/` (routes, controller, service, repository), with env validated by Zod at startup.
+- pino + pino-http logging with a request ID per request (reused from `X-Request-Id` when safe), an `AppError` hierarchy and one error handler that returns the standard error shape.
+- A `validate({ params, query, body })` middleware, `/api/v1/health/live` and `/api/v1/health/ready` (Postgres, Redis, Mongo, 503 if any is down), and graceful shutdown on SIGTERM/SIGINT.
+- A separate test database that Vitest migrates automatically, plus a `truncateAll` helper that only runs on `*_test` databases.
+
+**Key decision:** readiness checks are passed into `createApp()` instead of being imported directly, so tests simulate a dead Redis or a hanging Mongo with a fake function instead of stopping containers; the real checks run in parallel with a 1 s timeout each, because a hung dependency is as bad as a dead one.
+**Verify:** `pnpm test`, then `pnpm dev` and `curl -i localhost:4000/api/v1/nope -H 'X-Request-Id: demo-1'` (404 in the standard shape with `requestId: "demo-1"`) and `curl localhost:4000/api/v1/health/ready`.
+**Next:** Day 4 adds register, login, refresh-token rotation with reuse detection, logout and `/me` on top of this error and validation layer.
 
 <!-- BUILD-LOG:END -->
 

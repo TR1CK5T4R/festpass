@@ -12,7 +12,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Worker process with clean shutdown | `apps/worker` | Done (Day 1) |
 | Postgres, MongoDB, Redis, MinIO in Docker with healthchecks | `infra/docker-compose.yml` | Done (Day 1) |
 | Database schema, CHECK constraints, seed | `packages/db` | Done (Day 2) |
-| Env validation, structured errors, request IDs, readiness checks | `apps/api` | Planned (Day 3) |
+| Env validation, structured errors, request IDs, readiness checks | `apps/api` | Done (Day 3) |
 | Auth with rotating refresh tokens | `apps/api` | Planned (Day 4) |
 | Organizations and role-based access | `apps/api`, `packages/shared` | Planned (Day 5) |
 | Events and ticket tiers | `apps/api` | Planned (Day 6) |
@@ -53,11 +53,20 @@ Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 
 
 ```
 apps/api/
-  src/app.ts             Builds the Express app (no listening), so tests can import it
-  src/server.ts          Starts the app on API_PORT
-  test/health.test.ts    Supertest test for GET /api/v1/health
-  tsconfig.json          Typecheck config (src + test)
-  tsconfig.build.json    Build config (src only, output to dist/)
+  src/config/env.ts                 Zod schema for every env var; exits with a readable list if any is invalid
+  src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, Set-Cookie)
+  src/lib/errors.ts                 AppError + NotFound, Validation, Conflict, Forbidden, Unauthorized, RateLimited
+  src/lib/redis.ts                  ioredis client (lazy connect, auto-reconnect)
+  src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
+  src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
+  src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
+  src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
+  src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
+  src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
+  test/                             errors, health and env tests (Supertest, no open port)
+  vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database
+  tsconfig.json                     Typecheck config (src + test)
+  tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
 apps/worker/
   src/index.ts           Starts, logs "worker started", exits cleanly on SIGTERM/SIGINT
 packages/db/
@@ -66,11 +75,16 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/testing.ts         @festpass/db/testing: migrateTestDatabase(), truncateAll() (only on *_test databases)
   src/generated/         Generated Prisma client (git-ignored, rebuilt by `prisma generate` on install)
-  test/                  constraints.test.ts, seed.test.ts (need a running Postgres)
-packages/shared|mongo/
-  src/index.ts           Empty for now; filled from Day 3
+  test/                  global-setup.ts (migrates the test DB), constraints.test.ts, seed.test.ts
+packages/shared/
+  src/index.ts           paginationQuerySchema, idParamsSchema, ApiErrorBody type
+packages/mongo/
+  src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
+
+**How packages are imported:** each package's `exports` has a `development` condition pointing at `src/index.ts`. The API's dev server (`tsx --conditions=development`), Vitest and TypeScript (`customConditions` in `tsconfig.base.json`) all use it, so a change in `packages/db` is picked up without a build step. `pnpm build` and `node dist/server.js` ignore it and use each package's compiled `dist/`.
 
 ### Postgres schema (`packages/db`)
 
@@ -81,7 +95,20 @@ packages/shared|mongo/
 - **Delete rules:** children that mean nothing alone cascade (tiers with their event, order items with their order, memberships). Orders, payments and tickets never cascade, so deleting an event or tier that has sales fails instead of silently erasing money records.
 - **Seed** (`src/seed.ts`): every write is an `upsert` with an empty `update`, so a second run inserts nothing and never resets live counters like `sold_count`. Seed users get a placeholder password hash and can't log in until Day 4 adds bcrypt.
 
-Planned layout inside `apps/api/src` (Day 3): `config/`, `lib/`, `middleware/`, `modules/<feature>/{routes,controller,service,repository,schemas}.ts`, `sockets/`. Controllers handle HTTP only, services hold business rules, and repositories are the only code that touches the database.
+### Request pipeline (`apps/api/src/app.ts`)
+
+1. **`requestLogger`** (pino-http) gives the request an ID: the incoming `X-Request-Id` if it is 1–64 characters of `[A-Za-z0-9_-]`, otherwise a new UUID. The ID goes into `req.id`, every log line (`req.log`) and the `X-Request-Id` response header. Responses are logged at `warn` for 4xx and `error` for 5xx.
+2. **`express.json()`** parses bodies (100 kB limit).
+3. **Feature routers** under `/api/v1`. Each feature is `modules/<feature>/{routes,controller,service,repository}.ts`: controllers handle HTTP only, services hold business rules, and repositories are the only code that touches a data store. `validate({ params, query, body })` runs before a controller, reports every invalid field at once and replaces the raw values with the parsed ones.
+4. **`notFound`** turns anything unmatched into a `NotFoundError`.
+5. **`errorHandler`** is the only place that writes error responses. `AppError` subclasses keep their status, code and details; body-parser errors become `INVALID_JSON` or `BAD_REQUEST`; anything else is logged with its stack and returned as a generic `INTERNAL_ERROR` 500 (message and stack only when `NODE_ENV=development`). Express 5 forwards rejected promises from async handlers here, so handlers need no try/catch.
+
+### Health and shutdown
+
+- **Liveness** (`/health/live`) answers whenever the process can serve HTTP, and checks nothing else, so a database outage never makes the platform restart a healthy API process.
+- **Readiness** (`/health/ready`) runs `SELECT 1` on Postgres, `PING` on Redis and an admin `ping` on Mongo in parallel, each with a 1 s timeout. Any failure returns 503 so the load balancer stops sending traffic; the reasons go to the logs, not to the client.
+- **Startup:** env is validated first, then Mongo is connected (fail fast if it can't be). Prisma and ioredis connect on first use and reconnect by themselves.
+- **Shutdown** on SIGTERM/SIGINT: `server.close()` stops new connections and waits for in-flight requests, then Prisma, Redis and Mongo are closed, then the process exits 0. If that takes more than 10 s it exits 1.
 
 ## Core flows
 
@@ -147,7 +174,10 @@ _Planned (Days 17–19)._
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/api/v1/health` | none | Returns `{ "status": "ok" }` when the process is up |
+| GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
+| GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
+
+Error shape, request IDs, validation and pagination conventions: see the [project README](../../README.md#conventions).
 
 ## Running and testing
 
@@ -157,20 +187,22 @@ From the repo root (see the [project README](../../README.md#getting-started) fo
 pnpm infra:up                          # Postgres, MongoDB, Redis, MinIO
 pnpm db:migrate && pnpm db:seed        # tables, CHECK constraints, demo data
 pnpm --filter @festpass/db test        # constraint + seed tests (need Postgres)
+curl localhost:4000/api/v1/health/ready
+curl -i localhost:4000/api/v1/nope -H 'X-Request-Id: demo-1'
 pnpm dev                               # API on :4000, worker, web
 pnpm --filter @festpass/api dev        # only the API
 pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
-curl localhost:4000/api/v1/health
 ```
 
-Tests use Vitest and Supertest. `test/health.test.ts` checks the health route and that unknown routes return 404, without opening a port. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). `packages/db` reads `DATABASE_URL` (Prisma CLI, seed and tests load the root `.env` themselves). Today the API reads only `API_PORT` (default 4000), loaded from the root `.env` with Node's `--env-file-if-exists`. From Day 3 every variable is validated at startup and the process refuses to start if any is missing or invalid.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL` and `MONGODB_URI`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
 - **Day 1:** Express app with `GET /api/v1/health` and its test; worker entry point with clean shutdown; Docker Compose for the four data services.
 - **Day 2:** Prisma 7 schema for all Postgres tables in `packages/db`, CHECK-constraint migration, hot-path indexes, idempotent seed, `db:*` scripts, constraint and seed tests.
+- **Day 3:** `apps/api/src` split into config, lib, middleware and modules; Zod env validation; pino-http request IDs; `AppError` hierarchy and one error handler; `validate()` middleware; `/health/live` and `/health/ready`; graceful shutdown; Mongo connection in `packages/mongo`; shared pagination schema; separate auto-migrated test database with `truncateAll`.
