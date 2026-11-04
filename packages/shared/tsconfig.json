@@ -1,6 +1,8 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    // This code runs in the browser too, so it may only use APIs both have (e.g. TextEncoder).
+    "lib": ["ES2023", "DOM"],
     "rootDir": "src",
     "outDir": "dist",
     "declaration": true

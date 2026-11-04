@@ -20,8 +20,8 @@ export class ValidationError extends AppError {
 }
 
 export class UnauthorizedError extends AppError {
-  constructor(message = 'Authentication required') {
-    super(401, 'UNAUTHORIZED', message);
+  constructor(message = 'Authentication required', code = 'UNAUTHORIZED') {
+    super(401, code, message);
   }
 }
 

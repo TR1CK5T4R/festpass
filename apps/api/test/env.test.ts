@@ -5,6 +5,7 @@ const valid = {
   DATABASE_URL: 'postgresql://festpass:festpass@localhost:5433/festpass',
   REDIS_URL: 'redis://localhost:6380',
   MONGODB_URI: 'mongodb://localhost:27018/festpass',
+  JWT_ACCESS_SECRET: 'x'.repeat(32),
 };
 
 describe('parseEnv', () => {
@@ -15,6 +16,8 @@ describe('parseEnv', () => {
       API_PORT: 4100,
       NODE_ENV: 'development',
       LOG_LEVEL: 'info',
+      ACCESS_TOKEN_TTL_SECONDS: 900,
+      REFRESH_TOKEN_TTL_DAYS: 7,
     });
   });
 

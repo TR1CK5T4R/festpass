@@ -7,3 +7,5 @@ allowBuilds:
   # Prisma downloads its schema engine (used by migrate) in a postinstall script.
   '@prisma/engines': true
   prisma: true
+  # bcrypt is a native module; its install script loads a prebuilt binary (or compiles one).
+  bcrypt: true

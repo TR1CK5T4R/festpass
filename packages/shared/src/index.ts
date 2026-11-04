@@ -21,3 +21,5 @@ export interface ApiErrorBody {
     requestId: string;
   };
 }
+
+export * from './auth.js';
