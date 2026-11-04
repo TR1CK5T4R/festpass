@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 
-// Models (scan events, copilot conversations) arrive on Days 19 and 27; this is the shared connection.
+// The shared Mongo connection. Models (scan events, copilot conversations) are added as those features land.
 
 export async function connectMongo(uri: string): Promise<void> {
   // Fail after 5 s instead of Mongoose's default 30 s, so a bad URI is reported quickly at startup.

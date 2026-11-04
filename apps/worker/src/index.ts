@@ -1,4 +1,4 @@
-// BullMQ consumers (hold expiry, tickets, emails) are added from Day 13.
+// BullMQ consumers (hold expiry, tickets, emails) are not written yet.
 // Until then this timer only keeps the process alive so shutdown handling can be tested.
 const keepAlive = setInterval(() => {}, 60_000);
 
