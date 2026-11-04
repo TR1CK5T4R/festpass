@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { prisma } from '../src/index.js';
-import { seed } from '../src/seed.js';
+import bcrypt from 'bcrypt';
+import { SEED_PASSWORD, seed } from '../src/seed.js';
 import { truncateAll } from '../src/testing.js';
 
 const countAll = async () => ({
@@ -53,5 +54,16 @@ describe('truncateAll', () => {
     const fake = { $queryRaw: async () => [{ name: 'festpass' }] } as unknown as typeof prisma;
 
     await expect(truncateAll(fake)).rejects.toThrow(/refusing to truncate "festpass"/);
+  });
+});
+
+describe('seed users', () => {
+  it('can log in with the documented demo password', async () => {
+    await seed(prisma);
+    const user = await prisma.user.findUniqueOrThrow({
+      where: { email: 'organizer@festpass.dev' },
+    });
+
+    expect(await bcrypt.compare(SEED_PASSWORD, user.passwordHash)).toBe(true);
   });
 });

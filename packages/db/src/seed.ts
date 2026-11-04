@@ -1,12 +1,17 @@
 import { pathToFileURL } from 'node:url';
+import bcrypt from 'bcrypt';
 import { prisma, type PrismaClient } from './index.js';
 
-// shortcut: seed users get a hash that matches no password, so they can't log in until Day 4 adds bcrypt here.
-const NO_LOGIN_HASH = '!seed-user-no-password';
+/** Every seed account logs in with this password. Local demo data only. */
+export const SEED_PASSWORD = 'festpass-dev';
 
-// Every write is an upsert on a unique key with an empty update, so running the seed again
-// never duplicates rows and never resets live data such as sold_count.
+// Every write is an upsert on a unique key, so running the seed again never duplicates rows.
+// Updates are empty (live data such as sold_count is never reset), except that seed users get
+// their demo password back.
 export async function seed(db: PrismaClient): Promise<void> {
+  // Same cost as the API (apps/api/src/modules/auth/service.ts), hashed once for all seed users.
+  const passwordHash = await bcrypt.hash(SEED_PASSWORD, 12);
+
   const org = await db.organization.upsert({
     where: { slug: 'mait-alumni-cell' },
     update: {},
@@ -16,8 +21,8 @@ export async function seed(db: PrismaClient): Promise<void> {
   const user = (email: string, name: string) =>
     db.user.upsert({
       where: { email },
-      update: {},
-      create: { email, name, passwordHash: NO_LOGIN_HASH, college: 'MAIT' },
+      update: { passwordHash },
+      create: { email, name, passwordHash, college: 'MAIT' },
     });
   const organizer = await user('organizer@festpass.dev', 'Olivia Organizer');
   const scanner = await user('scanner@festpass.dev', 'Sam Scanner');
