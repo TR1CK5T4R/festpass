@@ -13,7 +13,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Postgres, MongoDB, Redis, MinIO in Docker with healthchecks | `infra/docker-compose.yml` | Done (Day 1) |
 | Database schema, CHECK constraints, seed | `packages/db` | Done (Day 2) |
 | Env validation, structured errors, request IDs, readiness checks | `apps/api` | Done (Day 3) |
-| Auth with rotating refresh tokens | `apps/api` | Planned (Day 4) |
+| Auth with rotating refresh tokens | `apps/api` | Done (Day 4) |
 | Organizations and role-based access | `apps/api`, `packages/shared` | Planned (Day 5) |
 | Events and ticket tiers | `apps/api` | Planned (Day 6) |
 | Pre-signed banner uploads | `apps/api` | Planned (Day 8) |
@@ -60,11 +60,13 @@ apps/api/
   src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
   src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
+  src/middleware/require-auth.ts    Verifies the Bearer access token and sets req.user = { id }
+  src/modules/auth/                 routes, controller (cookie handling), service (passwords, tokens, rotation), repository
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
-  test/                             errors, health and env tests (Supertest, no open port)
-  vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database
+  test/                             auth, errors, health and env tests (Supertest, no open port); global-setup.ts migrates the test DB
+  vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
   tsconfig.json                     Typecheck config (src + test)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
 apps/worker/
@@ -80,6 +82,7 @@ packages/db/
   test/                  global-setup.ts (migrates the test DB), constraints.test.ts, seed.test.ts
 packages/shared/
   src/index.ts           paginationQuerySchema, idParamsSchema, ApiErrorBody type
+  src/auth.ts            registerSchema, loginSchema, PublicUser and AuthResponse types
 packages/mongo/
   src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
@@ -93,7 +96,7 @@ packages/mongo/
 - **CHECK constraints** (`*_check_constraints/migration.sql`): `ticket_tiers.sold_count` between 0 and `capacity`, `capacity > 0`, `price_paise >= 0`, `per_user_limit` 1–10, `events.ends_at > starts_at`, plus `orders.amount_paise >= 0` and `order_items.qty > 0`. Prisma can't express CHECKs, so they live in SQL and Prisma's drift check simply ignores them.
 - **Unique keys that make retries safe:** `payments.razorpay_payment_id`, `orders.razorpay_order_id`, `tickets(order_id, seq)`, `tickets.code`.
 - **Delete rules:** children that mean nothing alone cascade (tiers with their event, order items with their order, memberships). Orders, payments and tickets never cascade, so deleting an event or tier that has sales fails instead of silently erasing money records.
-- **Seed** (`src/seed.ts`): every write is an `upsert` with an empty `update`, so a second run inserts nothing and never resets live counters like `sold_count`. Seed users get a placeholder password hash and can't log in until Day 4 adds bcrypt.
+- **Seed** (`src/seed.ts`): every write is an `upsert`, so a second run inserts nothing. Updates are empty, so live counters like `sold_count` are never reset; the one exception is that seed users get their demo password (`festpass-dev`, bcrypt cost 12) back.
 
 ### Request pipeline (`apps/api/src/app.ts`)
 
@@ -102,6 +105,16 @@ packages/mongo/
 3. **Feature routers** under `/api/v1`. Each feature is `modules/<feature>/{routes,controller,service,repository}.ts`: controllers handle HTTP only, services hold business rules, and repositories are the only code that touches a data store. `validate({ params, query, body })` runs before a controller, reports every invalid field at once and replaces the raw values with the parsed ones.
 4. **`notFound`** turns anything unmatched into a `NotFoundError`.
 5. **`errorHandler`** is the only place that writes error responses. `AppError` subclasses keep their status, code and details; body-parser errors become `INVALID_JSON` or `BAD_REQUEST`; anything else is logged with its stack and returned as a generic `INTERNAL_ERROR` 500 (message and stack only when `NODE_ENV=development`). Express 5 forwards rejected promises from async handlers here, so handlers need no try/catch.
+
+### Authentication (`src/modules/auth/`)
+
+- **Register:** the email is trimmed and lowercased by `registerSchema`, the password is hashed with bcrypt (cost 12), and a unique-violation from Postgres becomes `409 EMAIL_TAKEN`, so two simultaneous sign-ups with one email can't both succeed. Registering also logs the user in.
+- **Login:** looks the user up by email and always runs `bcrypt.compare`, against a dummy hash when the email is unknown, then returns the same `401 INVALID_CREDENTIALS` either way. The password hash is only ever selected by `findUserForLogin`; every other query uses a column list without it, and `toPublicUser` copies fields one by one.
+- **Sessions:** a login creates a refresh token with a new `family_id`. The browser gets 256 random bits (base64url) in the `fp_refresh` cookie (`httpOnly`, `SameSite=Lax`, `Path=/api/v1/auth`, `Secure` in production, expires with the token); Postgres stores only its SHA-256.
+- **Refresh:** finds the token by hash. Unknown or expired: `401 INVALID_REFRESH_TOKEN`. Already revoked: reuse, so every token in the family is revoked, a warning is logged (user and family IDs only) and `401 REFRESH_TOKEN_REUSED` is returned. Otherwise one transaction runs `UPDATE refresh_tokens SET revoked_at = now() WHERE id = $old AND revoked_at IS NULL` and inserts the replacement in the same family; if the update matched no row, a parallel refresh already used the token and that counts as reuse too. A rejected refresh also clears the cookie.
+- **Access tokens:** HS256 JWTs with `sub = userId`, lifetime `ACCESS_TOKEN_TTL_SECONDS` (15 min). `requireAuth` accepts only `Authorization: Bearer`, verifies with `algorithms: ['HS256']` and sets `req.user = { id }`; anything about the user is loaded fresh from the database.
+- **Logout:** revokes the presented token's family and clears the cookie; always 204, even with no cookie.
+- **Never logged:** pino redacts `Authorization`, `Cookie` and `Set-Cookie`, and request bodies (passwords) are not logged.
 
 ### Health and shutdown
 
@@ -174,6 +187,11 @@ _Planned (Days 17–19)._
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
+| POST | `/api/v1/auth/register` | none | `201 { user, accessToken }` + `fp_refresh` cookie; `409 EMAIL_TAKEN` |
+| POST | `/api/v1/auth/login` | none | `200 { user, accessToken }` + cookie; `401 INVALID_CREDENTIALS` |
+| POST | `/api/v1/auth/refresh` | cookie | Rotates the cookie, `200 { user, accessToken }`; `401 INVALID_REFRESH_TOKEN` or `REFRESH_TOKEN_REUSED` |
+| POST | `/api/v1/auth/logout` | cookie | Revokes the session's token family, clears the cookie, `204` |
+| GET | `/api/v1/auth/me` | Bearer | `200 { user }`; `401` without a valid access token |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
 | GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
 
@@ -195,14 +213,15 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL` and `MONGODB_URI`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900) and `REFRESH_TOKEN_TTL_DAYS` (default 7). If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
 - **Day 1:** Express app with `GET /api/v1/health` and its test; worker entry point with clean shutdown; Docker Compose for the four data services.
 - **Day 2:** Prisma 7 schema for all Postgres tables in `packages/db`, CHECK-constraint migration, hot-path indexes, idempotent seed, `db:*` scripts, constraint and seed tests.
 - **Day 3:** `apps/api/src` split into config, lib, middleware and modules; Zod env validation; pino-http request IDs; `AppError` hierarchy and one error handler; `validate()` middleware; `/health/live` and `/health/ready`; graceful shutdown; Mongo connection in `packages/mongo`; shared pagination schema; separate auto-migrated test database with `truncateAll`.
+- **Day 4:** auth module (register, login, refresh with rotation and reuse detection, logout, `/me`), `requireAuth` middleware, bcrypt cost 12, hashed refresh tokens in an `httpOnly` cookie, shared auth schemas, API tests against the test database, seed users with a real password.

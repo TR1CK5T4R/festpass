@@ -16,7 +16,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 
 | Feature | Status |
 |---|---|
-| Accounts, clubs (organizations) and roles | Planned (Days 4–5) |
+| Accounts, clubs (organizations) and roles | Accounts done (Day 4); clubs and roles planned (Day 5) |
 | Events and ticket tiers, SEO-friendly public pages | Planned (Days 6–10) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
@@ -90,7 +90,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | Layer | Technology |
 |---|---|
 | Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3 |
-| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, Socket.IO |
+| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO |
 | Jobs | BullMQ worker |
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
 | Storage and email | S3-compatible storage (MinIO / Cloudflare R2), SendGrid dynamic templates |
@@ -115,9 +115,25 @@ _Filled in as each piece is built. Each entry covers the problem, the approach, 
 
 **Tested by:** `packages/db/test/constraints.test.ts` runs raw `UPDATE`s against a real Postgres and asserts that `sold_count = capacity` succeeds while `capacity + 1` and `-1` are rejected by name.
 
+### Auth: short-lived JWT + rotating refresh tokens (Day 4)
+
+**Problem:** a single long-lived JWT can't be revoked: if it leaks, it works until it expires. But very short sessions make students log in again every few minutes, in the middle of a flash sale.
+
+**Approach** (`apps/api/src/modules/auth/`):
+- **Access token:** a JWT (HS256, 15 minutes) sent as `Authorization: Bearer`. It is checked without a database lookup, and if stolen it is only useful for minutes. `requireAuth` verifies it with the algorithm pinned to HS256 and sets `req.user`.
+- **Refresh token:** 256 random bits in an `httpOnly`, `SameSite=Lax` cookie scoped to `/api/v1/auth` (`Secure` in production), so page scripts can't read it and it is never sent to the rest of the API. The database stores only its SHA-256, a `family_id` and a 7-day expiry.
+- **Rotation:** every refresh revokes the presented token and issues a new one in the same family, inside one transaction. The revoke is a guarded `UPDATE ... WHERE revoked_at IS NULL`, so two concurrent refreshes with the same token can't both succeed.
+- **Reuse detection:** a revoked token should never come back. If one does, someone kept a copy, so the whole family is revoked (attacker and user are both logged out, the user logs in again) and a warning is logged with the user and family IDs, never the token.
+- **Passwords:** bcrypt cost 12, at most 72 bytes (bcrypt ignores the rest). Wrong password and unknown email return the same `INVALID_CREDENTIALS` error, and an unknown email still runs a bcrypt compare against a dummy hash so the response time doesn't reveal which emails exist.
+
+**Alternatives:** server-side sessions in Redis (simple to revoke, but every request needs a lookup and the API stops being stateless); one long JWT (can't be revoked); refresh tokens in `localStorage` (readable by any XSS).
+
+**Trade-off:** rotation is strict. If two tabs refresh with the same token at the same moment, the second is treated as reuse and the session ends. A short grace window could soften this later.
+
+**Tested by:** `apps/api/test/auth.test.ts`: rotation revokes the old token and keeps the family; replaying an old token returns `REFRESH_TOKEN_REUSED` and kills the newest token too; only hashes are stored; expired and forged access tokens are rejected.
+
 **Planned:**
 
-- Auth: short-lived JWT + rotating refresh tokens (Day 4)
 - Preventing oversells (Days 11–12, 24)
 - Hold expiry (Day 13)
 - Rate limiting (Day 14)
@@ -208,6 +224,8 @@ pnpm db:seed     # demo org, users, a published event with three tiers, a sponso
 pnpm dev        # web on :3000, API on :4000, worker in the background
 ```
 
+Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`) all log in with the password `festpass-dev`.
+
 Check it: open http://localhost:3000, and `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
 If the MinIO image fails to pull (MinIO stopped publishing free images in 2025), start the other three services with `docker compose --project-directory . -f infra/docker-compose.yml up -d --wait postgres mongo redis`. Nothing uses MinIO until banner uploads (Day 8).
@@ -221,6 +239,9 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `API_PORT` | api | Port the API listens on (default 4000) |
 | `NODE_ENV` | api | `development`, `test` or `production` (default `development`). Only `development` shows error messages and stacks in responses |
 | `LOG_LEVEL` | api | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent` (default `info`) |
+| `JWT_ACCESS_SECRET` | api | Secret that signs access tokens (HS256). Required, at least 32 characters; generate one with `openssl rand -base64 48` |
+| `ACCESS_TOKEN_TTL_SECONDS` | api | Access-token lifetime (default 900 = 15 minutes) |
+| `REFRESH_TOKEN_TTL_DAYS` | api | Refresh-token lifetime; each refresh starts a new period (default 7) |
 | `POSTGRES_PORT` | docker compose | Host port for Postgres (default 5433) |
 | `DATABASE_URL` | api, db (Prisma CLI, seed) | Postgres connection string |
 | `DATABASE_URL_TEST` | tests (`packages/db`, `apps/api`) | Separate Postgres database for tests; must end in `_test`, because tests truncate every table |
@@ -260,9 +281,10 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), conflict codes such as `SOLD_OUT` (409), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN` and other conflict codes such as `SOLD_OUT` (409), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
+- **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20; schema `paginationQuerySchema` in `packages/shared`). First list endpoint: Day 6.
 
 ### Endpoints
@@ -270,6 +292,11 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/v1/health/live` | none | Liveness: `200 { "status": "ok" }` whenever the process can answer. Checks no dependencies |
+| POST | `/api/v1/auth/register` | none | Body `{ email, password (8+ chars, max 72 bytes), name, college?, branch?, graduationYear? }`. `201 { user, accessToken }` and sets the `fp_refresh` cookie. `409 EMAIL_TAKEN` if the email (case-insensitive) exists |
+| POST | `/api/v1/auth/login` | none | Body `{ email, password }`. `200 { user, accessToken }` and a new `fp_refresh` cookie (a new token family). `401 INVALID_CREDENTIALS` for a wrong password or unknown email alike |
+| POST | `/api/v1/auth/refresh` | `fp_refresh` cookie | Rotates the refresh token: `200 { user, accessToken }` and a new cookie. `401 INVALID_REFRESH_TOKEN` if missing, unknown or expired; `401 REFRESH_TOKEN_REUSED` (and the whole family is revoked) if the token was already used |
+| POST | `/api/v1/auth/logout` | `fp_refresh` cookie | Revokes this session's token family and clears the cookie. Always `204` |
+| GET | `/api/v1/auth/me` | Bearer | `200 { user }`. `401` without a valid access token |
 | GET | `/api/v1/health/ready` | none | Readiness: pings Postgres, Redis and MongoDB in parallel (1 s timeout each). `200` with `{ "status": "ok", "checks": { "postgres": "up", ... } }`, or `503` with `"status": "unavailable"` and the down dependency marked `"down"` |
 
 ## Testing
@@ -280,9 +307,10 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 
 - `apps/api/test/errors.test.ts`: a bad body or query returns 400 with every invalid field and the request ID; unknown routes return 404 in the standard shape; invalid JSON returns 400; an `AppError` keeps its status and code; an unexpected error returns a generic 500 with no internal message or stack; incoming `X-Request-Id` values are reused only when safe.
 - `apps/api/test/health.test.ts`: liveness; readiness returns 200 when all checks pass, and 503 naming the dependency when a check fails or hangs (checks are injected fakes, so no real outage is needed).
+- `apps/api/test/auth.test.ts` (against the test database): register stores a cost-12 bcrypt hash and only the SHA-256 of the refresh token, and sets an `HttpOnly`, `SameSite=Lax`, `/api/v1/auth` cookie; duplicate email (any case) returns 409; wrong password and unknown email return the same 401; `/me` rejects a missing, expired or forged token; refresh rotates the token within its family; replaying an old token revokes the whole family; logout makes the refresh token stop working.
 - `apps/api/test/env.test.ts`: env parsing applies defaults, coerces numbers and lists every invalid variable in one message.
 - `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL.
-- `packages/db/test/seed.test.ts`: on an empty database the seed creates exactly the demo rows, and a second run changes nothing; `truncateAll` refuses a non-`_test` database.
+- `packages/db/test/seed.test.ts`: on an empty database the seed creates exactly the demo rows, and a second run changes nothing; seed users log in with `festpass-dev`; `truncateAll` refuses a non-`_test` database.
 
 ## Load test results
 
@@ -300,7 +328,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 01 (Fri 30 Oct): Monorepo and local infrastructure
 - [x] Day 02 (Sat 31 Oct): Database schema v1
 - [x] Day 03 (Sun 01 Nov): API foundation
-- [ ] Day 04 (Mon 02 Nov): Authentication with refresh-token rotation
+- [x] Day 04 (Mon 02 Nov): Authentication with refresh-token rotation
 - [ ] Day 05 (Tue 03 Nov): Organizations and role-based access
 - [ ] Day 06 (Wed 04 Nov): Events and ticket tiers API
 - [ ] Day 07 (Thu 05 Nov): Web foundation and auth UI
@@ -364,6 +392,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** readiness checks are passed into `createApp()` instead of being imported directly, so tests simulate a dead Redis or a hanging Mongo with a fake function instead of stopping containers; the real checks run in parallel with a 1 s timeout each, because a hung dependency is as bad as a dead one.
 **Verify:** `pnpm test`, then `pnpm dev` and `curl -i localhost:4000/api/v1/nope -H 'X-Request-Id: demo-1'` (404 in the standard shape with `requestId: "demo-1"`) and `curl localhost:4000/api/v1/health/ready`.
 **Next:** Day 4 adds register, login, refresh-token rotation with reuse detection, logout and `/me` on top of this error and validation layer.
+
+### Day 04: Authentication with refresh-token rotation (2026-11-02)
+**Built:**
+- `POST /auth/register`, `/login`, `/refresh`, `/logout` and `GET /auth/me`, with request schemas in `packages/shared` and an `auth` module split into routes, controller, service and repository.
+- bcrypt (cost 12) passwords and one generic login error; 15-minute HS256 access tokens checked by a `requireAuth` middleware.
+- 256-bit refresh tokens stored only as SHA-256 hashes, in an `httpOnly` cookie scoped to `/api/v1/auth`, rotated on every refresh, with reuse detection that revokes the whole token family.
+- Seed users now log in with a real password (`festpass-dev`).
+
+**Key decision:** refresh tokens are random strings stored hashed in Postgres instead of being a second JWT, because a refresh token has to be revocable and detectable on reuse, which needs a database row anyway; the short JWT access token keeps every other request free of database lookups.
+**Verify:** `pnpm test`, then `pnpm dev` and `curl -c jar -X POST localhost:4000/api/v1/auth/login -H 'Content-Type: application/json' -d '{"email":"organizer@festpass.dev","password":"festpass-dev"}'`, then `curl -b jar -c jar -X POST localhost:4000/api/v1/auth/refresh`.
+**Next:** Day 5 adds club organizations with OWNER, MANAGER and SCANNER roles, enforced by middleware on top of `requireAuth`.
 
 <!-- BUILD-LOG:END -->
 
