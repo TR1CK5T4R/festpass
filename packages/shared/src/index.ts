@@ -23,3 +23,5 @@ export interface ApiErrorBody {
 }
 
 export * from './auth.js';
+export * from './orgs.js';
+export * from './permissions.js';
