@@ -14,7 +14,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Database schema, CHECK constraints, seed | `packages/db` | Done (Day 2) |
 | Env validation, structured errors, request IDs, readiness checks | `apps/api` | Done (Day 3) |
 | Auth with rotating refresh tokens | `apps/api` | Done (Day 4) |
-| Organizations and role-based access | `apps/api`, `packages/shared` | Planned (Day 5) |
+| Organizations and role-based access | `apps/api`, `packages/shared` | Done (Day 5) |
 | Events and ticket tiers | `apps/api` | Planned (Day 6) |
 | Pre-signed banner uploads | `apps/api` | Planned (Day 8) |
 | Booking engine (Postgres + Redis gate) | `packages/db`, `apps/api` | Planned (Days 11–12) |
@@ -61,11 +61,13 @@ apps/api/
   src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
   src/middleware/require-auth.ts    Verifies the Bearer access token and sets req.user = { id }
+  src/middleware/require-org-permission.ts  Loads the caller's membership of :orgId and checks the matrix (404 / 403)
   src/modules/auth/                 routes, controller (cookie handling), service (passwords, tokens, rotation), repository
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
+  src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
-  test/                             auth, errors, health and env tests (Supertest, no open port); global-setup.ts migrates the test DB
+  test/                             auth, orgs, errors, health and env tests (Supertest, no open port); global-setup.ts migrates the test DB
   vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
   tsconfig.json                     Typecheck config (src + test)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
@@ -83,6 +85,8 @@ packages/db/
 packages/shared/
   src/index.ts           paginationQuerySchema, idParamsSchema, ApiErrorBody type
   src/auth.ts            registerSchema, loginSchema, PublicUser and AuthResponse types
+  src/orgs.ts            createOrgSchema, member schemas, org/member params, OrgSummary and OrgMemberView
+  src/permissions.ts     ORG_ROLES, ORG_ACTIONS, the PERMISSIONS matrix and can(role, action)
 packages/mongo/
   src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
@@ -115,6 +119,14 @@ packages/mongo/
 - **Access tokens:** HS256 JWTs with `sub = userId`, lifetime `ACCESS_TOKEN_TTL_SECONDS` (15 min). `requireAuth` accepts only `Authorization: Bearer`, verifies with `algorithms: ['HS256']` and sets `req.user = { id }`; anything about the user is loaded fresh from the database.
 - **Logout:** revokes the presented token's family and clears the cookie; always 204, even with no cookie.
 - **Never logged:** pino redacts `Authorization`, `Cookie` and `Set-Cookie`, and request bodies (passwords) are not logged.
+
+### Organizations and permissions (`src/modules/orgs/`)
+
+- **Matrix as data:** `PERMISSIONS` in `packages/shared/src/permissions.ts` maps each role to its allowed actions; `can(role, action)` is a lookup. Adding an action or changing a role is a one-line data change, and the web app imports the same table to decide which buttons to show.
+- **Enforcement:** org routes run `validate({ params })` (orgId must be a UUID), then `requireOrgPermission(action)`, then body validation, so a non-member learns nothing from validation errors. The middleware loads the `(org_id, user_id)` membership row: none is `404 Organization not found` (the same response as an org that doesn't exist), a role without the action is `403`, otherwise `req.membership = { orgId, role }`.
+- **Create:** the org and its OWNER membership are one nested Prisma create, so there is never an org without an owner. The slug is derived from the name when not given; a duplicate is `409 SLUG_TAKEN`.
+- **Members:** added by email (the user must already have an account; `404` otherwise, `409 ALREADY_MEMBER` via the primary key). Role changes and removals go through `changeMembership()`, which in one transaction runs `SELECT ... FROM org_members WHERE org_id = $1 AND role = 'OWNER' FOR UPDATE`, then refuses (`409 LAST_OWNER`) if the target is the only OWNER. The lock makes concurrent demotions take turns, so the second one sees the first's result.
+- **Not yet:** a member can't leave an org on their own (only an OWNER can remove them), and `/orgs/mine` is not paginated.
 
 ### Health and shutdown
 
@@ -192,6 +204,12 @@ _Planned (Days 17–19)._
 | POST | `/api/v1/auth/refresh` | cookie | Rotates the cookie, `200 { user, accessToken }`; `401 INVALID_REFRESH_TOKEN` or `REFRESH_TOKEN_REUSED` |
 | POST | `/api/v1/auth/logout` | cookie | Revokes the session's token family, clears the cookie, `204` |
 | GET | `/api/v1/auth/me` | Bearer | `200 { user }`; `401` without a valid access token |
+| POST | `/api/v1/orgs` | Bearer | Create an org; caller becomes OWNER. `201 { org }`; `409 SLUG_TAKEN` |
+| GET | `/api/v1/orgs/mine` | Bearer | `200 { orgs }` with the caller's role in each |
+| GET | `/api/v1/orgs/:orgId` | `org:read` | `200 { org, members }`; `404` for non-members |
+| POST | `/api/v1/orgs/:orgId/members` | `member:manage` | Add a user by email with a role. `201`; `404` unknown email; `409 ALREADY_MEMBER` |
+| PATCH | `/api/v1/orgs/:orgId/members/:userId` | `member:manage` | Change role. `200`; `409 LAST_OWNER` |
+| DELETE | `/api/v1/orgs/:orgId/members/:userId` | `member:manage` | Remove. `204`; `409 LAST_OWNER` |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
 | GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
 
@@ -213,7 +231,7 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
@@ -225,3 +243,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 2:** Prisma 7 schema for all Postgres tables in `packages/db`, CHECK-constraint migration, hot-path indexes, idempotent seed, `db:*` scripts, constraint and seed tests.
 - **Day 3:** `apps/api/src` split into config, lib, middleware and modules; Zod env validation; pino-http request IDs; `AppError` hierarchy and one error handler; `validate()` middleware; `/health/live` and `/health/ready`; graceful shutdown; Mongo connection in `packages/mongo`; shared pagination schema; separate auto-migrated test database with `truncateAll`.
 - **Day 4:** auth module (register, login, refresh with rotation and reuse detection, logout, `/me`), `requireAuth` middleware, bcrypt cost 12, hashed refresh tokens in an `httpOnly` cookie, shared auth schemas, API tests against the test database, seed users with a real password.
+- **Day 5:** organizations with OWNER/MANAGER/SCANNER roles, permission matrix and `can()` in `packages/shared`, `requireOrgPermission` middleware (404 for non-members, 403 for missing permission), member management with a row-locked last-owner rule, matrix-driven tests.
