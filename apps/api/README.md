@@ -15,7 +15,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Env validation, structured errors, request IDs, readiness checks | `apps/api` | Done (Day 3) |
 | Auth with rotating refresh tokens | `apps/api` | Done (Day 4) |
 | Organizations and role-based access | `apps/api`, `packages/shared` | Done (Day 5) |
-| Events and ticket tiers | `apps/api` | Planned (Day 6) |
+| Events and ticket tiers | `apps/api` | Done (Day 6) |
 | Pre-signed banner uploads | `apps/api` | Planned (Day 8) |
 | Booking engine (Postgres + Redis gate) | `packages/db`, `apps/api` | Planned (Days 11–12) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
@@ -57,6 +57,8 @@ apps/api/
   src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, Set-Cookie)
   src/lib/errors.ts                 AppError + NotFound, Validation, Conflict, Forbidden, Unauthorized, RateLimited
   src/lib/redis.ts                  ioredis client (lazy connect, auto-reconnect)
+  src/lib/slug.ts                   slugify() for org and event URLs
+  src/lib/cursor.ts                 Opaque (startsAt, id) cursors for keyset pagination
   src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
   src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
@@ -65,9 +67,10 @@ apps/api/
   src/modules/auth/                 routes, controller (cookie handling), service (passwords, tokens, rotation), repository
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
+  src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
-  test/                             auth, orgs, errors, health and env tests (Supertest, no open port); global-setup.ts migrates the test DB
+  test/                             auth, orgs, events, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
   vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
   tsconfig.json                     Typecheck config (src + test)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
@@ -87,6 +90,8 @@ packages/shared/
   src/auth.ts            registerSchema, loginSchema, PublicUser and AuthResponse types
   src/orgs.ts            createOrgSchema, member schemas, org/member params, OrgSummary and OrgMemberView
   src/permissions.ts     ORG_ROLES, ORG_ACTIONS, the PERMISSIONS matrix and can(role, action)
+  src/pagination.ts      paginationQuerySchema and the Page<T> response type
+  src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, TierView
 packages/mongo/
   src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
@@ -127,6 +132,16 @@ packages/mongo/
 - **Create:** the org and its OWNER membership are one nested Prisma create, so there is never an org without an owner. The slug is derived from the name when not given; a duplicate is `409 SLUG_TAKEN`.
 - **Members:** added by email (the user must already have an account; `404` otherwise, `409 ALREADY_MEMBER` via the primary key). Role changes and removals go through `changeMembership()`, which in one transaction runs `SELECT ... FROM org_members WHERE org_id = $1 AND role = 'OWNER' FOR UPDATE`, then refuses (`409 LAST_OWNER`) if the target is the only OWNER. The lock makes concurrent demotions take turns, so the second one sees the first's result.
 - **Not yet:** a member can't leave an org on their own (only an OWNER can remove them), and `/orgs/mine` is not paginated.
+
+### Events and ticket tiers (`src/modules/events/`)
+
+- **Routes:** organizer routes are mounted at `/api/v1/orgs/:orgId/events` (`mergeParams`) and use the permission matrix: `event:create` to create, `event:update` for edits and tiers, `event:publish` to publish or close, `org:read` to view. Every lookup is `WHERE id = $eventId AND org_id = $orgId`, so an org can never touch another org's event by ID. Public routes are at `/api/v1/events` and need no login.
+- **Slugs:** `slugify(title)`; if the insert hits the unique index, retry up to 5 times with a random 4-hex suffix (`tech-fest-3f9a`). The database decides, so two simultaneous "Tech Fest" events can't get the same slug. Slugs never change after creation.
+- **Dates:** the shared schemas check `endsAt > startsAt`, `saleEndsAt > saleStartsAt` and `saleEndsAt ≤ endsAt`; a tier's own window must sit inside the event's. On a partial update the service merges with the stored event and re-runs the same checks, including every existing tier's window.
+- **Status:** `status.ts` lists the allowed transitions (DRAFT → PUBLISHED → CLOSED). Publishing also needs at least one tier and `startsAt` in the future. The change itself is `UPDATE ... WHERE id = $1 AND status = $from`, so two parallel publishes can't both succeed.
+- **Tier lock after sales:** `updateTierLocked()` runs `SELECT ... FROM ticket_tiers WHERE id = $1 FOR UPDATE`, then checks the rules against the locked row: once `sold_count > 0` the price can't change and capacity can only grow. The booking engine's `UPDATE ... sold_count` takes the same row lock, so no sale can slip in between the check and the update. Deleting uses `DELETE ... WHERE sold_count = 0`. The Day 2 CHECK (`sold_count <= capacity`) stays as the last line of defence.
+- **Keyset pagination:** `listEvents()` orders by `(starts_at, id)` and continues with `starts_at > c.starts_at OR (starts_at = c.starts_at AND id > c.id)`, fetching `limit + 1` rows to know whether there's another page. The cursor is that pair, base64url-encoded. Served by the `events(status, starts_at, id)` index.
+- **Public view:** `GET /events` shows `PUBLISHED` events whose `ends_at` is still in the future; `GET /events/:slug` also shows `CLOSED` ones, never drafts. Each tier carries `available = capacity - sold_count`, which is only a hint; booking (Day 11) rechecks in Postgres.
 
 ### Health and shutdown
 
@@ -210,6 +225,17 @@ _Planned (Days 17–19)._
 | POST | `/api/v1/orgs/:orgId/members` | `member:manage` | Add a user by email with a role. `201`; `404` unknown email; `409 ALREADY_MEMBER` |
 | PATCH | `/api/v1/orgs/:orgId/members/:userId` | `member:manage` | Change role. `200`; `409 LAST_OWNER` |
 | DELETE | `/api/v1/orgs/:orgId/members/:userId` | `member:manage` | Remove. `204`; `409 LAST_OWNER` |
+| POST | `/api/v1/orgs/:orgId/events` | `event:create` | Create a DRAFT event; slug from the title. `201 { event }` |
+| GET | `/api/v1/orgs/:orgId/events` | `org:read` | The org's events (all statuses), `{ items, nextCursor }` |
+| GET | `/api/v1/orgs/:orgId/events/:eventId` | `org:read` | `200 { event }` with tiers |
+| PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; `409 EVENT_CLOSED` |
+| POST | `/api/v1/orgs/:orgId/events/:eventId/publish` | `event:publish` | DRAFT → PUBLISHED; `409 NO_TIERS`, `EVENT_IN_PAST`, `INVALID_TRANSITION` |
+| POST | `/api/v1/orgs/:orgId/events/:eventId/close` | `event:publish` | PUBLISHED → CLOSED |
+| POST | `/api/v1/orgs/:orgId/events/:eventId/tiers` | `event:update` | Add a tier. `201 { tier }`; `409 TIER_NAME_TAKEN` |
+| PATCH | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | Edit a tier; `409 PRICE_LOCKED` / `CAPACITY_LOCKED` after a sale |
+| DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` |
+| GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
+| GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
 | GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
 
@@ -231,7 +257,7 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
@@ -244,3 +270,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 3:** `apps/api/src` split into config, lib, middleware and modules; Zod env validation; pino-http request IDs; `AppError` hierarchy and one error handler; `validate()` middleware; `/health/live` and `/health/ready`; graceful shutdown; Mongo connection in `packages/mongo`; shared pagination schema; separate auto-migrated test database with `truncateAll`.
 - **Day 4:** auth module (register, login, refresh with rotation and reuse detection, logout, `/me`), `requireAuth` middleware, bcrypt cost 12, hashed refresh tokens in an `httpOnly` cookie, shared auth schemas, API tests against the test database, seed users with a real password.
 - **Day 5:** organizations with OWNER/MANAGER/SCANNER roles, permission matrix and `can()` in `packages/shared`, `requireOrgPermission` middleware (404 for non-members, 403 for missing permission), member management with a row-locked last-owner rule, matrix-driven tests.
+- **Day 6:** events and ticket tiers under `/orgs/:orgId/events` (create, list, get, update, publish, close; tier create, update, delete), status transitions, price lock and grow-only capacity after a sale under a row lock, public keyset-paginated `GET /events` and `GET /events/:slug`, `events(status, starts_at, id)` index.
