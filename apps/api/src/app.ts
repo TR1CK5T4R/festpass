@@ -2,6 +2,7 @@ import express from 'express';
 import { errorHandler, notFound } from './middleware/error-handler.js';
 import { requestLogger } from './middleware/request-logger.js';
 import { authRoutes } from './modules/auth/routes.js';
+import { orgEventRoutes, publicEventRoutes } from './modules/events/routes.js';
 import { healthRoutes } from './modules/health/routes.js';
 import { orgRoutes } from './modules/orgs/routes.js';
 import { defaultReadinessChecks, type ReadinessChecks } from './modules/health/service.js';
@@ -23,7 +24,9 @@ export function createApp({ readinessChecks = defaultReadinessChecks }: AppDeps 
 
   app.use('/api/v1/health', healthRoutes(readinessChecks));
   app.use('/api/v1/auth', authRoutes());
+  app.use('/api/v1/orgs/:orgId/events', orgEventRoutes());
   app.use('/api/v1/orgs', orgRoutes());
+  app.use('/api/v1/events', publicEventRoutes());
 
   // Last: unmatched routes become a 404, then every error is rendered in the standard shape.
   app.use(notFound);
