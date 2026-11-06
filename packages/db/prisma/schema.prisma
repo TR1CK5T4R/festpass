@@ -136,6 +136,8 @@ model Event {
   sponsors Sponsor[]
 
   @@index([orgId, status])
+  // Public listing: WHERE status = 'PUBLISHED' ORDER BY starts_at, id, paged with a (starts_at, id) cursor.
+  @@index([status, startsAt, id])
   @@map("events")
 }
 
