@@ -2,43 +2,16 @@ import { prisma } from '@festpass/db';
 import { truncateAll } from '@festpass/db/testing';
 import { ORG_ACTIONS, ORG_ROLES, can, type OrgAction, type OrgRole } from '@festpass/shared';
 import express from 'express';
-import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { createApp } from '../src/app.js';
 import { errorHandler } from '../src/middleware/error-handler.js';
 import { requireAuth } from '../src/middleware/require-auth.js';
 import { requireOrgPermission } from '../src/middleware/require-org-permission.js';
 import { changeMembership } from '../src/modules/orgs/repository.js';
-
-const app = createApp();
+import { addMember, app, makeOrg, makeUser, type TestUser } from './helpers.js';
 
 beforeEach(() => truncateAll(prisma));
 afterAll(() => prisma.$disconnect());
-
-// Users are inserted directly (no bcrypt) and get a signed access token, so tests stay fast.
-let n = 0;
-async function makeUser(name = 'User') {
-  n += 1;
-  const user = await prisma.user.create({
-    data: { email: `user${n}@test.dev`, name, passwordHash: 'x' },
-  });
-  const token = jwt.sign({}, process.env.JWT_ACCESS_SECRET!, {
-    subject: user.id,
-    algorithm: 'HS256',
-  });
-  return { id: user.id, email: user.email, auth: { Authorization: `Bearer ${token}` } };
-}
-
-async function makeOrg(owner: Awaited<ReturnType<typeof makeUser>>, name = 'Coding Club') {
-  const res = await request(app).post('/api/v1/orgs').set(owner.auth).send({ name });
-  expect(res.status).toBe(201);
-  return res.body.org.id as string;
-}
-
-async function addMember(orgId: string, userId: string, role: OrgRole) {
-  await prisma.orgMember.create({ data: { orgId, userId, role } });
-}
 
 // The policy, written out by hand. If someone edits PERMISSIONS, this test makes them change it on purpose.
 const EXPECTED: Record<OrgRole, Record<OrgAction, boolean>> = {
@@ -87,7 +60,7 @@ describe('permission matrix', () => {
   it('requireOrgPermission allows or denies every role × action as the policy says', async () => {
     const owner = await makeUser();
     const orgId = await makeOrg(owner);
-    const members: Record<OrgRole, Awaited<ReturnType<typeof makeUser>>> = {
+    const members: Record<OrgRole, TestUser> = {
       OWNER: owner,
       MANAGER: await makeUser(),
       SCANNER: await makeUser(),
