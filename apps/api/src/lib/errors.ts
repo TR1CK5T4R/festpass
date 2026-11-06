@@ -49,3 +49,10 @@ export class RateLimitedError extends AppError {
     super(429, 'RATE_LIMITED', 'Too many requests, try again shortly', { retryAfterSeconds });
   }
 }
+
+/** A 400 in the same shape the validate middleware produces, for rules checked in services. */
+export function bodyFieldErrors(issues: { path: string; message: string }[]): ValidationError {
+  return new ValidationError('Request validation failed', {
+    fields: issues.map((i) => ({ location: 'body', ...i })),
+  });
+}

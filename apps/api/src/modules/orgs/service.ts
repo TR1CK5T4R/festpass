@@ -5,26 +5,14 @@ import type {
   OrgRole,
   OrgSummary,
 } from '@festpass/shared';
-import { ConflictError, NotFoundError, ValidationError } from '../../lib/errors.js';
+import { bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { slugify } from '../../lib/slug.js';
 import * as repo from './repository.js';
-
-/** "MAIT Alumni Cell!" -> "mait-alumni-cell" */
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60);
-}
 
 export async function createOrg(userId: string, input: CreateOrgInput): Promise<OrgSummary> {
   const slug = input.slug ?? slugify(input.name);
   if (slug.length < 3) {
-    throw new ValidationError('Request validation failed', {
-      fields: [
-        { location: 'body', path: 'slug', message: 'Choose a slug of at least 3 characters' },
-      ],
-    });
+    throw bodyFieldErrors([{ path: 'slug', message: 'Choose a slug of at least 3 characters' }]);
   }
   const org = await repo.createOrgWithOwner({ name: input.name, slug }, userId);
   if (!org) throw new ConflictError('SLUG_TAKEN', 'An organization with this slug already exists');
