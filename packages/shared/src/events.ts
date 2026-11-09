@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { paginationQuerySchema } from './pagination.js';
+import { paginationQuerySchema } from './pagination.ts';
 
 export const EVENT_STATUSES = ['DRAFT', 'PUBLISHED', 'CLOSED'] as const;
 export type EventStatus = (typeof EVENT_STATUSES)[number];

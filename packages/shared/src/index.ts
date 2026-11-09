@@ -15,8 +15,10 @@ export interface ApiErrorBody {
   };
 }
 
-export * from './auth.js';
-export * from './orgs.js';
-export * from './permissions.js';
-export * from './pagination.js';
-export * from './events.js';
+// Internal imports end in .ts (rewritten to .js on build) because the web app's bundler reads this
+// package as TypeScript source and, unlike tsc and tsx, does not map ./auth.js to auth.ts.
+export * from './auth.ts';
+export * from './orgs.ts';
+export * from './permissions.ts';
+export * from './pagination.ts';
+export * from './events.ts';

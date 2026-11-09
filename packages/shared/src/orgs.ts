@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ORG_ROLES, type OrgRole } from './permissions.js';
+import { ORG_ROLES, type OrgRole } from './permissions.ts';
 
 const slug = z
   .string()
