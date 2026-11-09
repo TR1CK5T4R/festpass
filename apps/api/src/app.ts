@@ -1,4 +1,6 @@
 import express from 'express';
+import { env } from './config/env.js';
+import { cors } from './middleware/cors.js';
 import { errorHandler, notFound } from './middleware/error-handler.js';
 import { requestLogger } from './middleware/request-logger.js';
 import { authRoutes } from './modules/auth/routes.js';
@@ -20,6 +22,7 @@ export function createApp({ readinessChecks = defaultReadinessChecks }: AppDeps 
 
   // First, so every later log line and error response carries the request ID.
   app.use(requestLogger);
+  app.use(cors(env.WEB_ORIGINS));
   app.use(express.json());
 
   app.use('/api/v1/health', healthRoutes(readinessChecks));

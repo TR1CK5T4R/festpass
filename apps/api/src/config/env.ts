@@ -17,6 +17,12 @@ const envSchema = z.object({
     .positive()
     .default(15 * 60),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
+  // Browser origins allowed to call the API with cookies, comma-separated (e.g. the web app).
+  WEB_ORIGINS: z
+    .string()
+    .default('http://localhost:3000')
+    .transform((s) => s.split(',').map((o) => o.trim()))
+    .pipe(z.array(z.url())),
 });
 
 export type Env = z.infer<typeof envSchema>;
