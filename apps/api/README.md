@@ -62,6 +62,7 @@ apps/api/
   src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
   src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
+  src/middleware/cors.ts            CORS for WEB_ORIGINS only, with credentials (hand-written, no library)
   src/middleware/require-auth.ts    Verifies the Bearer access token and sets req.user = { id }
   src/middleware/require-org-permission.ts  Loads the caller's membership of :orgId and checks the matrix (404 / 403)
   src/modules/auth/                 routes, controller (cookie handling), service (passwords, tokens, rotation), repository
@@ -110,10 +111,11 @@ packages/mongo/
 ### Request pipeline (`apps/api/src/app.ts`)
 
 1. **`requestLogger`** (pino-http) gives the request an ID: the incoming `X-Request-Id` if it is 1–64 characters of `[A-Za-z0-9_-]`, otherwise a new UUID. The ID goes into `req.id`, every log line (`req.log`) and the `X-Request-Id` response header. Responses are logged at `warn` for 4xx and `error` for 5xx.
-2. **`express.json()`** parses bodies (100 kB limit).
-3. **Feature routers** under `/api/v1`. Each feature is `modules/<feature>/{routes,controller,service,repository}.ts`: controllers handle HTTP only, services hold business rules, and repositories are the only code that touches a data store. `validate({ params, query, body })` runs before a controller, reports every invalid field at once and replaces the raw values with the parsed ones.
-4. **`notFound`** turns anything unmatched into a `NotFoundError`.
-5. **`errorHandler`** is the only place that writes error responses. `AppError` subclasses keep their status, code and details; body-parser errors become `INVALID_JSON` or `BAD_REQUEST`; anything else is logged with its stack and returned as a generic `INTERNAL_ERROR` 500 (message and stack only when `NODE_ENV=development`). Express 5 forwards rejected promises from async handlers here, so handlers need no try/catch.
+2. **`cors(env.WEB_ORIGINS)`**: if the request's `Origin` is on the allow-list it is echoed back with `Access-Control-Allow-Credentials: true` (credentials never work with `*`), preflights get a `204`, and every response has `Vary: Origin`. Other origins get no CORS headers, so browsers won't let their pages read the response.
+3. **`express.json()`** parses bodies (100 kB limit).
+4. **Feature routers** under `/api/v1`. Each feature is `modules/<feature>/{routes,controller,service,repository}.ts`: controllers handle HTTP only, services hold business rules, and repositories are the only code that touches a data store. `validate({ params, query, body })` runs before a controller, reports every invalid field at once and replaces the raw values with the parsed ones.
+5. **`notFound`** turns anything unmatched into a `NotFoundError`.
+6. **`errorHandler`** is the only place that writes error responses. `AppError` subclasses keep their status, code and details; body-parser errors become `INVALID_JSON` or `BAD_REQUEST`; anything else is logged with its stack and returned as a generic `INTERNAL_ERROR` 500 (message and stack only when `NODE_ENV=development`). Express 5 forwards rejected promises from async handlers here, so handlers need no try/catch.
 
 ### Authentication (`src/modules/auth/`)
 
@@ -261,7 +263,7 @@ Tests use Vitest and Supertest against `createApp()`, without opening a port. `t
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900) and `REFRESH_TOKEN_TTL_DAYS` (default 7). If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7) and `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`). If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -271,3 +273,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 4:** auth module (register, login, refresh with rotation and reuse detection, logout, `/me`), `requireAuth` middleware, bcrypt cost 12, hashed refresh tokens in an `httpOnly` cookie, shared auth schemas, API tests against the test database, seed users with a real password.
 - **Day 5:** organizations with OWNER/MANAGER/SCANNER roles, permission matrix and `can()` in `packages/shared`, `requireOrgPermission` middleware (404 for non-members, 403 for missing permission), member management with a row-locked last-owner rule, matrix-driven tests.
 - **Day 6:** events and ticket tiers under `/orgs/:orgId/events` (create, list, get, update, publish, close; tier create, update, delete), status transitions, price lock and grow-only capacity after a sale under a row lock, public keyset-paginated `GET /events` and `GET /events/:slug`, `events(status, starts_at, id)` index.
+- **Day 7:** CORS middleware for the web app's origin with credentials (`WEB_ORIGINS`); `packages/shared` imports its own files with `.ts` extensions (rewritten to `.js` on build) so the Next.js bundler can read it as source.

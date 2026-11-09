@@ -6,6 +6,8 @@
 
 **Status:** in development. See the [30-day progress](#30-day-progress) tracker and the [build log](#build-log).
 
+![Organizer dashboard: a club, its owner and the team list](.github/screenshots/dashboard.png)
+
 **Deeper docs:** [Frontend README](apps/web/README.md) · [Backend README](apps/api/README.md)
 
 ## Why I built this
@@ -16,7 +18,8 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 
 | Feature | Status |
 |---|---|
-| Accounts, clubs (organizations) and roles | Done (Days 4–5) |
+| Accounts, clubs (organizations) and roles | Done: API (Days 4–5); register, login and create-club screens (Day 7) |
+| Web app: auth screens, silent refresh, organizer dashboard shell | Done (Day 7) |
 | Events and ticket tiers, SEO-friendly public pages | API done (Day 6); organizer UI and public pages planned (Days 9–10) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
@@ -242,7 +245,7 @@ pnpm dev        # web on :3000, API on :4000, worker in the background
 
 Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`) all log in with the password `festpass-dev`.
 
-Check it: open http://localhost:3000, and `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
+Check it: open http://localhost:3000, register (or log in with a seed account), create a club and reload the page: you stay logged in. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
 If the MinIO image fails to pull (MinIO stopped publishing free images in 2025), start the other three services with `docker compose --project-directory . -f infra/docker-compose.yml up -d --wait postgres mongo redis`. Nothing uses MinIO until banner uploads (Day 8).
 
@@ -253,6 +256,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | Variable | Used by | Description |
 |---|---|---|
 | `API_PORT` | api | Port the API listens on (default 4000) |
+| `WEB_ORIGINS` | api | Comma-separated browser origins allowed to call the API with cookies (CORS); default `http://localhost:3000` |
+| `NEXT_PUBLIC_API_URL` | web | API base URL the browser calls (default `http://localhost:4000/api/v1`). Inlined into the bundle at build time, so never a secret |
 | `NODE_ENV` | api | `development`, `test` or `production` (default `development`). Only `development` shows error messages and stacks in responses |
 | `LOG_LEVEL` | api | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent` (default `info`) |
 | `JWT_ACCESS_SECRET` | api | Secret that signs access tokens (HS256). Required, at least 32 characters; generate one with `openssl rand -base64 48` |
@@ -300,6 +305,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES` and later `SOLD_OUT` (409), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
+- **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie.
 - **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20) and return `{ items, nextCursor }`; pass `nextCursor` back to get the next page (`null` on the last page). Cursors are opaque and keyset-based on `(startsAt, id)`, so pages stay correct when events are added between requests.
 - **Dates:** ISO 8601 with a timezone, e.g. `2026-12-12T10:00:00+05:30`; stored and returned in UTC.
@@ -344,6 +350,8 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/auth.test.ts` (against the test database): register stores a cost-12 bcrypt hash and only the SHA-256 of the refresh token, and sets an `HttpOnly`, `SameSite=Lax`, `/api/v1/auth` cookie; duplicate email (any case) returns 409; wrong password and unknown email return the same 401; `/me` rejects a missing, expired or forged token; refresh rotates the token within its family; replaying an old token revokes the whole family; logout makes the refresh token stop working.
 - `apps/api/test/orgs.test.ts` (against the test database): loops over every role × action and checks both `can()` and the real `requireOrgPermission` middleware against a hand-written policy table; a non-member gets 404 for every action, identical to a nonexistent org; creating an org makes the creator OWNER; owners add members by email, managers get 403; the last OWNER can't be demoted or removed; two owners demoting each other concurrently leave exactly one OWNER.
 - `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
+- `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
+- `apps/api/test/cors.test.ts`: the web origin gets a preflight with credentials allowed; any other origin gets no CORS headers.
 - `apps/api/test/env.test.ts`: env parsing applies defaults, coerces numbers and lists every invalid variable in one message.
 - `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL.
 - `packages/db/test/seed.test.ts`: on an empty database the seed creates exactly the demo rows, and a second run changes nothing; seed users log in with `festpass-dev`; `truncateAll` refuses a non-`_test` database.
@@ -367,7 +375,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 04 (Mon 02 Nov): Authentication with refresh-token rotation
 - [x] Day 05 (Tue 03 Nov): Organizations and role-based access
 - [x] Day 06 (Wed 04 Nov): Events and ticket tiers API
-- [ ] Day 07 (Thu 05 Nov): Web foundation and auth UI
+- [x] Day 07 (Thu 05 Nov): Web foundation and auth UI
 - [ ] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
 - [ ] Day 09 (Sat 07 Nov): Organizer dashboard UI
 - [ ] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
@@ -461,6 +469,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** keyset (cursor) pagination on `(startsAt, id)` instead of `OFFSET`, because events added while someone is paging would shift offsets and show an event twice or skip one; the cursor says "after this row", which doesn't move.
 **Verify:** `pnpm test`, then log in as the organizer, `POST /orgs/:orgId/events`, add a tier, `POST .../publish`, and `curl localhost:4000/api/v1/events`.
 **Next:** Day 7 starts the web app: auth pages with silent refresh, creating an org and an organizer dashboard shell.
+
+### Day 07: Web foundation and auth UI (2026-11-05)
+**Built:**
+- Next.js route groups `(public)`, `(auth)` and `(dashboard)`, design tokens in Tailwind's `@theme`, and Button, Input, Card, Badge, Toast and EmptyState components.
+- A typed API client that keeps the access token in memory, refreshes once on a 401 and retries once (shared between concurrent requests), and turns error bodies into `ApiError`.
+- An auth context that silently refreshes on page load from the httpOnly cookie; register and login forms with react-hook-form and the shared Zod schemas.
+- A protected dashboard with an org switcher, team list and create-club flow; API CORS for the web origin with credentials.
+
+**Key decision:** the access token lives only in JavaScript memory and the refresh token only in an httpOnly cookie, instead of putting either in `localStorage`, because anything in storage can be read by any script on the page; a reload costs one `/auth/refresh` call, which is the price of nothing stealable being stored.
+**Verify:** `pnpm test`, then `pnpm dev`, open http://localhost:3000/register, create an account and a club, and hard-reload `/dashboard`: you stay logged in.
+**Next:** Day 8 adds banner uploads straight from the browser to S3-compatible storage with pre-signed URLs.
 
 <!-- BUILD-LOG:END -->
 
