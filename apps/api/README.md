@@ -10,13 +10,13 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 |---|---|---|
 | Express app with health check, Vitest + Supertest | `apps/api` | Done (Day 1) |
 | Worker process with clean shutdown | `apps/worker` | Done (Day 1) |
-| Postgres, MongoDB, Redis, MinIO in Docker with healthchecks | `infra/docker-compose.yml` | Done (Day 1) |
+| Postgres, MongoDB, Redis and S3 storage (SeaweedFS since Day 8) in Docker with healthchecks | `infra/docker-compose.yml` | Done (Day 1) |
 | Database schema, CHECK constraints, seed | `packages/db` | Done (Day 2) |
 | Env validation, structured errors, request IDs, readiness checks | `apps/api` | Done (Day 3) |
 | Auth with rotating refresh tokens | `apps/api` | Done (Day 4) |
 | Organizations and role-based access | `apps/api`, `packages/shared` | Done (Day 5) |
 | Events and ticket tiers | `apps/api` | Done (Day 6) |
-| Pre-signed banner uploads | `apps/api` | Planned (Day 8) |
+| Pre-signed banner uploads | `apps/api`, `packages/shared` | Done (Day 8) |
 | Booking engine (Postgres + Redis gate) | `packages/db`, `apps/api` | Planned (Days 11–12) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
@@ -45,9 +45,9 @@ They are separate processes so a slow PDF or a stuck email can never slow down b
 | **PostgreSQL 16** | Users, orgs, events, tiers, orders, payments, tickets | The source of truth for money and capacity. It has transactions, row locks and CHECK constraints, so overselling is blocked by the database itself. |
 | **MongoDB 7** | Scan events (time-series), copilot conversations | Many small append-only writes, read through aggregations for analytics. |
 | **Redis 7** | Inventory gate, rate limits, waiting room, job queues | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking. |
-| **MinIO / R2** | Event banners (public), ticket PDFs (private) | S3-compatible storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
+| **S3 storage** (SeaweedFS locally, R2 in production) | Event banners (public), ticket PDFs (private, Day 18) | S3-compatible object storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
 
-Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 6380 and 9000/9001, bound to 127.0.0.1.
+Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 6380 and 9000, bound to 127.0.0.1.
 
 ## Folder layout (today)
 
@@ -59,6 +59,7 @@ apps/api/
   src/lib/redis.ts                  ioredis client (lazy connect, auto-reconnect)
   src/lib/slug.ts                   slugify() for org and event URLs
   src/lib/cursor.ts                 Opaque (startsAt, id) cursors for keyset pagination
+  src/lib/storage.ts                S3 client (AWS SDK v3, path-style), presignPost(), headObject(), publicUrl()
   src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
   src/middleware/validate.ts        validate({ params, query, body }) with Zod; 400 with field details
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
@@ -69,11 +70,14 @@ apps/api/
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
+  src/modules/uploads/              routes, controller, service (presignBanner with the permission check, verifyBanner with HeadObject)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
-  test/                             auth, orgs, events, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
+  scripts/storage-init.ts           Creates the bucket, public-read policy for banners, CORS for WEB_ORIGINS (idempotent)
+  scripts/upload-banner.ts          The whole upload flow from the command line, as the web app will do it
+  test/                             auth, orgs, events, uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
   vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
-  tsconfig.json                     Typecheck config (src + test)
+  tsconfig.json                     Typecheck config (src, test and scripts)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
 apps/worker/
   src/index.ts           Starts, logs "worker started", exits cleanly on SIGTERM/SIGINT
@@ -93,6 +97,7 @@ packages/shared/
   src/permissions.ts     ORG_ROLES, ORG_ACTIONS, the PERMISSIONS matrix and can(role, action)
   src/pagination.ts      paginationQuerySchema and the Page<T> response type
   src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, TierView
+  src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
 packages/mongo/
   src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
@@ -144,6 +149,15 @@ packages/mongo/
 - **Tier lock after sales:** `updateTierLocked()` runs `SELECT ... FROM ticket_tiers WHERE id = $1 FOR UPDATE`, then checks the rules against the locked row: once `sold_count > 0` the price can't change and capacity can only grow. The booking engine's `UPDATE ... sold_count` takes the same row lock, so no sale can slip in between the check and the update. Deleting uses `DELETE ... WHERE sold_count = 0`. The Day 2 CHECK (`sold_count <= capacity`) stays as the last line of defence.
 - **Keyset pagination:** `listEvents()` orders by `(starts_at, id)` and continues with `starts_at > c.starts_at OR (starts_at = c.starts_at AND id > c.id)`, fetching `limit + 1` rows to know whether there's another page. The cursor is that pair, base64url-encoded. Served by the `events(status, starts_at, id)` index.
 - **Public view:** `GET /events` shows `PUBLISHED` events whose `ends_at` is still in the future; `GET /events/:slug` also shows `CLOSED` ones, never drafts. Each tier carries `available = capacity - sold_count`, which is only a hint; booking (Day 11) rechecks in Postgres.
+
+### Banner uploads (`src/modules/uploads/`, `src/lib/storage.ts`)
+
+- **Presign:** `POST /uploads/presign { eventId, contentType }`. The body names the event, so the org comes from the event row (`findEventOrg`) and the service checks the membership itself: no membership or no such event is `404 Event not found` (like `requireOrgPermission`), a role without `event:update` is `403`. The key is chosen by the server, `orgs/{orgId}/events/{eventId}/banner/{uuid}.{ext}`, and `createPresignedPost` signs a policy containing that key, `content-length-range 1..2097152` and `Content-Type` equal to the requested type, valid for 5 minutes. Signing is local (HMAC with the secret key), with no call to storage.
+- **Upload:** the browser POSTs a multipart form (policy fields first, file last) straight to storage, which rejects a bigger file (`400 EntityTooLarge`) or another content type (`403 AccessDenied`). The API never sees the bytes.
+- **Confirm:** `PATCH /orgs/:orgId/events/:eventId { bannerKey }`. `verifyBanner()` first matches the key against `^orgs/{orgId}/events/{eventId}/banner/{uuid}.(jpg|png|webp)$` (without a storage call), then runs `HeadObject`: missing object (404 from storage), a type outside JPEG/PNG/WebP, or a size over 2 MB is a `400` on the `bannerKey` field. This runs before the database update, outside any transaction. `bannerKey: null` removes the banner.
+- **Serving:** every event response (organizer, public list, public detail) has `bannerUrl = S3_PUBLIC_URL + '/' + bannerKey`. `pnpm storage:init` sets a bucket policy that allows anonymous `s3:GetObject` only on `orgs/*/events/*/banner/*`; everything else in the bucket needs signed requests. Ticket PDFs (Day 18) will live under a different prefix and be shared only as short-lived pre-signed GETs, because they carry a name and an entry QR.
+- **CORS on storage:** the browser talks to storage directly, so `storage:init` also sets bucket CORS for `WEB_ORIGINS` (POST, GET). The API's own CORS doesn't apply there.
+- **Not yet:** replaced banners are not deleted from storage, and the content type is the uploader's declaration (not sniffed from the bytes).
 
 ### Health and shutdown
 
@@ -230,7 +244,7 @@ _Planned (Days 17–19)._
 | POST | `/api/v1/orgs/:orgId/events` | `event:create` | Create a DRAFT event; slug from the title. `201 { event }` |
 | GET | `/api/v1/orgs/:orgId/events` | `org:read` | The org's events (all statuses), `{ items, nextCursor }` |
 | GET | `/api/v1/orgs/:orgId/events/:eventId` | `org:read` | `200 { event }` with tiers |
-| PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; `409 EVENT_CLOSED` |
+| PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update, including `bannerKey` (checked with HeadObject) or `null`; `409 EVENT_CLOSED` |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/publish` | `event:publish` | DRAFT → PUBLISHED; `409 NO_TIERS`, `EVENT_IN_PAST`, `INVALID_TRANSITION` |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/close` | `event:publish` | PUBLISHED → CLOSED |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/tiers` | `event:update` | Add a tier. `201 { tier }`; `409 TIER_NAME_TAKEN` |
@@ -238,6 +252,7 @@ _Planned (Days 17–19)._
 | DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` |
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
+| POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | `201 { upload: { url, fields, key, maxBytes, expiresAt } }` for a JPEG/PNG/WebP banner up to 2 MB; `400` other types, `404` non-members, `403` scanners |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
 | GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
 
@@ -248,8 +263,10 @@ Error shape, request IDs, validation and pagination conventions: see the [projec
 From the repo root (see the [project README](../../README.md#getting-started) for full setup):
 
 ```bash
-pnpm infra:up                          # Postgres, MongoDB, Redis, MinIO
+pnpm infra:up                          # Postgres, MongoDB, Redis, SeaweedFS
 pnpm db:migrate && pnpm db:seed        # tables, CHECK constraints, demo data
+pnpm storage:init                      # bucket, banner public-read policy, CORS
+pnpm storage:upload-banner ./banner.png  # with the API running: presign, upload, PATCH, print the URL
 pnpm --filter @festpass/db test        # constraint + seed tests (need Postgres)
 curl localhost:4000/api/v1/health/ready
 curl -i localhost:4000/api/v1/nope -H 'X-Request-Id: demo-1'
@@ -259,11 +276,11 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7) and `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`). If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -274,3 +291,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 5:** organizations with OWNER/MANAGER/SCANNER roles, permission matrix and `can()` in `packages/shared`, `requireOrgPermission` middleware (404 for non-members, 403 for missing permission), member management with a row-locked last-owner rule, matrix-driven tests.
 - **Day 6:** events and ticket tiers under `/orgs/:orgId/events` (create, list, get, update, publish, close; tier create, update, delete), status transitions, price lock and grow-only capacity after a sale under a row lock, public keyset-paginated `GET /events` and `GET /events/:slug`, `events(status, starts_at, id)` index.
 - **Day 7:** CORS middleware for the web app's origin with credentials (`WEB_ORIGINS`); `packages/shared` imports its own files with `.ts` extensions (rewritten to `.js` on build) so the Next.js bundler can read it as source.
+- **Day 8:** storage module on AWS SDK v3 and SeaweedFS in docker compose (MinIO images are no longer pullable); `POST /uploads/presign` with a 2 MB, type-locked pre-signed POST for a server-chosen key; `bannerKey` on event PATCH verified with HeadObject; `bannerUrl` on every event; `storage:init` (bucket, banner-only public-read policy, CORS) and `storage:upload-banner` scripts; upload tests with S3 mocked.

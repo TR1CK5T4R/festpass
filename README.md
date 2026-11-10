@@ -21,6 +21,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Accounts, clubs (organizations) and roles | Done: API (Days 4–5); register, login and create-club screens (Day 7) |
 | Web app: auth screens, silent refresh, organizer dashboard shell | Done (Day 7) |
 | Events and ticket tiers, SEO-friendly public pages | API done (Day 6); organizer UI and public pages planned (Days 9–10) |
+| Event banners uploaded straight from the browser to S3-compatible storage | API and storage done (Day 8); upload UI planned (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
@@ -47,6 +48,8 @@ flowchart TB
   redis -- jobs --> worker["Worker (BullMQ)"]
   worker --> pg
   worker --> ext["SendGrid / S3-compatible storage"]
+  web -- "banner upload (pre-signed POST)" --> s3[("S3 storage: banners")]
+  api -- "sign, HeadObject" --> s3
 ```
 
 - **PostgreSQL** holds anything involving money or capacity, because it needs transactions and constraints.
@@ -82,7 +85,7 @@ packages/
   db/        Prisma schema, migrations and the raw-SQL booking path
   mongo/     Mongoose models for scan events and copilot conversations
 infra/
-  docker-compose.yml   Postgres, MongoDB, Redis and MinIO for local development
+  docker-compose.yml   Postgres, MongoDB, Redis and SeaweedFS (S3) for local development
 scripts/     Small developer scripts
 ```
 
@@ -96,7 +99,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO |
 | Jobs | BullMQ worker |
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
-| Storage and email | S3-compatible storage (MinIO / Cloudflare R2), SendGrid dynamic templates |
+| Storage and email | S3-compatible storage via AWS SDK v3 (SeaweedFS 4.50 locally, Cloudflare R2 in production), SendGrid dynamic templates |
 | Payments | Razorpay (test mode) |
 | Testing | Vitest 5.0, Supertest 7.3, k6 |
 | CI/CD | GitHub Actions, Docker |
@@ -134,6 +137,23 @@ _Filled in as each piece is built. Each entry covers the problem, the approach, 
 **Trade-off:** rotation is strict. If two tabs refresh with the same token at the same moment, the second is treated as reuse and the session ends. A short grace window could soften this later.
 
 **Tested by:** `apps/api/test/auth.test.ts`: rotation revokes the old token and keeps the family; replaying an old token returns `REFRESH_TOKEN_REUSED` and kills the newest token too; only hashes are stored; expired and forged access tokens are rejected.
+
+### Direct-to-storage uploads with pre-signed URLs (Day 8)
+
+**Problem:** event banners are images of up to 2 MB. Streaming them through the API would tie up an Express worker and its memory for the whole upload, on every slow phone connection, and every byte would cross the network twice.
+
+**Approach** (`apps/api/src/modules/uploads/`, `apps/api/src/lib/storage.ts`):
+- **Sign, don't receive:** `POST /uploads/presign` checks that the caller may edit the event (OWNER or MANAGER), picks the key itself (`orgs/{orgId}/events/{eventId}/banner/{uuid}.{ext}`) and returns a pre-signed POST valid for 5 minutes. The browser sends the file straight to storage. The API never receives file bytes.
+- **Limits enforced by storage:** the signed policy contains `content-length-range 1..2 MB` and `Content-Type` equal to the type that was signed. Storage checks the form against the policy, so a 3 MB file gets `400 EntityTooLarge` and a swapped type gets `403 AccessDenied` before anything is stored. Changing the policy breaks the signature.
+- **Verify before saving:** the client then PATCHes the event with `bannerKey`. The API checks the key has this event's banner pattern (so nobody can point their event at another org's file), then runs `HeadObject`. It saves the key only if the object exists, has an allowed type and is within 2 MB. This storage call runs before the database write, never inside a transaction.
+- **Public banners, private everything else:** `pnpm storage:init` grants anonymous `GetObject` on `orgs/*/events/*/banner/*` only. Banners appear on public event pages, so a plain URL (`bannerUrl` in every event response) can be cached by browsers and a CDN. Each upload gets a new UUID key, so a replaced banner never serves a stale copy.
+- **Why ticket PDFs (Day 18) will be private:** a ticket PDF carries an attendee's name and a QR code that gets someone through the gate. A public URL can be guessed, forwarded or indexed and never expires. So ticket PDFs will sit outside the public prefix and be handed out only as short-lived pre-signed GET links to the ticket's owner.
+
+**Alternatives:** multipart upload through the API with `multer` (simple, but the API carries every byte and needs its own size limit); a pre-signed PUT (one request, but a PUT URL can't enforce a size range, only a fixed `Content-Length`); trusting the client after upload (it could send any key, or a key it never uploaded).
+
+**Limits:** the content type is the one the uploader declared; nothing sniffs the bytes yet. Replaced banners stay in storage until a cleanup job exists. Cloudflare R2 has no bucket policies, so in production banners will go in a bucket with public access turned on (planned, Day 29).
+
+**Tested by:** `apps/api/test/uploads.test.ts` (S3 mocked): the signed policy contains the size range and type; a bad content type returns 400; a non-member gets 404 and a scanner 403; a PATCH with a missing object, a 2 MB + 1 byte object, a non-image type or another event's key is rejected. The real limits were also checked against SeaweedFS: 3 MB upload `400 EntityTooLarge`, swapped type `403 AccessDenied`, anonymous GET outside the banner prefix `403`.
 
 **Planned:**
 
@@ -230,7 +250,7 @@ erDiagram
 
 - Node.js 22 (`.nvmrc`)
 - pnpm 12 (`npm i -g pnpm`)
-- Docker Desktop or OrbStack (for Postgres, MongoDB, Redis and MinIO)
+- Docker Desktop or OrbStack (for Postgres, MongoDB, Redis and SeaweedFS)
 
 **Run it locally**
 
@@ -240,6 +260,7 @@ cp .env.example .env
 pnpm infra:up   # starts the four services and waits until all are healthy
 pnpm db:migrate  # creates the tables and CHECK constraints
 pnpm db:seed     # demo org, users, a published event with three tiers, a sponsor
+pnpm storage:init  # creates the bucket, public-read for banners, CORS for the web app
 pnpm dev        # web on :3000, API on :4000, worker in the background
 ```
 
@@ -247,9 +268,11 @@ Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`)
 
 Check it: open http://localhost:3000, register (or log in with a seed account), create a club and reload the page: you stay logged in. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
-If the MinIO image fails to pull (MinIO stopped publishing free images in 2025), start the other three services with `docker compose --project-directory . -f infra/docker-compose.yml up -d --wait postgres mongo redis`. Nothing uses MinIO until banner uploads (Day 8).
+Upload a banner end to end (with `pnpm dev` running): `pnpm storage:upload-banner ./some-image.png`. It logs in as the seed organizer, presigns, uploads straight to storage, PATCHes the event and prints the public URL.
 
-The containers use host ports 5433, 27018 and 6380 instead of the defaults, so they don't clash with a Postgres, MongoDB or Redis already installed on your machine. Change them in `.env` if needed. The MinIO console is at http://localhost:9001.
+Local S3 storage is [SeaweedFS](https://github.com/seaweedfs/seaweedfs), because MinIO's free Docker images can no longer be pulled. The API only speaks the S3 protocol through AWS SDK v3, so any S3-compatible server (MinIO, R2) works by changing the `S3_*` variables.
+
+The containers use host ports 5433, 27018 and 6380 instead of the defaults, so they don't clash with a Postgres, MongoDB or Redis already installed on your machine; storage is on 9000. Change them in `.env` if needed.
 
 ## Environment variables
 
@@ -270,11 +293,13 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `MONGODB_URI` | api | MongoDB connection string |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api (worker from Day 13) | Redis connection string |
-| `MINIO_API_PORT` | docker compose | Host port for the MinIO S3 API (default 9000) |
-| `MINIO_CONSOLE_PORT` | docker compose | Host port for the MinIO web console (default 9001) |
-| `MINIO_ROOT_USER` | docker compose | MinIO admin user (local only) |
-| `MINIO_ROOT_PASSWORD` | docker compose | MinIO admin password (local only, min 8 characters) |
-| `S3_ENDPOINT` | api (Day 8+) | S3-compatible endpoint; MinIO locally, R2 in production |
+| `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
+| `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
+| `S3_REGION` | api | Signing region (default `us-east-1`; `auto` for R2) |
+| `S3_BUCKET` | api | Bucket for uploads (`festpass`) |
+| `S3_ACCESS_KEY_ID` | api, docker compose | Storage access key; docker compose also uses it as the local SeaweedFS admin key |
+| `S3_SECRET_ACCESS_KEY` | api, docker compose | Storage secret key (never logged) |
+| `S3_PUBLIC_URL` | api | Base URL public objects are served from, used to build `bannerUrl`: `http://localhost:9000/festpass` locally, the R2 public domain in production |
 
 ## Scripts
 
@@ -286,12 +311,14 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `pnpm typecheck` | TypeScript checks in every package |
 | `pnpm test` | Runs all test suites (Vitest) |
 | `pnpm format` | Formats code with Prettier |
-| `pnpm infra:up` | Starts Postgres, MongoDB, Redis and MinIO and waits for healthchecks |
+| `pnpm infra:up` | Starts Postgres, MongoDB, Redis and SeaweedFS and waits for healthchecks |
 | `pnpm infra:down` | Stops the containers (data stays in named volumes) |
 | `pnpm db:migrate` | Applies pending Prisma migrations (and creates a new one if the schema changed) |
 | `pnpm db:reset` | Drops the database and re-applies every migration (destroys local data) |
 | `pnpm db:seed` | Inserts demo data; safe to run repeatedly |
 | `pnpm db:studio` | Opens Prisma Studio to browse the tables |
+| `pnpm storage:init` | Creates the bucket, makes `orgs/*/events/*/banner/*` publicly readable and allows `WEB_ORIGINS` to POST uploads (CORS); safe to run repeatedly |
+| `pnpm storage:upload-banner <image> [email] [password]` | Uploads an image as the banner of the first event of that user's first org (default: the seed organizer) and prints its public URL |
 
 ## API reference
 
@@ -309,6 +336,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 - **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20) and return `{ items, nextCursor }`; pass `nextCursor` back to get the next page (`null` on the last page). Cursors are opaque and keyset-based on `(startsAt, id)`, so pages stay correct when events are added between requests.
 - **Dates:** ISO 8601 with a timezone, e.g. `2026-12-12T10:00:00+05:30`; stored and returned in UTC.
+- **Banners:** every event response includes `bannerKey` and `bannerUrl` (a public URL, or `null`).
 
 ### Endpoints
 
@@ -323,7 +351,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | POST | `/api/v1/orgs/:orgId/events` | `event:create` | Body `{ title, description?, venue, startsAt, endsAt, saleStartsAt, saleEndsAt }` (ends after start, sales end by the event's end). Creates a DRAFT; the slug comes from the title, with a 4-character suffix if taken. `201 { event }` |
 | GET | `/api/v1/orgs/:orgId/events` | `org:read` | All of the org's events, any status, `{ items, nextCursor }` |
 | GET | `/api/v1/orgs/:orgId/events/:eventId` | `org:read` | `200 { event }` with its tiers (`soldCount`, `available`) |
-| PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; dates re-checked together, tier sale windows must still fit. The slug never changes. `409 EVENT_CLOSED` once closed |
+| PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; dates re-checked together, tier sale windows must still fit. The slug never changes. `bannerKey` (from presign) is saved only after `HeadObject` confirms the object exists, is JPEG/PNG/WebP and at most 2 MB, else `400` on `bannerKey`; `null` removes the banner. `409 EVENT_CLOSED` once closed |
+| POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | Body `{ eventId, contentType: image/jpeg \| image/png \| image/webp }`. `201 { upload: { url, fields, key, maxBytes, expiresAt } }`: POST a multipart form to `url` with every `fields` entry, then the file as `file`, within 5 minutes. `400` for another type, `404` for non-members (same as a missing event), `403` for scanners |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/publish` | `event:publish` | DRAFT → PUBLISHED. `409 NO_TIERS` without tiers, `409 EVENT_IN_PAST` if it already started, `409 INVALID_TRANSITION` otherwise |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/close` | `event:publish` | PUBLISHED → CLOSED (stays public, no longer bookable) |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/tiers` | `event:update` | Body `{ name, pricePaise ≥ 0, capacity > 0, perUserLimit 1–10 (default 4), saleStartsAt?, saleEndsAt? }`; the tier's sale window must sit inside the event's. `201 { tier }`; `409 TIER_NAME_TAKEN` |
@@ -351,6 +380,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/orgs.test.ts` (against the test database): loops over every role × action and checks both `can()` and the real `requireOrgPermission` middleware against a hand-written policy table; a non-member gets 404 for every action, identical to a nonexistent org; creating an org makes the creator OWNER; owners add members by email, managers get 403; the last OWNER can't be demoted or removed; two owners demoting each other concurrently leave exactly one OWNER.
 - `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
+- `apps/api/test/uploads.test.ts` (S3 mocked with a spy on the client's `send`): presign signs a fixed key under the event's banner prefix with `content-length-range` and `Content-Type` in the policy; a bad content type returns 400, a non-member 404, a scanner 403, no login 401; PATCH saves a confirmed `bannerKey` and returns `bannerUrl`, rejects a missing object, an object over 2 MB and a non-image type, rejects another event's key without calling storage, and `null` clears the banner.
 - `apps/api/test/cors.test.ts`: the web origin gets a preflight with credentials allowed; any other origin gets no CORS headers.
 - `apps/api/test/env.test.ts`: env parsing applies defaults, coerces numbers and lists every invalid variable in one message.
 - `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL.
@@ -376,7 +406,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 05 (Tue 03 Nov): Organizations and role-based access
 - [x] Day 06 (Wed 04 Nov): Events and ticket tiers API
 - [x] Day 07 (Thu 05 Nov): Web foundation and auth UI
-- [ ] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
+- [x] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
 - [ ] Day 09 (Sat 07 Nov): Organizer dashboard UI
 - [ ] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
 - [ ] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
@@ -480,6 +510,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** the access token lives only in JavaScript memory and the refresh token only in an httpOnly cookie, instead of putting either in `localStorage`, because anything in storage can be read by any script on the page; a reload costs one `/auth/refresh` call, which is the price of nothing stealable being stored.
 **Verify:** `pnpm test`, then `pnpm dev`, open http://localhost:3000/register, create an account and a club, and hard-reload `/dashboard`: you stay logged in.
 **Next:** Day 8 adds banner uploads straight from the browser to S3-compatible storage with pre-signed URLs.
+
+### Day 08: Banner uploads with pre-signed URLs (2026-11-06)
+**Built:**
+- A storage module on AWS SDK v3 (path-style, so it works on SeaweedFS locally and R2 later) and SeaweedFS in docker compose in place of MinIO, whose images can no longer be pulled.
+- `POST /uploads/presign` for OWNER and MANAGER: a 5-minute pre-signed POST for a server-chosen key `orgs/{orgId}/events/{eventId}/banner/{uuid}.{ext}` with a 2 MB `content-length-range` and the content type in the signed policy.
+- PATCH event with `bannerKey`: the key must match the event's banner pattern and `HeadObject` must confirm the object, its type and size; events now return `bannerUrl`.
+- `pnpm storage:init` (bucket, public-read on banners only, CORS for the web app) and `pnpm storage:upload-banner` for the whole flow from the command line.
+
+**Key decision:** the browser uploads straight to storage with a pre-signed POST instead of sending the file through the API, so the API never handles file bytes. The POST policy (rather than a pre-signed PUT) lets storage itself enforce the 2 MB range and the content type.
+**Verify:** `pnpm test`, then `pnpm infra:up`, `pnpm storage:init`, `pnpm dev`, and `pnpm storage:upload-banner ./some-image.png`. Open the printed URL.
+**Next:** Day 9 builds the organizer dashboard UI, including a banner uploader on top of this flow.
 
 <!-- BUILD-LOG:END -->
 
