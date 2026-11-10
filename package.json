@@ -18,7 +18,9 @@
     "db:migrate": "pnpm --filter @festpass/db exec prisma migrate dev",
     "db:reset": "pnpm --filter @festpass/db exec prisma migrate reset --force",
     "db:seed": "pnpm --filter @festpass/db exec prisma db seed",
-    "db:studio": "pnpm --filter @festpass/db exec prisma studio"
+    "db:studio": "pnpm --filter @festpass/db exec prisma studio",
+    "storage:init": "pnpm --filter @festpass/api storage:init",
+    "storage:upload-banner": "pnpm --filter @festpass/api storage:upload-banner"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
