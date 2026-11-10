@@ -52,6 +52,10 @@ export function findOrgEvent(orgId: string, eventId: string) {
   return prisma.event.findFirst({ where: { id: eventId, orgId }, select: eventSelect });
 }
 
+export function findEventOrg(eventId: string) {
+  return prisma.event.findUnique({ where: { id: eventId }, select: { orgId: true } });
+}
+
 export function findPublicEventBySlug(slug: string) {
   return prisma.event.findFirst({
     // Drafts never leave the organizer dashboard.

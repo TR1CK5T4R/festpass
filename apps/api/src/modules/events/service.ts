@@ -13,6 +13,8 @@ import {
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { slugify } from '../../lib/slug.js';
+import { publicUrl } from '../../lib/storage.js';
+import { verifyBanner } from '../uploads/service.js';
 import * as repo from './repository.js';
 import { assertTransition } from './status.js';
 
@@ -27,8 +29,10 @@ function toTierView(t: repo.TierRecord): TierView {
   };
 }
 
+const bannerUrl = (key: string | null) => (key ? publicUrl(key) : null);
+
 function toEventView<T extends repo.EventRecord>(e: T) {
-  return { ...e, tiers: e.tiers.map(toTierView) };
+  return { ...e, bannerUrl: bannerUrl(e.bannerKey), tiers: e.tiers.map(toTierView) };
 }
 
 async function loadEvent(orgId: string, eventId: string) {
@@ -49,7 +53,7 @@ async function listPage(
   limit: number,
 ) {
   const rows = await repo.listEvents(where, cursor ? decodeCursor(cursor) : null, limit);
-  const items = rows.slice(0, limit);
+  const items = rows.slice(0, limit).map((e) => ({ ...e, bannerUrl: bannerUrl(e.bannerKey) }));
   const last = items.at(-1);
   const page: Page<(typeof items)[number]> = {
     items,
@@ -94,6 +98,9 @@ export async function updateEvent(orgId: string, eventId: string, input: UpdateE
     }
   }
   if (issues.length > 0) throw bodyFieldErrors(issues);
+  // A storage round trip, so it runs before (never inside) any database write.
+  // shortcut: a replaced banner's old object stays in storage; add a cleanup job if that ever costs money.
+  if (input.bannerKey) await verifyBanner(orgId, eventId, input.bannerKey);
   return toEventView(await repo.updateEvent(eventId, input));
 }
 
