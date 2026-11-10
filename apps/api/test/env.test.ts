@@ -6,6 +6,11 @@ const valid = {
   REDIS_URL: 'redis://localhost:6380',
   MONGODB_URI: 'mongodb://localhost:27018/festpass',
   JWT_ACCESS_SECRET: 'x'.repeat(32),
+  S3_ENDPOINT: 'http://localhost:9000',
+  S3_BUCKET: 'festpass',
+  S3_ACCESS_KEY_ID: 'festpass',
+  S3_SECRET_ACCESS_KEY: 'secret',
+  S3_PUBLIC_URL: 'http://localhost:9000/festpass/',
 };
 
 describe('parseEnv', () => {
@@ -18,6 +23,8 @@ describe('parseEnv', () => {
       LOG_LEVEL: 'info',
       ACCESS_TOKEN_TTL_SECONDS: 900,
       REFRESH_TOKEN_TTL_DAYS: 7,
+      S3_REGION: 'us-east-1',
+      S3_PUBLIC_URL: 'http://localhost:9000/festpass',
     });
   });
 

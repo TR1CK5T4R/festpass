@@ -23,6 +23,14 @@ const envSchema = z.object({
     .default('http://localhost:3000')
     .transform((s) => s.split(',').map((o) => o.trim()))
     .pipe(z.array(z.url())),
+  // S3-compatible storage: SeaweedFS locally, Cloudflare R2 in production (region "auto" there).
+  S3_ENDPOINT: z.url(),
+  S3_REGION: z.string().min(1).default('us-east-1'),
+  S3_BUCKET: z.string().min(3),
+  S3_ACCESS_KEY_ID: z.string().min(1),
+  S3_SECRET_ACCESS_KEY: z.string().min(1),
+  // Base URL that public objects (banners) are read from, without a trailing slash.
+  S3_PUBLIC_URL: z.url().transform((u) => u.replace(/\/+$/, '')),
 });
 
 export type Env = z.infer<typeof envSchema>;

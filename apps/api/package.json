@@ -8,9 +8,13 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=../../.env dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "storage:init": "tsx --conditions=development --env-file-if-exists=../../.env scripts/storage-init.ts",
+    "storage:upload-banner": "tsx --env-file-if-exists=../../.env scripts/upload-banner.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1161.0",
+    "@aws-sdk/s3-presigned-post": "^3.1161.0",
     "@festpass/db": "workspace:*",
     "@festpass/mongo": "workspace:*",
     "@festpass/shared": "workspace:*",
