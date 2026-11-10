@@ -78,8 +78,13 @@ export const createEventSchema = z
 export type CreateEventInput = z.infer<typeof createEventSchema>;
 
 // Dates are re-checked in the API after merging with the stored event, since one date alone can't be judged.
+// bannerKey comes from POST /uploads/presign; null removes the banner. The API checks the object exists.
 export const updateEventSchema = z
-  .object({ ...eventFields, description: z.string().trim().max(5000) })
+  .object({
+    ...eventFields,
+    description: z.string().trim().max(5000),
+    bannerKey: z.string().min(1).max(300).nullable(),
+  })
   .partial()
   .refine((e) => Object.keys(e).length > 0, 'Nothing to update');
 export type UpdateEventInput = z.infer<typeof updateEventSchema>;

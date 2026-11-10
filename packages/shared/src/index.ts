@@ -22,3 +22,4 @@ export * from './orgs.ts';
 export * from './permissions.ts';
 export * from './pagination.ts';
 export * from './events.ts';
+export * from './uploads.ts';
