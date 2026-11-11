@@ -4,6 +4,7 @@ const variants = {
   primary: 'bg-brand-600 text-white hover:bg-brand-700 disabled:bg-brand-500/60',
   secondary: 'border border-line bg-surface text-ink hover:bg-canvas disabled:text-muted',
   ghost: 'text-muted hover:bg-canvas hover:text-ink',
+  danger: 'bg-danger text-white hover:bg-danger/90 disabled:bg-danger/60',
 };
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {

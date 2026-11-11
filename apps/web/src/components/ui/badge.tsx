@@ -4,6 +4,7 @@ const tones = {
   neutral: 'bg-canvas text-muted border-line',
   brand: 'bg-brand-50 text-brand-700 border-brand-100',
   success: 'bg-success/10 text-success border-success/20',
+  warning: 'bg-warning/10 text-warning border-warning/20',
 };
 
 export function Badge({
