@@ -53,7 +53,12 @@ async function listPage(
   limit: number,
 ) {
   const rows = await repo.listEvents(where, cursor ? decodeCursor(cursor) : null, limit);
-  const items = rows.slice(0, limit).map((e) => ({ ...e, bannerUrl: bannerUrl(e.bannerKey) }));
+  const items = rows.slice(0, limit).map(({ tiers, ...e }) => ({
+    ...e,
+    bannerUrl: bannerUrl(e.bannerKey),
+    capacity: tiers.reduce((sum, t) => sum + t.capacity, 0),
+    soldCount: tiers.reduce((sum, t) => sum + t.soldCount, 0),
+  }));
   const last = items.at(-1);
   const page: Page<(typeof items)[number]> = {
     items,

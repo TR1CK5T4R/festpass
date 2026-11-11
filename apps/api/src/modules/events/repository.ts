@@ -26,6 +26,8 @@ const eventSelect = {
   saleEndsAt: true,
   status: true,
   bannerKey: true,
+  queueMode: true,
+  admitRatePerSec: true,
   tiers: { select: tierSelect, orderBy: [{ pricePaise: 'asc' }, { name: 'asc' }] },
 } satisfies Prisma.EventSelect;
 
@@ -99,6 +101,8 @@ export function listEvents(
       status: true,
       bannerKey: true,
       org: { select: { name: true, slug: true } },
+      // Only for the sold/capacity totals; small (an event has a handful of tiers).
+      tiers: { select: { capacity: true, soldCount: true } },
     },
   });
 }

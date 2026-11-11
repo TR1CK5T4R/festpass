@@ -5,7 +5,10 @@ export const EVENT_STATUSES = ['DRAFT', 'PUBLISHED', 'CLOSED'] as const;
 export type EventStatus = (typeof EVENT_STATUSES)[number];
 
 // ISO 8601 with a timezone (`2026-12-12T10:00:00+05:30` or `...Z`), turned into a Date (stored as UTC).
-const dateTime = z.iso.datetime({ offset: true }).transform((s) => new Date(s));
+const dateTime = z.iso
+  .datetime({ offset: true, error: 'Enter a date and time' })
+  .transform((s) => new Date(s));
+const wholeNumber = () => z.number({ error: 'Enter a whole number' }).int('Enter a whole number');
 
 export interface FieldIssue {
   path: string;
@@ -70,10 +73,19 @@ const eventFields = {
   endsAt: dateTime,
   saleStartsAt: dateTime,
   saleEndsAt: dateTime,
+  // Waiting room for flash sales: when on, people are let into booking at admitRatePerSec.
+  queueMode: z.boolean(),
+  admitRatePerSec: wholeNumber().min(1).max(1000),
 };
 
+// Queue settings may be left out on create (the database defaults to off, 50/s). Defaults are not set
+// here, because .partial() on the update schema would then reset them on every unrelated edit.
 export const createEventSchema = z
-  .object(eventFields)
+  .object({
+    ...eventFields,
+    queueMode: eventFields.queueMode.optional(),
+    admitRatePerSec: eventFields.admitRatePerSec.optional(),
+  })
   .superRefine((e, ctx) => addIssues(eventWindowIssues(e), ctx));
 export type CreateEventInput = z.infer<typeof createEventSchema>;
 
@@ -91,9 +103,9 @@ export type UpdateEventInput = z.infer<typeof updateEventSchema>;
 
 const tierFields = {
   name: z.string().trim().min(1).max(60),
-  pricePaise: z.number().int().min(0),
-  capacity: z.number().int().positive(),
-  perUserLimit: z.number().int().min(1).max(10),
+  pricePaise: z.number({ error: 'Enter an amount like 299 or 99.99' }).int().min(0),
+  capacity: wholeNumber().positive(),
+  perUserLimit: wholeNumber().min(1).max(10),
   saleStartsAt: dateTime.nullable(),
   saleEndsAt: dateTime.nullable(),
 };
@@ -118,6 +130,36 @@ export const eventSlugParamsSchema = z.object({ slug: z.string().min(1).max(80) 
 
 export const publicEventsQuerySchema = paginationQuerySchema.extend({ orgId: z.uuid().optional() });
 export type PublicEventsQuery = z.infer<typeof publicEventsQuerySchema>;
+
+/** An event as the organizer endpoints return it. Dates are ISO strings in UTC. */
+export interface EventView {
+  id: string;
+  orgId: string;
+  title: string;
+  slug: string;
+  description: string;
+  venue: string;
+  startsAt: string;
+  endsAt: string;
+  saleStartsAt: string;
+  saleEndsAt: string;
+  status: EventStatus;
+  bannerKey: string | null;
+  bannerUrl: string | null;
+  queueMode: boolean;
+  admitRatePerSec: number;
+  tiers: TierView[];
+}
+
+/** A row of an event list: no tiers, but their totals. */
+export interface EventSummary extends Omit<
+  EventView,
+  'tiers' | 'description' | 'queueMode' | 'admitRatePerSec'
+> {
+  org: { name: string; slug: string };
+  capacity: number;
+  soldCount: number;
+}
 
 export interface TierView {
   id: string;

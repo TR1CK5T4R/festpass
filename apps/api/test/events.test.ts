@@ -99,6 +99,50 @@ describe('organizer flow', () => {
     expect(byScanner.status).toBe(403);
     expect(byOutsider.status).toBe(404);
   });
+
+  it('queue settings default to off at 50/s, and an unrelated edit leaves them alone', async () => {
+    const event = await createEvent();
+    const turnOn = await request(app)
+      .patch(`${orgPath()}/${event.id}`)
+      .set(owner.auth)
+      .send({ queueMode: true, admitRatePerSec: 5 });
+    const rename = await request(app)
+      .patch(`${orgPath()}/${event.id}`)
+      .set(owner.auth)
+      .send({ title: 'Tech Fest Finale' });
+
+    expect(event).toMatchObject({ queueMode: false, admitRatePerSec: 50 });
+    expect(turnOn.body.event).toMatchObject({ queueMode: true, admitRatePerSec: 5 });
+    expect(rename.body.event).toMatchObject({ queueMode: true, admitRatePerSec: 5 });
+  });
+
+  it('rejects an admit rate outside 1–1000 per second', async () => {
+    const res = await request(app)
+      .post(orgPath())
+      .set(owner.auth)
+      .send({ ...eventBody(), admitRatePerSec: 0 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.details.fields).toContainEqual(
+      expect.objectContaining({ path: 'admitRatePerSec' }),
+    );
+  });
+
+  it('the org event list sums sold and capacity over the tiers', async () => {
+    const event = await createEvent();
+    const vip = await createTier(event.id, { ...tierBody, name: 'VIP', capacity: 20 });
+    await createTier(event.id);
+    await prisma.ticketTier.update({ where: { id: vip.id }, data: { soldCount: 7 } });
+    await createEvent(eventBody('Empty Fest'));
+
+    const res = await request(app).get(orgPath()).set(owner.auth);
+
+    expect(res.body.items).toEqual([
+      expect.objectContaining({ id: event.id, status: 'DRAFT', capacity: 120, soldCount: 7 }),
+      expect.objectContaining({ title: 'Empty Fest', capacity: 0, soldCount: 0 }),
+    ]);
+    expect(res.body.items[0]).not.toHaveProperty('tiers');
+  });
 });
 
 describe('tier rules', () => {
