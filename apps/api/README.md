@@ -96,8 +96,10 @@ packages/shared/
   src/orgs.ts            createOrgSchema, member schemas, org/member params, OrgSummary and OrgMemberView
   src/permissions.ts     ORG_ROLES, ORG_ACTIONS, the PERMISSIONS matrix and can(role, action)
   src/pagination.ts      paginationQuerySchema and the Page<T> response type
-  src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, TierView
+  src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, EventView, EventSummary, TierView
+  src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
   src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
+  test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
 packages/mongo/
   src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
 ```
@@ -148,6 +150,7 @@ packages/mongo/
 - **Status:** `status.ts` lists the allowed transitions (DRAFT → PUBLISHED → CLOSED). Publishing also needs at least one tier and `startsAt` in the future. The change itself is `UPDATE ... WHERE id = $1 AND status = $from`, so two parallel publishes can't both succeed.
 - **Tier lock after sales:** `updateTierLocked()` runs `SELECT ... FROM ticket_tiers WHERE id = $1 FOR UPDATE`, then checks the rules against the locked row: once `sold_count > 0` the price can't change and capacity can only grow. The booking engine's `UPDATE ... sold_count` takes the same row lock, so no sale can slip in between the check and the update. Deleting uses `DELETE ... WHERE sold_count = 0`. The Day 2 CHECK (`sold_count <= capacity`) stays as the last line of defence.
 - **Keyset pagination:** `listEvents()` orders by `(starts_at, id)` and continues with `starts_at > c.starts_at OR (starts_at = c.starts_at AND id > c.id)`, fetching `limit + 1` rows to know whether there's another page. The cursor is that pair, base64url-encoded. Served by the `events(status, starts_at, id)` index.
+- **Organizer list and queue settings:** `GET /orgs/:orgId/events` items carry `capacity` and `soldCount` summed over the event's tiers (read with the page, no extra query). Events carry `queueMode` and `admitRatePerSec` (1–1000, default off at 50/s from the database); the create schema leaves them optional and the update schema has no defaults, so a partial update never resets them.
 - **Public view:** `GET /events` shows `PUBLISHED` events whose `ends_at` is still in the future; `GET /events/:slug` also shows `CLOSED` ones, never drafts. Each tier carries `available = capacity - sold_count`, which is only a hint; booking (Day 11) rechecks in Postgres.
 
 ### Banner uploads (`src/modules/uploads/`, `src/lib/storage.ts`)
@@ -292,3 +295,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 6:** events and ticket tiers under `/orgs/:orgId/events` (create, list, get, update, publish, close; tier create, update, delete), status transitions, price lock and grow-only capacity after a sale under a row lock, public keyset-paginated `GET /events` and `GET /events/:slug`, `events(status, starts_at, id)` index.
 - **Day 7:** CORS middleware for the web app's origin with credentials (`WEB_ORIGINS`); `packages/shared` imports its own files with `.ts` extensions (rewritten to `.js` on build) so the Next.js bundler can read it as source.
 - **Day 8:** storage module on AWS SDK v3 and SeaweedFS in docker compose (MinIO images are no longer pullable); `POST /uploads/presign` with a 2 MB, type-locked pre-signed POST for a server-chosen key; `bannerKey` on event PATCH verified with HeadObject; `bannerUrl` on every event; `storage:init` (bucket, banner-only public-read policy, CORS) and `storage:upload-banner` scripts; upload tests with S3 mocked.
+- **Day 9:** event responses include `queueMode` and `admitRatePerSec` (validated 1–1000, no defaults on update); the org event list sums `capacity` and `soldCount` over tiers; shared `money.ts` (rupee/paise) with Vitest tests in `packages/shared`; friendlier shared messages for dates and numbers.

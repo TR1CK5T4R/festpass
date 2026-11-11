@@ -6,7 +6,16 @@
 
 **Status:** in development. See the [30-day progress](#30-day-progress) tracker and the [build log](#build-log).
 
-![Organizer dashboard: a club, its owner and the team list](.github/screenshots/dashboard.png)
+![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
+
+<details>
+<summary>More screenshots: event editor, team</summary>
+
+![Event editor: banner, ticket tiers in rupees, details with the waiting-room setting](.github/screenshots/organizer-event.png)
+
+![Team page: add a member by email, change roles, remove](.github/screenshots/organizer-members.png)
+
+</details>
 
 **Deeper docs:** [Frontend README](apps/web/README.md) · [Backend README](apps/api/README.md)
 
@@ -18,10 +27,10 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 
 | Feature | Status |
 |---|---|
-| Accounts, clubs (organizations) and roles | Done: API (Days 4–5); register, login and create-club screens (Day 7) |
-| Web app: auth screens, silent refresh, organizer dashboard shell | Done (Day 7) |
-| Events and ticket tiers, SEO-friendly public pages | API done (Day 6); organizer UI and public pages planned (Days 9–10) |
-| Event banners uploaded straight from the browser to S3-compatible storage | API and storage done (Day 8); upload UI planned (Day 9) |
+| Accounts, clubs (organizations) and roles | Done: API (Days 4–5); register, login and create-club screens (Day 7); members page (Day 9) |
+| Web app: auth screens, silent refresh, organizer dashboard | Done (Days 7, 9) |
+| Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages planned (Day 10) |
+| Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
@@ -64,7 +73,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 
 | Step | What happens | Why it's built this way | Status |
 |---|---|---|---|
-| 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Planned (Day 6) |
+| 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Done (API Day 6, dashboard Day 9) |
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Planned (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Planned (Days 11–12) |
@@ -95,7 +104,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 
 | Layer | Technology |
 |---|---|
-| Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3 |
+| Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3, react-hook-form 7.91 with the shared Zod schemas |
 | API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO |
 | Jobs | BullMQ worker |
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
@@ -154,6 +163,16 @@ _Filled in as each piece is built. Each entry covers the problem, the approach, 
 **Limits:** the content type is the one the uploader declared; nothing sniffs the bytes yet. Replaced banners stay in storage until a cleanup job exists. Cloudflare R2 has no bucket policies, so in production banners will go in a bucket with public access turned on (planned, Day 29).
 
 **Tested by:** `apps/api/test/uploads.test.ts` (S3 mocked): the signed policy contains the size range and type; a bad content type returns 400; a non-member gets 404 and a scanner 403; a PATCH with a missing object, a 2 MB + 1 byte object, a non-image type or another event's key is rejected. The real limits were also checked against SeaweedFS: 3 MB upload `400 EntityTooLarge`, swapped type `403 AccessDenied`, anonymous GET outside the banner prefix `403`.
+
+### Money as integer paise, converted at the edge (Day 9)
+
+**Problem:** prices are typed and read in rupees ("₹99.99"), but rupees with decimals are floats in JavaScript, and `99.99 * 100` is `9998.999999999998`. A float price can lose a paisa on the way in, and sums of floats drift.
+
+**Approach:** everything behind the form (API, database, booking maths, Razorpay amounts) uses integer paise (`price_paise INT`, Zod `.int()`). Rupees exist only in the input box and on screen. `packages/shared/src/money.ts` is the only crossing: `rupeesToPaise` parses the text (`"99.99"` -> `99 * 100 + 99`) instead of multiplying a float and rejects more than 2 decimals rather than guessing; `paiseToRupees` and `formatPaise` go back with integer division. The web forms call it inside `sharedSchemaResolver`, so the shared `createTierSchema` validates the paise value and its errors are shown on the rupee input.
+
+**Alternatives:** storing `NUMERIC(10,2)` rupees (exact in Postgres, but JavaScript would still see floats); converting with `Math.round(rupees * 100)` (works for 99.99 but hides typos like 1.005).
+
+**Tested by:** `packages/shared/test/money.test.ts`: ₹99.99, ₹0.29 and ₹1.1 convert exactly; `1.005`, `-5`, `1,299`, `.5` and huge values are rejected; every amount from ₹0.00 to ₹1,000.00 round-trips. In the browser walk-through, typing ₹99.99 stored `price_paise = 9999`.
 
 **Planned:**
 
@@ -266,7 +285,7 @@ pnpm dev        # web on :3000, API on :4000, worker in the background
 
 Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`) all log in with the password `festpass-dev`.
 
-Check it: open http://localhost:3000, register (or log in with a seed account), create a club and reload the page: you stay logged in. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
+Check it: open http://localhost:3000, register (or log in with a seed account), create a club and reload the page: you stay logged in. Then click **New event**, add tiers and a banner, and publish it from the event page. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
 Upload a banner end to end (with `pnpm dev` running): `pnpm storage:upload-banner ./some-image.png`. It logs in as the seed organizer, presigns, uploads straight to storage, PATCHes the event and prints the public URL.
 
@@ -348,8 +367,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | POST | `/api/v1/orgs/:orgId/members` | Bearer, `member:manage` | Body `{ email, role }` adds an existing user. `201 { member }`; `404` if no account has that email; `409 ALREADY_MEMBER` |
 | PATCH | `/api/v1/orgs/:orgId/members/:userId` | Bearer, `member:manage` | Body `{ role }`. `200 { member }`; `409 LAST_OWNER` if it would leave no OWNER |
 | DELETE | `/api/v1/orgs/:orgId/members/:userId` | Bearer, `member:manage` | `204`; `409 LAST_OWNER` for the last OWNER |
-| POST | `/api/v1/orgs/:orgId/events` | `event:create` | Body `{ title, description?, venue, startsAt, endsAt, saleStartsAt, saleEndsAt }` (ends after start, sales end by the event's end). Creates a DRAFT; the slug comes from the title, with a 4-character suffix if taken. `201 { event }` |
-| GET | `/api/v1/orgs/:orgId/events` | `org:read` | All of the org's events, any status, `{ items, nextCursor }` |
+| POST | `/api/v1/orgs/:orgId/events` | `event:create` | Body `{ title, description?, venue, startsAt, endsAt, saleStartsAt, saleEndsAt, queueMode?, admitRatePerSec? }` (ends after start, sales end by the event's end; waiting room off and 50/s by default, rate 1–1000). Creates a DRAFT; the slug comes from the title, with a 4-character suffix if taken. `201 { event }` |
+| GET | `/api/v1/orgs/:orgId/events` | `org:read` | All of the org's events, any status, `{ items, nextCursor }`; each item has `capacity` and `soldCount` summed over its tiers |
 | GET | `/api/v1/orgs/:orgId/events/:eventId` | `org:read` | `200 { event }` with its tiers (`soldCount`, `available`) |
 | PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; dates re-checked together, tier sale windows must still fit. The slug never changes. `bannerKey` (from presign) is saved only after `HeadObject` confirms the object exists, is JPEG/PNG/WebP and at most 2 MB, else `400` on `bannerKey`; `null` removes the banner. `409 EVENT_CLOSED` once closed |
 | POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | Body `{ eventId, contentType: image/jpeg \| image/png \| image/webp }`. `201 { upload: { url, fields, key, maxBytes, expiresAt } }`: POST a multipart form to `url` with every `fields` entry, then the file as `file`, within 5 minutes. `400` for another type, `404` for non-members (same as a missing event), `403` for scanners |
@@ -378,7 +397,9 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/health.test.ts`: liveness; readiness returns 200 when all checks pass, and 503 naming the dependency when a check fails or hangs (checks are injected fakes, so no real outage is needed).
 - `apps/api/test/auth.test.ts` (against the test database): register stores a cost-12 bcrypt hash and only the SHA-256 of the refresh token, and sets an `HttpOnly`, `SameSite=Lax`, `/api/v1/auth` cookie; duplicate email (any case) returns 409; wrong password and unknown email return the same 401; `/me` rejects a missing, expired or forged token; refresh rotates the token within its family; replaying an old token revokes the whole family; logout makes the refresh token stop working.
 - `apps/api/test/orgs.test.ts` (against the test database): loops over every role × action and checks both `can()` and the real `requireOrgPermission` middleware against a hand-written policy table; a non-member gets 404 for every action, identical to a nonexistent org; creating an org makes the creator OWNER; owners add members by email, managers get 403; the last OWNER can't be demoted or removed; two owners demoting each other concurrently leave exactly one OWNER.
-- `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
+- `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; queue settings default to off at 50/s and survive unrelated edits, and a rate of 0 is a 400; the org list sums sold and capacity over tiers; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
+- `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
+- `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
 - `apps/api/test/uploads.test.ts` (S3 mocked with a spy on the client's `send`): presign signs a fixed key under the event's banner prefix with `content-length-range` and `Content-Type` in the policy; a bad content type returns 400, a non-member 404, a scanner 403, no login 401; PATCH saves a confirmed `bannerKey` and returns `bannerUrl`, rejects a missing object, an object over 2 MB and a non-image type, rejects another event's key without calling storage, and `null` clears the banner.
 - `apps/api/test/cors.test.ts`: the web origin gets a preflight with credentials allowed; any other origin gets no CORS headers.
@@ -407,7 +428,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 06 (Wed 04 Nov): Events and ticket tiers API
 - [x] Day 07 (Thu 05 Nov): Web foundation and auth UI
 - [x] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
-- [ ] Day 09 (Sat 07 Nov): Organizer dashboard UI
+- [x] Day 09 (Sat 07 Nov): Organizer dashboard UI
 - [ ] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
 - [ ] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
 - [ ] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
@@ -521,6 +542,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** the browser uploads straight to storage with a pre-signed POST instead of sending the file through the API, so the API never handles file bytes. The POST policy (rather than a pre-signed PUT) lets storage itself enforce the 2 MB range and the content type.
 **Verify:** `pnpm test`, then `pnpm infra:up`, `pnpm storage:init`, `pnpm dev`, and `pnpm storage:upload-banner ./some-image.png`. Open the printed URL.
 **Next:** Day 9 builds the organizer dashboard UI, including a banner uploader on top of this flow.
+
+### Day 09: Organizer dashboard UI (2026-11-07)
+**Built:**
+- Events list per club with status badges and sold / capacity (summed by the API), and an event editor at `/dashboard/orgs/[orgId]/events/[eventId]` for details, sale window, waiting-room toggle and admit rate.
+- A tier editor that takes rupees and sends paise through a shared, tested `rupeesToPaise`, and a banner uploader on the Day 8 flow with preview, progress and error states.
+- Publish and close behind confirmation dialogs that show the API's refusal (e.g. "Add at least one ticket tier before publishing"), and a members page to add by email, change roles and remove.
+- `sharedSchemaResolver` so converted forms (local dates, rupees) still validate with the shared Zod schemas, with server field errors shown under the right input.
+
+**Key decision:** convert at the edge: the form shows rupees and local time, and the moment it's submitted they become paise and UTC, the only forms the API, database and booking maths ever see. Storing rupees would put floats (`99.99 * 100 = 9998.999…`) into money maths.
+**Verify:** `pnpm test`, then `pnpm dev`, log in, click **New event**, add a ₹99.99 tier and a banner, publish, and add `scanner@festpass.dev` on **Members**.
+**Next:** Day 10 builds the public event pages (server-rendered and cached) that published events appear on.
 
 <!-- BUILD-LOG:END -->
 
