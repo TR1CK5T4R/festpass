@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, type ReactNode } from 'react';
 import { Button } from '@/components/ui/button';
 import { api } from '@/lib/api';
@@ -38,6 +38,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
               FestPass
             </Link>
             <OrgSwitcher />
+            <Nav />
             <span className="ml-auto text-sm text-muted">{auth.user.name}</span>
             <Button variant="ghost" onClick={() => void api.logout()}>
               Log out
@@ -47,6 +48,33 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         <main className="mx-auto max-w-5xl px-6 py-8">{children}</main>
       </div>
     </OrgsProvider>
+  );
+}
+
+const tabs = [
+  { href: '/dashboard', label: 'Events' },
+  { href: '/dashboard/members', label: 'Members' },
+];
+
+function Nav() {
+  const pathname = usePathname();
+  const { current } = useOrgs();
+  if (!current) return null;
+  // Event pages live under /dashboard/orgs/..., and they belong to the Events tab.
+  const active = pathname.startsWith('/dashboard/members') ? '/dashboard/members' : '/dashboard';
+  return (
+    <nav aria-label="Dashboard" className="flex gap-1">
+      {tabs.map((t) => (
+        <Link
+          key={t.href}
+          href={t.href}
+          aria-current={active === t.href ? 'page' : undefined}
+          className={`rounded-control px-3 py-1.5 text-sm ${active === t.href ? 'bg-brand-50 font-medium text-brand-700' : 'text-muted hover:text-ink'}`}
+        >
+          {t.label}
+        </Link>
+      ))}
+    </nav>
   );
 }
 
