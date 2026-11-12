@@ -1,7 +1,7 @@
 import { prisma } from '@festpass/db';
 import { truncateAll } from '@festpass/db/testing';
 import request from 'supertest';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { addMember, app, makeOrg, makeUser, type TestUser } from './helpers.js';
 
 beforeEach(() => truncateAll(prisma));
@@ -363,5 +363,45 @@ describe('public endpoints', () => {
     expect(res.body.error.details.fields).toContainEqual(
       expect.objectContaining({ location: 'query', path: 'cursor' }),
     );
+  });
+});
+
+describe('public page revalidation', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const webCalls = (spy: { mock: { calls: Parameters<typeof fetch>[] } }) =>
+    spy.mock.calls.map(([url, init]) => ({
+      url: String(url),
+      auth: new Headers((init as RequestInit).headers).get('authorization'),
+      body: JSON.parse(String((init as RequestInit).body)),
+    }));
+
+  it('tells the web app after publishing and after editing a published event', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null));
+    const event = await createEvent();
+    await createTier(event.id);
+    await request(app).patch(`${orgPath()}/${event.id}`).set(owner.auth).send({ venue: 'Hall B' });
+    expect(fetchSpy).not.toHaveBeenCalled(); // drafts have no public page
+
+    await publish(event.id);
+    await request(app).patch(`${orgPath()}/${event.id}`).set(owner.auth).send({ venue: 'Hall C' });
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+    expect(webCalls(fetchSpy)).toEqual([
+      {
+        url: process.env.WEB_REVALIDATE_URL,
+        auth: `Bearer ${process.env.REVALIDATE_SECRET}`,
+        body: { slug: event.slug },
+      },
+      expect.objectContaining({ body: { slug: event.slug } }),
+    ]);
+  });
+
+  it('a failing web app never fails the organizer request', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+    const event = await createEvent();
+    await createTier(event.id);
+
+    expect((await publish(event.id)).status).toBe(200);
   });
 });

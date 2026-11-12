@@ -6,6 +6,7 @@ const valid = {
   REDIS_URL: 'redis://localhost:6380',
   MONGODB_URI: 'mongodb://localhost:27018/festpass',
   JWT_ACCESS_SECRET: 'x'.repeat(32),
+  REVALIDATE_SECRET: 'y'.repeat(32),
   S3_ENDPOINT: 'http://localhost:9000',
   S3_BUCKET: 'festpass',
   S3_ACCESS_KEY_ID: 'festpass',

@@ -13,6 +13,7 @@ import {
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { slugify } from '../../lib/slug.js';
+import { revalidateEventPages } from '../../lib/revalidate.js';
 import { publicUrl } from '../../lib/storage.js';
 import { verifyBanner } from '../uploads/service.js';
 import * as repo from './repository.js';
@@ -106,7 +107,14 @@ export async function updateEvent(orgId: string, eventId: string, input: UpdateE
   // A storage round trip, so it runs before (never inside) any database write.
   // shortcut: a replaced banner's old object stays in storage; add a cleanup job if that ever costs money.
   if (input.bannerKey) await verifyBanner(orgId, eventId, input.bannerKey);
-  return toEventView(await repo.updateEvent(eventId, input));
+  const updated = toEventView(await repo.updateEvent(eventId, input));
+  refreshPublicPages(updated);
+  return updated;
+}
+
+/** Drafts have no public page, so only published or closed events need their cached pages rebuilt. */
+function refreshPublicPages(event: { slug: string; status: repo.EventRecord['status'] }) {
+  if (event.status !== 'DRAFT') revalidateEventPages(event.slug);
 }
 
 const statusChanged = () =>
@@ -127,6 +135,8 @@ export async function publishEvent(orgId: string, eventId: string) {
   }
   // Guarded update: if a parallel request already published it, this one matches nothing.
   if (!(await repo.transitionStatus(eventId, 'DRAFT', 'PUBLISHED'))) throw statusChanged();
+  // Also clears a cached 404 from anyone who opened the link while it was still a draft.
+  refreshPublicPages({ slug: event.slug, status: 'PUBLISHED' });
   return getEvent(orgId, eventId);
 }
 
@@ -135,6 +145,7 @@ export async function closeEvent(orgId: string, eventId: string) {
   const event = await loadEvent(orgId, eventId);
   assertTransition(event.status, 'CLOSED');
   if (!(await repo.transitionStatus(eventId, 'PUBLISHED', 'CLOSED'))) throw statusChanged();
+  refreshPublicPages({ slug: event.slug, status: 'CLOSED' });
   return getEvent(orgId, eventId);
 }
 
@@ -147,6 +158,7 @@ export async function createTier(orgId: string, eventId: string, input: CreateTi
   const tier = await repo.createTier({ ...input, eventId });
   if (!tier)
     throw new ConflictError('TIER_NAME_TAKEN', 'This event already has a tier with that name');
+  refreshPublicPages(event);
   return toTierView(tier);
 }
 
@@ -179,16 +191,18 @@ export async function updateTier(
     return input;
   });
   if (!tier) throw new NotFoundError('Tier not found');
+  refreshPublicPages(event);
   return toTierView(tier);
 }
 
 export async function deleteTier(orgId: string, eventId: string, tierId: string) {
-  await loadEditableEvent(orgId, eventId);
+  const event = await loadEditableEvent(orgId, eventId);
   const result = await repo.deleteUnsoldTier(eventId, tierId);
   if (result === 'NOT_FOUND') throw new NotFoundError('Tier not found');
   if (result === 'HAS_SALES') {
     throw new ConflictError('TIER_HAS_SALES', 'A tier with sold tickets cannot be deleted');
   }
+  refreshPublicPages(event);
 }
 
 // ---- Public side ----

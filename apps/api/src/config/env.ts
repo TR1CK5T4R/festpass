@@ -23,6 +23,9 @@ const envSchema = z.object({
     .default('http://localhost:3000')
     .transform((s) => s.split(',').map((o) => o.trim()))
     .pipe(z.array(z.url())),
+  // The web app's on-demand revalidation route, called when a public event changes. Same secret on both sides.
+  WEB_REVALIDATE_URL: z.url().default('http://localhost:3000/api/revalidate'),
+  REVALIDATE_SECRET: z.string().min(32),
   // S3-compatible storage: SeaweedFS locally, Cloudflare R2 in production (region "auto" there).
   S3_ENDPOINT: z.url(),
   S3_REGION: z.string().min(1).default('us-east-1'),
