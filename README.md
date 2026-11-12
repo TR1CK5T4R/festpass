@@ -9,7 +9,9 @@
 ![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
 
 <details>
-<summary>More screenshots: event editor, team</summary>
+<summary>More screenshots: public event page, event editor, team</summary>
+
+![Public event page: server-rendered with the banner, times in IST and ticket tiers](.github/screenshots/public-event.png)
 
 ![Event editor: banner, ticket tiers in rupees, details with the waiting-room setting](.github/screenshots/organizer-event.png)
 
@@ -29,7 +31,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 |---|---|
 | Accounts, clubs (organizations) and roles | Done: API (Days 4–5); register, login and create-club screens (Day 7); members page (Day 9) |
 | Web app: auth screens, silent refresh, organizer dashboard | Done (Days 7, 9) |
-| Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages planned (Day 10) |
+| Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages with ISR and on-demand revalidation (Day 10) |
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
@@ -74,7 +76,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | Step | What happens | Why it's built this way | Status |
 |---|---|---|---|
 | 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Done (API Day 6, dashboard Day 9) |
-| 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Planned (Day 10) |
+| 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Planned (Days 11–12) |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Planned (Days 13–16) |
@@ -173,6 +175,20 @@ _Filled in as each piece is built. Each entry covers the problem, the approach, 
 **Alternatives:** storing `NUMERIC(10,2)` rupees (exact in Postgres, but JavaScript would still see floats); converting with `Math.round(rupees * 100)` (works for 99.99 but hides typos like 1.005).
 
 **Tested by:** `packages/shared/test/money.test.ts`: ₹99.99, ₹0.29 and ₹1.1 convert exactly; `1.005`, `-5`, `1,299`, `.5` and huge values are rejected; every amount from ₹0.00 to ₹1,000.00 round-trips. In the browser walk-through, typing ₹99.99 stored `price_paise = 9999`.
+
+### Public pages: SSR + ISR with on-demand revalidation (Day 10)
+
+**Problem:** event pages get the traffic spike: everyone opens the shared link the minute the sale is announced. Rendering each request on the server and calling the API means the spike hits the API and Postgres; client-side rendering would hide the content from search engines and link previews and show a spinner first.
+
+**Approach** (`apps/web/src/app/(public)/`, `apps/web/src/app/api/revalidate/route.ts`, `apps/api/src/lib/revalidate.ts`):
+- `/` and `/e/[slug]` are Server Components that fetch from the public API and send complete HTML (title, Open Graph banner, tiers) in the first response.
+- **ISR** (`export const revalidate = 60`): the rendered HTML is cached and served to everyone; at most once a minute a request triggers a background re-render, and visitors keep getting the cached page meanwhile. A failed re-render keeps the last good page.
+- **On-demand revalidation:** after a published event, its tiers or banner change, the API calls `POST /api/revalidate` on the web app with a shared secret (`Authorization: Bearer`, compared in constant time) and `{ slug }`. The route calls `revalidatePath('/e/{slug}')` and `revalidatePath('/')`, so the next visit renders fresh HTML. The call is fire-and-forget, made after the database work and never inside a transaction; if it fails, the 60 s timer still refreshes the page.
+- **Availability is a hint:** the "12 left" on a cached page can be up to a minute old. The booking endpoint (Day 11) checks live stock in Postgres, so a stale number can only mean "you thought there were tickets and there weren't", which the booking response says clearly, never an oversell.
+
+**Alternatives:** SSR on every request (always fresh, but every visitor during a spike costs an API call and a Postgres query); fully static at build time (needs a deploy per edit); client-side fetching (no HTML for crawlers or link previews, spinner on first load); tag-based revalidation (`revalidateTag`), which is finer-grained but needs every fetch tagged, while two paths per event are enough here.
+
+**Tested by:** `route.test.ts` (wrong or missing secret 401, right secret revalidates both paths, bad slug 400); `events.test.ts` checks the API calls the route after publish and edits but not for drafts, and that an unreachable web app doesn't fail the request. Measured locally under [Performance](#performance).
 
 **Planned:**
 
@@ -285,7 +301,7 @@ pnpm dev        # web on :3000, API on :4000, worker in the background
 
 Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`) all log in with the password `festpass-dev`.
 
-Check it: open http://localhost:3000, register (or log in with a seed account), create a club and reload the page: you stay logged in. Then click **New event**, add tiers and a banner, and publish it from the event page. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
+Check it: open http://localhost:3000 to see the published seed events, open one (`/e/mait-alumni-meet-2026`), then register (or log in with a seed account), create a club and reload the page: you stay logged in. Then click **New event**, add tiers and a banner, and publish it from the event page. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
 Upload a banner end to end (with `pnpm dev` running): `pnpm storage:upload-banner ./some-image.png`. It logs in as the seed organizer, presigns, uploads straight to storage, PATCHes the event and prints the public URL.
 
@@ -299,7 +315,9 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 |---|---|---|
 | `API_PORT` | api | Port the API listens on (default 4000) |
 | `WEB_ORIGINS` | api | Comma-separated browser origins allowed to call the API with cookies (CORS); default `http://localhost:3000` |
-| `NEXT_PUBLIC_API_URL` | web | API base URL the browser calls (default `http://localhost:4000/api/v1`). Inlined into the bundle at build time, so never a secret |
+| `NEXT_PUBLIC_API_URL` | web | API base URL the browser and the public pages' Server Components call (default `http://localhost:4000/api/v1`). Inlined into the bundle at build time, so never a secret |
+| `WEB_REVALIDATE_URL` | api | The web app's revalidation route (default `http://localhost:3000/api/revalidate`), called when a published event changes |
+| `REVALIDATE_SECRET` | api, web | Shared secret for `POST /api/revalidate`, sent as `Authorization: Bearer ...`. At least 32 characters; generate with `openssl rand -base64 48`. Server-only on the web side (no `NEXT_PUBLIC_`) |
 | `NODE_ENV` | api | `development`, `test` or `production` (default `development`). Only `development` shows error messages and stacks in responses |
 | `LOG_LEVEL` | api | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent` (default `info`) |
 | `JWT_ACCESS_SECRET` | api | Secret that signs access tokens (HS256). Required, at least 32 characters; generate one with `openssl rand -base64 48` |
@@ -318,7 +336,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `S3_BUCKET` | api | Bucket for uploads (`festpass`) |
 | `S3_ACCESS_KEY_ID` | api, docker compose | Storage access key; docker compose also uses it as the local SeaweedFS admin key |
 | `S3_SECRET_ACCESS_KEY` | api, docker compose | Storage secret key (never logged) |
-| `S3_PUBLIC_URL` | api | Base URL public objects are served from, used to build `bannerUrl`: `http://localhost:9000/festpass` locally, the R2 public domain in production |
+| `S3_PUBLIC_URL` | api, web | Base URL public objects are served from, used to build `bannerUrl` (api) and as the only allowed `next/image` source (web): `http://localhost:9000/festpass` locally, the R2 public domain in production |
 
 ## Scripts
 
@@ -402,10 +420,32 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
 - `apps/api/test/uploads.test.ts` (S3 mocked with a spy on the client's `send`): presign signs a fixed key under the event's banner prefix with `content-length-range` and `Content-Type` in the policy; a bad content type returns 400, a non-member 404, a scanner 403, no login 401; PATCH saves a confirmed `bannerKey` and returns `bannerUrl`, rejects a missing object, an object over 2 MB and a non-image type, rejects another event's key without calling storage, and `null` clears the banner.
+- `apps/web/src/app/api/revalidate/route.test.ts` (`next/cache` mocked): a wrong secret, no header, or the secret without `Bearer` get 401 and revalidate nothing; the right secret revalidates `/e/{slug}` and `/`; a slug like `../dashboard` is a 400.
+- `apps/web/src/lib/tier-state.test.ts`: a tier follows the event's sale window unless it has its own (early bird); exact boundaries; closed beats sold out beats the window.
+- `apps/api/test/events.test.ts` › public page revalidation (`fetch` spied): editing a draft calls nothing; publishing and editing a published event POST `{ slug }` with the Bearer secret to `WEB_REVALIDATE_URL`; a web app that can't be reached never fails the organizer's request.
 - `apps/api/test/cors.test.ts`: the web origin gets a preflight with credentials allowed; any other origin gets no CORS headers.
 - `apps/api/test/env.test.ts`: env parsing applies defaults, coerces numbers and lists every invalid variable in one message.
 - `packages/db/test/constraints.test.ts`: Postgres rejects `sold_count` above capacity or below zero and an out-of-range `per_user_limit`, even through raw SQL.
 - `packages/db/test/seed.test.ts`: on an empty database the seed creates exactly the demo rows, and a second run changes nothing; seed users log in with `festpass-dev`; `truncateAll` refuses a non-`_test` database.
+
+## Performance
+
+**Public pages (Day 10), measured** on a MacBook Air (Apple M2, 8 GB, macOS 27.2), everything local: `next start` (production build), the API in dev mode, Postgres in Docker.
+
+| What | Result |
+|---|---|
+| Event page served from the ISR cache | `x-nextjs-cache: HIT` on the second request; a title changed directly in the database (bypassing the API) stays hidden until revalidation, proving the page is cached |
+| Edit through the API → public page updated | new title visible 137 ms after the PATCH was sent (first poll that saw it) |
+| Edit saved in the dashboard → public page updated | visible on the first check after "Changes saved", 27 ms later |
+
+**Lighthouse:** not measured yet. To record it, run against the production build with a published event:
+
+```bash
+pnpm build && pnpm --filter @festpass/web start
+npx lighthouse http://localhost:3000/e/mait-alumni-meet-2026 --only-categories=performance,accessibility,best-practices,seo --view
+```
+
+and note the Lighthouse version, mobile or desktop preset, throttling and machine next to the scores.
 
 ## Load test results
 
@@ -429,7 +469,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 07 (Thu 05 Nov): Web foundation and auth UI
 - [x] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
 - [x] Day 09 (Sat 07 Nov): Organizer dashboard UI
-- [ ] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
+- [x] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
 - [ ] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
 - [ ] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
 - [ ] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
@@ -553,6 +593,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** convert at the edge: the form shows rupees and local time, and the moment it's submitted they become paise and UTC, the only forms the API, database and booking maths ever see. Storing rupees would put floats (`99.99 * 100 = 9998.999…`) into money maths.
 **Verify:** `pnpm test`, then `pnpm dev`, log in, click **New event**, add a ₹99.99 tier and a banner, publish, and add `scanner@festpass.dev` on **Members**.
 **Next:** Day 10 builds the public event pages (server-rendered and cached) that published events appear on.
+
+### Day 10: Public event pages with SSR and ISR (2026-11-08)
+**Built:**
+- `/` (upcoming events) and `/e/[slug]` (event page) as Server Components that fetch from the API, cached with ISR (60 s), with loading, error and 404 states (unknown slugs and drafts).
+- On-demand revalidation: the API calls a secret-protected `POST /api/revalidate` after a published event, its tiers or banner change, and the route revalidates `/e/{slug}` and `/`.
+- `generateMetadata` with title, description and the banner as the Open Graph image; tier cards with price, availability, sale state and a Book button (wired up on Days 11 and 15).
+- Banners through `next/image`, env validation in `next.config.ts`, and login and dashboard moved under an `(app)` group so public pages load no auth code.
+
+**Key decision:** ISR plus on-demand revalidation instead of rendering every request: during a sale spike everyone gets the cached HTML and the API isn't touched, while an organizer's edit still appears in well under a second. Availability on that cached page is only a hint; booking checks live stock.
+**Verify:** `pnpm test`, then `pnpm build && pnpm --filter @festpass/web start` with the API running, open http://localhost:3000/e/mait-alumni-meet-2026, view source, and edit the event in the dashboard: the public page changes on the next reload.
+**Next:** Day 11 starts the booking engine: holding tickets with a single conditional `UPDATE` in Postgres.
 
 <!-- BUILD-LOG:END -->
 

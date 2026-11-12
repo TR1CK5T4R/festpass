@@ -8,12 +8,11 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 
 | Area | Who uses it | Route(s) | Status |
 |---|---|---|---|
-| Home page | everyone | `/` | Done (Day 1, links added Day 7) |
 | Design tokens, base components, auth screens | everyone | `/login`, `/register` | Done (Day 7) |
 | Protected dashboard shell: org switcher, create club | organizers | `/dashboard`, `/dashboard/orgs/new` | Done (Day 7) |
 | Organizer dashboard: events list, event editor, tier editor, publish/close, members | organizers | `/dashboard`, `/dashboard/events/new`, `/dashboard/orgs/[orgId]/events/[eventId]`, `/dashboard/members` | Done (Day 9) |
 | Banner uploads straight to storage, with preview and progress | organizers | inside the event editor | Done (Day 9; API Day 8) |
-| Public event list and event pages (SSR + ISR) | attendees | `/`, `/e/[slug]` | Planned (Day 10) |
+| Public event list and event pages (SSR + ISR, on-demand revalidation) | attendees | `/`, `/e/[slug]` | Done (Day 10); Book button wired up on Days 11 and 15 |
 | Checkout with a hold countdown and Razorpay | attendees | `/checkout/[orderId]` | Planned (Day 15) |
 | My Tickets with QR codes and PDF download | attendees | `/tickets` | Planned (Day 18) |
 | Scanner PWA with offline mode | volunteers | `/scan` | Planned (Day 20) |
@@ -37,19 +36,26 @@ Only rows marked **Done** exist in the code. Everything else describes the desig
 ```
 apps/web/
   src/app/
-    layout.tsx                      Root layout: <html>, metadata, global styles, <Providers>
-    providers.tsx                   AuthProvider + ToastProvider (client)
+    layout.tsx                      Root layout: <html>, metadata (title template "%s · FestPass"), global styles
+    providers.tsx                   AuthProvider + ToastProvider (client), used only by (app)
     globals.css                     Tailwind entry point and design tokens (@theme)
-    (public)/page.tsx               Home page
-    (auth)/layout.tsx               Centered card layout
-    (auth)/login/page.tsx           Login form
-    (auth)/register/page.tsx        Register form
-    (dashboard)/dashboard/layout.tsx         Login guard, header, org switcher, Events | Members tabs, log out
-    (dashboard)/dashboard/page.tsx           The club's events (status, sold / capacity, load more) or "create your first club"
-    (dashboard)/dashboard/events/new/page.tsx            New event form (creates a draft)
-    (dashboard)/dashboard/orgs/[orgId]/events/[eventId]/page.tsx  Event editor: banner, tiers, details, publish/close
-    (dashboard)/dashboard/members/page.tsx   Add by email with a role, change roles, remove
-    (dashboard)/dashboard/orgs/new/page.tsx  Create-club form
+    (public)/layout.tsx             Header and footer; no client providers
+    (public)/page.tsx               `/`: upcoming events (Server Component, ISR 60 s)
+    (public)/loading.tsx, error.tsx Skeleton while rendering; message if the API is down and nothing is cached
+    (public)/e/[slug]/page.tsx      `/e/[slug]`: event page, generateMetadata (Open Graph banner), tier cards
+    (public)/e/[slug]/loading.tsx, not-found.tsx  Skeleton; 404 for unknown slugs and drafts
+    api/revalidate/route.ts         POST, called by the API: checks the secret, revalidates /e/{slug} and /
+    api/revalidate/route.test.ts    401 for a wrong or missing secret, 400 for a bad slug, revalidation otherwise
+    (app)/layout.tsx                Wraps login, register and the dashboard in <Providers>
+    (app)/(auth)/layout.tsx         Centered card layout
+    (app)/(auth)/login/page.tsx     Login form
+    (app)/(auth)/register/page.tsx  Register form
+    (app)/(dashboard)/dashboard/layout.tsx         Login guard, header, org switcher, Events | Members tabs, log out
+    (app)/(dashboard)/dashboard/page.tsx           The club's events (status, sold / capacity, load more) or "create your first club"
+    (app)/(dashboard)/dashboard/events/new/page.tsx            New event form (creates a draft)
+    (app)/(dashboard)/dashboard/orgs/[orgId]/events/[eventId]/page.tsx  Event editor: banner, tiers, details, publish/close
+    (app)/(dashboard)/dashboard/members/page.tsx   Add by email with a role, change roles, remove
+    (app)/(dashboard)/dashboard/orgs/new/page.tsx  Create-club form
   src/components/ui/                Button, Input/Textarea/Select/Checkbox, Card, Badge, Toast, EmptyState, ConfirmDialog
   src/components/events/            EventForm, TierEditor, BannerUploader, EventActions (publish/close), StatusBadge
   src/lib/
@@ -63,11 +69,13 @@ apps/web/
     upload.ts                       Banner upload: presign, XHR POST to storage with progress, PATCH bannerKey
     use-api-data.ts                 useApiData(path): load, reload and replace one API resource
     form-helpers.test.ts            Resolver and date conversion tests
+    public-api.ts                   Server-side reads for public pages, cached with `next: { revalidate: 60 }`
+    tier-state.ts (+ .test.ts)      On sale / opens at / ended / sold out / closed, for a tier at a given time
   next.config.ts                    Loads the root .env, transpiles @festpass/shared
   tsconfig.json                     Extends the root config, switches to bundler module resolution
 ```
 
-Route groups (folders in parentheses) organise pages without appearing in URLs: `(public)` for pages anyone sees, `(auth)` for login and register, `(dashboard)` for screens behind login. `/scan` comes later.
+Route groups (folders in parentheses) organise pages without appearing in URLs: `(public)` for pages anyone sees, and `(app)` for everything that needs the auth client: `(auth)` for login and register and `(dashboard)` for screens behind login. Keeping public pages out of `(app)` means they ship no auth code and never call `/auth/refresh`. `/scan` comes later.
 
 **Design tokens** live in `src/app/globals.css` under `@theme`: brand colours (`brand-50` to `brand-700`), text and surface colours (`ink`, `muted`, `line`, `canvas`, `surface`, `danger`, `success`, `warning`), radii (`rounded-control`, `rounded-card`) and the font stack. Components use only these, so a colour change is one line.
 
@@ -94,13 +102,22 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 
 ## Rendering strategy
 
-_Planned (Day 10)._
-
 | Page | Rendering | Why |
 |---|---|---|
-| Event list and event pages | Server-rendered, cached with ISR (60 s), revalidated on demand when an organizer edits | Fast first load and good SEO; the page can be slightly stale because booking always rechecks availability on the server |
-| Dashboards, checkout, tickets | Client-rendered behind login | Personal data, no SEO value |
-| Scanner | Client-only PWA with a service worker | Must work when the venue's network drops |
+| `/` and `/e/[slug]` (Day 10) | Server Components that fetch from the API, cached with ISR (`export const revalidate = 60`), revalidated on demand when an organizer changes a published event | Fast first load, full HTML for search engines and link previews; availability can be up to a minute old because booking rechecks it on the server |
+| Dashboards (Days 7–9), checkout, tickets | Client-rendered behind login | Personal data, no SEO value, must always be current |
+| Scanner (Day 20) | Client-only PWA with a service worker | Must work when the venue's network drops |
+
+**How the public pages are cached (Day 10):**
+- `/e/[slug]` has `generateStaticParams()` returning `[]`: nothing is built at deploy time, each event page is rendered on its first visit and then served from the cache (`x-nextjs-cache: HIT`). A new event never waits for a deploy, and `next build` doesn't need the API.
+- `/` is prerendered at build. If the API isn't reachable during `next build` (CI), `listUpcomingEvents()` builds an empty list instead of failing, and the next refresh fills it in.
+- After 60 s the next visitor still gets the cached page instantly while Next renders a fresh one in the background. If that render fails, the last good page keeps being served.
+- **On demand:** when a published or closed event, its tiers or its banner change, the API POSTs `{ slug }` to `/api/revalidate` with `Authorization: Bearer <REVALIDATE_SECRET>`. The route compares the secret in constant time, validates the slug with the shared `revalidateEventSchema`, and calls `revalidatePath` for `/e/{slug}` and `/`. The next request renders fresh HTML. Measured locally against `next start`: an edit saved in the dashboard was on the public page at the first check after "Changes saved" (27 ms later).
+- **404s:** the API answers 404 for unknown slugs and drafts, and the page calls `notFound()`. Publishing revalidates the path, so a 404 cached while the event was a draft is replaced.
+- **Metadata:** `generateMetadata` sets the title, a 160-character description and Open Graph / Twitter tags with the banner, so shared links show a preview. The page and `generateMetadata` make the same `fetch`, which Next de-duplicates into one API call.
+- **Times** on these pages are formatted on the server in `Asia/Kolkata` with "IST" shown, because the server's own time zone says nothing about the reader. Dashboards format in the browser's time zone.
+- **Images:** banners go through `next/image` (resized, modern formats, `preload` for the hero). `remotePatterns` allows only the storage bucket from `S3_PUBLIC_URL`; `dangerouslyAllowLocalIP` is on only when that bucket is on localhost.
+- **Book button:** shown with the tier's state (on sale, opens at, ended, sold out, closed) but not wired up yet: booking arrives on Day 11 and checkout on Day 15.
 
 ## The scanner app
 
@@ -128,7 +145,8 @@ pnpm dev                               # web on http://localhost:3000 (plus API 
 pnpm --filter @festpass/web dev        # only the web app
 pnpm --filter @festpass/web build      # production build
 pnpm --filter @festpass/web typecheck  # generates route types, then runs tsc
-pnpm --filter @festpass/web test       # API client, resolver and date tests
+pnpm --filter @festpass/web test       # API client, resolver, date, tier-state and revalidate-route tests
+pnpm build && pnpm --filter @festpass/web start   # production server: the only mode where ISR caching happens
 ```
 
 ## Environment variables
@@ -137,7 +155,11 @@ Read from the root `.env` (loaded in `next.config.ts`).
 
 | Variable | Description |
 |---|---|
-| `NEXT_PUBLIC_API_URL` | Base URL of the API, e.g. `http://localhost:4000/api/v1` (the default). `NEXT_PUBLIC_` values are inlined into the browser bundle at build time, so they must never be secrets |
+| `NEXT_PUBLIC_API_URL` | Base URL of the API, e.g. `http://localhost:4000/api/v1` (the default). Used by the browser and by Server Components. `NEXT_PUBLIC_` values are inlined into the browser bundle at build time, so they must never be secrets |
+| `REVALIDATE_SECRET` | Shared with the API; `/api/revalidate` only accepts `Authorization: Bearer <this>`. At least 32 characters. Server-only |
+| `S3_PUBLIC_URL` | Where banners are served from; becomes the only `next/image` remote pattern |
+
+`next.config.ts` validates these with Zod whenever `next dev`, `next build` or `next start` loads it, and stops with a list of problems if any is missing or malformed.
 
 The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 
@@ -146,3 +168,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 1:** Next.js app with Tailwind and a placeholder home page on port 3000.
 - **Day 7:** route groups, design tokens and base components, API client with in-memory token and refresh-once retry, AuthProvider with silent refresh, register and login with shared Zod schemas, protected dashboard with org switcher and create-club flow.
 - **Day 9:** organizer dashboard: events list with status and sold / capacity, create and edit event (dates, sale window, waiting-room toggle and admit rate), tier editor in rupees with paise sent to the API, banner uploader with preview and progress, publish and close behind confirmation dialogs, members page; `sharedSchemaResolver`, Textarea/Select/Checkbox/ConfirmDialog components, `warning` colour token; resolver and date tests.
+- **Day 10:** public pages: `/` and `/e/[slug]` as Server Components with ISR (60 s) and on-demand revalidation through a secret-protected `POST /api/revalidate`; `generateMetadata` with Open Graph banner; tier cards with sale state; loading, error and not-found states; `next/image` for banners; env validation in `next.config.ts`; auth and dashboard moved under an `(app)` group so public pages don't load the auth client.
