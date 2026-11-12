@@ -128,6 +128,14 @@ export const eventParamsSchema = z.object({ orgId: z.uuid(), eventId: z.uuid() }
 export const tierParamsSchema = z.object({ orgId: z.uuid(), eventId: z.uuid(), tierId: z.uuid() });
 export const eventSlugParamsSchema = z.object({ slug: z.string().min(1).max(80) });
 
+/** API -> web: "this event's public pages changed". Only real slugs, so it can't name another path. */
+export const revalidateEventSchema = z.object({
+  slug: z
+    .string()
+    .max(80)
+    .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/),
+});
+
 export const publicEventsQuerySchema = paginationQuerySchema.extend({ orgId: z.uuid().optional() });
 export type PublicEventsQuery = z.infer<typeof publicEventsQuerySchema>;
 
@@ -149,6 +157,11 @@ export interface EventView {
   queueMode: boolean;
   admitRatePerSec: number;
   tiers: TierView[];
+}
+
+/** An event on its public page: also says which club runs it. */
+export interface PublicEventView extends EventView {
+  org: { id: string; name: string; slug: string };
 }
 
 /** A row of an event list: no tiers, but their totals. */
