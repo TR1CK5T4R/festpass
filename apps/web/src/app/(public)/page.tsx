@@ -1,27 +1,71 @@
+import type { EventSummary } from '@festpass/shared';
+import Image from 'next/image';
 import Link from 'next/link';
+import { Badge } from '@/components/ui/badge';
+import { formatEventTime } from '@/lib/dates';
+import { listUpcomingEvents } from '@/lib/public-api';
 
-export default function HomePage() {
+// ISR: served from cache, rebuilt in the background at most once a minute, and right away when the API
+// reports that an event was published or edited (POST /api/revalidate).
+export const revalidate = 60;
+
+export default async function HomePage() {
+  const events = await listUpcomingEvents();
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center gap-6 px-6 text-center">
-      <h1 className="text-5xl font-bold tracking-tight">FestPass</h1>
-      <p className="max-w-md text-lg text-muted">
-        Ticketing and entry for college fests, built to stay correct when the whole campus books at
-        once.
-      </p>
-      <div className="flex gap-3">
-        <Link
-          href="/register"
-          className="rounded-control bg-brand-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-brand-700"
-        >
-          Create an account
-        </Link>
-        <Link
-          href="/login"
-          className="rounded-control border border-line bg-surface px-5 py-2.5 text-sm font-medium hover:bg-canvas"
-        >
-          Log in
-        </Link>
+    <div className="flex flex-col gap-8">
+      <section>
+        <h1 className="text-3xl font-bold tracking-tight">Upcoming college events</h1>
+        <p className="mt-2 max-w-xl text-muted">
+          Hackathons, fests and meetups from college clubs. Tickets stay fair even when the whole
+          campus books at the same second.
+        </p>
+      </section>
+      {events.length === 0 ? (
+        <p className="rounded-card border border-dashed border-line bg-surface px-6 py-12 text-center text-muted">
+          No upcoming events right now. Check back soon.
+        </p>
+      ) : (
+        <ul className="grid gap-6 sm:grid-cols-2">
+          {events.map((event, i) => (
+            <li key={event.id}>
+              <EventCard event={event} preload={i === 0} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function EventCard({ event, preload }: { event: EventSummary; preload: boolean }) {
+  const soldOut = event.capacity > 0 && event.soldCount >= event.capacity;
+  return (
+    <Link
+      href={`/e/${event.slug}`}
+      className="group block overflow-hidden rounded-card border border-line bg-surface shadow-sm transition-shadow hover:shadow-md"
+    >
+      <div className="relative aspect-[3/1] bg-gradient-to-br from-brand-600 to-brand-700">
+        {event.bannerUrl && (
+          <Image
+            src={event.bannerUrl}
+            alt=""
+            fill
+            sizes="(min-width: 640px) 480px, 100vw"
+            preload={preload}
+            className="object-cover"
+          />
+        )}
       </div>
-    </main>
+      <div className="flex flex-col gap-1 p-5">
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-lg font-semibold group-hover:text-brand-600">{event.title}</h2>
+          {soldOut && <Badge>Sold out</Badge>}
+        </div>
+        <p className="text-sm text-muted">{formatEventTime(event.startsAt)}</p>
+        <p className="text-sm text-muted">
+          {event.venue} · by {event.org.name}
+        </p>
+      </div>
+    </Link>
   );
 }
