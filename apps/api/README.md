@@ -17,7 +17,8 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Organizations and role-based access | `apps/api`, `packages/shared` | Done (Day 5) |
 | Events and ticket tiers | `apps/api` | Done (Day 6) |
 | Pre-signed banner uploads | `apps/api`, `packages/shared` | Done (Day 8) |
-| Booking engine (Postgres + Redis gate) | `packages/db`, `apps/api` | Planned (Days 11–12) |
+| Booking engine: Postgres correctness and idempotency | `packages/db`, `apps/api` | Done (Day 11) |
+| Booking engine: Redis gate | `apps/api` | Planned (Day 12) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -71,12 +72,13 @@ apps/api/
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
+  src/modules/orders/               routes (POST /events/:eventId/orders), controller (replays stored answers), service (request hash, on-sale checks), repository
   src/modules/uploads/              routes, controller, service (presignBanner with the permission check, verifyBanner with HeadObject)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
   scripts/storage-init.ts           Creates the bucket, public-read policy for banners, CORS for WEB_ORIGINS (idempotent)
   scripts/upload-banner.ts          The whole upload flow from the command line, as the web app will do it
-  test/                             auth, orgs, events, uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
+  test/                             auth, orgs, events, orders (concurrency, idempotency), uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
   vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
   tsconfig.json                     Typecheck config (src, test and scripts)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
@@ -88,9 +90,10 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer()
   src/testing.ts         @festpass/db/testing: migrateTestDatabase(), truncateAll() (only on *_test databases)
   src/generated/         Generated Prisma client (git-ignored, rebuilt by `prisma generate` on install)
-  test/                  global-setup.ts (migrates the test DB), constraints.test.ts, seed.test.ts
+  test/                  global-setup.ts (migrates the test DB), constraints.test.ts, seed.test.ts, booking.test.ts
 packages/shared/
   src/index.ts           paginationQuerySchema, idParamsSchema, ApiErrorBody type
   src/auth.ts            registerSchema, loginSchema, PublicUser and AuthResponse types
@@ -175,19 +178,30 @@ packages/mongo/
 
 ### Booking a ticket
 
-_Planned (Days 11–13)._
+Done (Day 11): steps 1 and 3–4. Planned: the Redis gate (Day 12) and hold expiry (Day 13).
 
-1. The request carries an `Idempotency-Key`. A retry with the same key gets the stored response instead of booking twice.
-2. **Redis gate:** a Lua script checks stock and the per-user limit for every tier in one atomic step. Most of the crowd is rejected here, before Postgres is touched.
-3. **Postgres decides:** in one transaction, for each tier (sorted by ID so concurrent requests lock rows in the same order and can't deadlock):
-   ```sql
-   UPDATE ticket_tiers SET sold_count = sold_count + $qty
-   WHERE id = $tierId AND sold_count + $qty <= capacity
-   RETURNING sold_count;
-   ```
-   No row returned means sold out. The whole transaction rolls back and Redis stock is given back.
-4. The order is saved as `PENDING` with a 10-minute hold, and a delayed job is scheduled to expire it.
-5. If Redis is down, booking still works through Postgres alone, just with more load on the database.
+`POST /events/:eventId/orders` → `orders/service.ts` → `@festpass/db/booking`:
+
+1. **Idempotency first.** The body is hashed (SHA-256 of the event and the items sorted by tier). If `idempotency_keys` already has this user's key, the stored answer is returned (`Idempotent-Replayed: true`), even if the sale has closed since; a different hash is `422 IDEMPOTENCY_KEY_REUSED`.
+2. **Pre-checks, no locks:** the event exists and isn't a draft (else 404), isn't closed (`409 EVENT_CLOSED`), every tier belongs to it (400 on `items.N.tierId`), and every tier's sale window (its own, or the event's) is open (`SALE_NOT_STARTED`, `SALE_ENDED`).
+3. **_Planned (Day 12):_ Redis gate:** a Lua script checks stock and the per-user limit in one atomic step, so most of the crowd is turned away before Postgres.
+4. **One transaction** (`reserveTickets`, READ COMMITTED, raw SQL):
+   1. `pg_advisory_xact_lock(hashtextextended(userId || ':' || eventId, 0))`: one user's requests for one event take turns until COMMIT/ROLLBACK, which releases the lock. Without it, one user's 20 parallel requests got 11 tickets against a limit of 2 in testing.
+   2. Re-read the idempotency key: a duplicate that waited on the lock returns the first request's answer.
+   3. Per-user limit: the user's quantities in `PENDING`, `PAID` and `TICKETED` orders per tier, plus this request, must be within `per_user_limit` (else `409 PER_USER_LIMIT`).
+   4. `SAVEPOINT reserve`, then for each item **sorted by tier ID** (one lock order for everyone, so no deadlocks):
+      ```sql
+      UPDATE ticket_tiers SET sold_count = sold_count + $qty, updated_at = now()
+      WHERE id = $tierId AND sold_count + $qty <= capacity
+      RETURNING price_paise;
+      ```
+      No row means sold out: `ROLLBACK TO SAVEPOINT reserve` gives back the tiers already taken and the answer is `409 SOLD_OUT` naming the tier. The price comes from the locked row.
+   5. `INSERT` the `PENDING` order (`expires_at = now() + HOLD_MINUTES`) and its items (with `unit_price_paise`).
+   6. `INSERT` the answer (status and body) into `idempotency_keys`, in the same transaction, so the order and its stored answer commit or fail together.
+5. If two requests use the same key for different events at once (different advisory locks), the unique `(user_id, key)` index makes the second one's INSERT fail; its whole transaction rolls back and it answers `422`.
+6. **_Planned (Day 13):_** a delayed job expires unpaid holds and gives the tickets back.
+
+No network call happens inside the transaction. `maxWait`/`timeout` are 10 s because in a flash sale many short transactions queue for the same tier row and for pool connections.
 
 ### Paying
 
@@ -257,6 +271,7 @@ _Planned (Days 17–19)._
 | DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` |
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
+| POST | `/api/v1/events/:eventId/orders` | Bearer + `Idempotency-Key` | Hold tickets: `201 { order }` (`PENDING`, `expiresAt`); `409 SOLD_OUT`, `PER_USER_LIMIT`, `SALE_NOT_STARTED`, `SALE_ENDED`, `EVENT_CLOSED`; `422 IDEMPOTENCY_KEY_REUSED`; replays carry `Idempotent-Replayed: true` |
 | POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | `201 { upload: { url, fields, key, maxBytes, expiresAt } }` for a JPEG/PNG/WebP banner up to 2 MB; `400` other types, `404` non-members, `403` scanners |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
 | GET | `/api/v1/health/ready` | none | `200` if Postgres, Redis and Mongo all answer, else `503` with the down dependency marked `"down"` |
@@ -285,7 +300,7 @@ Tests use Vitest and Supertest against `createApp()`, without opening a port. `t
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (1–60, default 10), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -299,3 +314,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 8:** storage module on AWS SDK v3 and SeaweedFS in docker compose (MinIO images are no longer pullable); `POST /uploads/presign` with a 2 MB, type-locked pre-signed POST for a server-chosen key; `bannerKey` on event PATCH verified with HeadObject; `bannerUrl` on every event; `storage:init` (bucket, banner-only public-read policy, CORS) and `storage:upload-banner` scripts; upload tests with S3 mocked.
 - **Day 9:** event responses include `queueMode` and `admitRatePerSec` (validated 1–1000, no defaults on update); the org event list sums `capacity` and `soldCount` over tiers; shared `money.ts` (rupee/paise) with Vitest tests in `packages/shared`; friendlier shared messages for dates and numbers.
 - **Day 10:** on-demand revalidation of the public pages: `revalidateEventPages()` POSTs to the web app's `/api/revalidate` with a shared secret after public event, tier or banner changes; `WEB_REVALIDATE_URL` and `REVALIDATE_SECRET` env vars; shared `revalidateEventSchema` and `PublicEventView`; tests with `fetch` spied.
+- **Day 11:** booking engine in Postgres: `POST /events/:eventId/orders` with a required `Idempotency-Key`; `@festpass/db/booking` (advisory lock per user and event, per-user limit, conditional `UPDATE` per tier in ID order, savepoint for sold-out rollback, order and stored answer in one transaction); `idempotency_keys` table; `validate()` checks headers; `HOLD_MINUTES`; concurrency, idempotency and rollback tests.

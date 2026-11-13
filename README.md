@@ -33,7 +33,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Web app: auth screens, silent refresh, organizer dashboard | Done (Days 7, 9) |
 | Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages with ISR and on-demand revalidation (Day 10) |
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
-| Oversell-proof booking engine (Postgres + Redis gate) | Planned (Days 11–12) |
+| Oversell-proof booking engine (Postgres + Redis gate) | Postgres booking with idempotent retries done (Day 11); Redis gate planned (Day 12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Planned (Days 17–18) |
@@ -78,7 +78,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Done (API Day 6, dashboard Day 9) |
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
-| 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Planned (Days 11–12) |
+| 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Postgres part done (Day 11, API only); Redis gate planned (Day 12) |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Planned (Days 13–16) |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Planned (Days 17–18) |
 | 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
@@ -190,9 +190,57 @@ _Filled in as each piece is built. Each entry covers the problem, the approach, 
 
 **Tested by:** `route.test.ts` (wrong or missing secret 401, right secret revalidates both paths, bad slug 400); `events.test.ts` checks the API calls the route after publish and edits but not for drafts, and that an unreachable web app doesn't fail the request. Measured locally under [Performance](#performance).
 
+### Preventing oversells (Day 11)
+
+**Problem:** 200 students press **Book** on the last 10 tickets in the same second. The naive code, `SELECT sold_count`, check it in JavaScript, then `UPDATE`, lets every request read "10 left" before any of them writes, so all 200 succeed. The same gap lets one student send 20 requests at once and slip past a "2 per person" limit.
+
+**Approach** (`packages/db/src/booking.ts`, one transaction in hand-written SQL, called by `apps/api/src/modules/orders/service.ts` after it checks that the event is published and on sale):
+
+```sql
+-- 1. One user's requests for one event take turns; released automatically at COMMIT or ROLLBACK.
+SELECT pg_advisory_xact_lock(hashtextextended(:userId || ':' || :eventId, 0));
+
+-- 2. A retry that waited on the lock finds the first request's stored answer and returns it.
+SELECT request_hash, status, response FROM idempotency_keys WHERE user_id = :userId AND key = :key;
+
+-- 3. Per-user limit: tickets this user already holds in the tier (PENDING, PAID, TICKETED) + this request.
+SELECT t.id, t.per_user_limit, COALESCE(SUM(held qty), 0) ... FROM ticket_tiers t WHERE t.id = ANY(:tierIds);
+
+-- 4. For each item, sorted by tier ID: take the tickets only if they still exist.
+UPDATE ticket_tiers SET sold_count = sold_count + :qty
+WHERE id = :tierId AND sold_count + :qty <= capacity
+RETURNING price_paise;          -- no row: sold out, ROLLBACK TO SAVEPOINT, answer 409 SOLD_OUT
+
+-- 5. The hold, and the answer stored under the key, in the same transaction.
+INSERT INTO orders (..., status, expires_at) VALUES (..., 'PENDING', now() + make_interval(mins => :hold));
+INSERT INTO order_items ...;  INSERT INTO idempotency_keys (..., status, response) VALUES (..., 201, :body);
+```
+
+- **The conditional UPDATE is the whole check.** The `WHERE` clause is evaluated while holding the tier's row lock, against the latest committed `sold_count`, so there is no gap between reading and writing for another request to slip into. Under READ COMMITTED, a request that waited for the lock re-checks the condition against the winner's committed value.
+- **Tier IDs are sorted** so every transaction locks rows in the same order: two orders for {Day pass, Workshop} and {Workshop, Day pass} can't each hold one row while waiting for the other.
+- **The advisory lock** is per (user, event), so it serialises one user's parallel requests (making the per-user count trustworthy) without slowing anyone else down.
+- **Idempotency:** the answer (`201` with the order, or a `409` like `SOLD_OUT`) is stored with the order in one transaction, so they commit or fail together. A retry is answered from the table, even after the sale closes. If two requests use the same key for different events at once, the unique `(user_id, key)` index stops the second, its whole transaction (order included) rolls back, and it gets `422`.
+- The CHECK constraint `sold_count <= capacity` from Day 2 stays underneath as the last line of defence.
+
+**Alternatives:** `SELECT ... FOR UPDATE` then `UPDATE` (correct, but two round trips holding the lock and easy to get wrong); SERIALIZABLE isolation (correct, but losers fail with serialization errors that need retry loops); checking stock in Redis only (fast, but Redis is not the source of truth; it becomes the fast gate on Day 12).
+
+**Tested by** `apps/api/test/orders.test.ts` (real Postgres, requests through the HTTP API with `Promise.all`), run 5 times in a row, same result every time:
+
+| Test | Result |
+|---|---|
+| 200 different users, 1 ticket each, tier capacity 10 | 10 × `201`, 190 × `409 SOLD_OUT`, `sold_count` = 10, 10 orders |
+| 1 user, 20 parallel requests, `perUserLimit` 2 | 2 × `201`, 18 × `409 PER_USER_LIMIT`, `sold_count` = 2 |
+| Same user, advisory lock removed (manual check, not committed) | 11 × `201` against a limit of 2, in 3 out of 3 runs: the lock is what makes the limit hold |
+| 60 users, half ordering {A, B} and half {B, A} | 60 × `201`, no deadlock |
+| Same key and body twice; 10 parallel copies of one request | one order, every response identical, `Idempotent-Replayed: true` on retries |
+| Same key, different body | `422 IDEMPOTENCY_KEY_REUSED`, nothing booked |
+| Second tier sold out in a two-tier order | `409 SOLD_OUT` naming it; the first tier's tickets are given back |
+
+`packages/db/test/booking.test.ts` forces the unique-index case deterministically (another transaction holds the same key uncommitted) and checks the booking rolls back completely and reports the key as reused.
+
 **Planned:**
 
-- Preventing oversells (Days 11–12, 24)
+- Redis gate in front of Postgres (Day 12), load-tested (Day 24)
 - Hold expiry (Day 13)
 - Rate limiting (Day 14)
 - Payment idempotency and the order state machine (Days 15–16)
@@ -277,6 +325,7 @@ erDiagram
 ```
 
 - **Orders vs tickets:** an order is a purchase (amount, hold expiry, payment status). A ticket is one entry right (QR code, owner, check-in). An order for 3 tickets has one order row and three ticket rows, and a ticket can later change owner without touching the payment.
+- **Idempotency keys:** `idempotency_keys(user_id, key UNIQUE, request_hash, status, response jsonb)` stores the answer to each booking request (HTTP status and body) in the same transaction as the order, so a retry gets exactly that answer.
 - **Hot-path indexes:** `orders(user_id, status)`, `orders(status, expires_at)` for the hold-expiry sweep, `tickets(owner_user_id)`, `events(org_id, status)`, `events(status, starts_at, id)` for the public event list. `tickets(order_id)` is served by the unique `(order_id, seq)` index, so it has no separate index.
 
 ## Getting started
@@ -330,6 +379,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `MONGODB_URI` | api | MongoDB connection string |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api (worker from Day 13) | Redis connection string |
+| `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid (1–60, default 10) |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
 | `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
 | `S3_REGION` | api | Signing region (default `us-east-1`; `auto` for R2) |
@@ -366,12 +416,13 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES` and later `SOLD_OUT` (409), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT` (409), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie.
 - **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20) and return `{ items, nextCursor }`; pass `nextCursor` back to get the next page (`null` on the last page). Cursors are opaque and keyset-based on `(startsAt, id)`, so pages stay correct when events are added between requests.
+- **Idempotency:** `POST /events/:eventId/orders` requires an `Idempotency-Key` header (a UUID the client generates once per booking attempt). Retrying with the same key and body returns the stored answer, with `Idempotent-Replayed: true`, and books nothing new; the same key with a different body is a `422`.
 - **Dates:** ISO 8601 with a timezone, e.g. `2026-12-12T10:00:00+05:30`; stored and returned in UTC.
 - **Banners:** every event response includes `bannerKey` and `bannerUrl` (a public URL, or `null`).
 
@@ -397,6 +448,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` once anything is sold |
 | GET | `/api/v1/events` | none | Published events that haven't ended, soonest first. `?cursor=&limit=&orgId=`. `{ items, nextCursor }` |
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
+| POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
 | GET | `/api/v1/health/live` | none | Liveness: `200 { "status": "ok" }` whenever the process can answer. Checks no dependencies |
 | POST | `/api/v1/auth/register` | none | Body `{ email, password (8+ chars, max 72 bytes), name, college?, branch?, graduationYear? }`. `201 { user, accessToken }` and sets the `fp_refresh` cookie. `409 EMAIL_TAKEN` if the email (case-insensitive) exists |
 | POST | `/api/v1/auth/login` | none | Body `{ email, password }`. `200 { user, accessToken }` and a new `fp_refresh` cookie (a new token family). `401 INVALID_CREDENTIALS` for a wrong password or unknown email alike |
@@ -415,6 +467,8 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/health.test.ts`: liveness; readiness returns 200 when all checks pass, and 503 naming the dependency when a check fails or hangs (checks are injected fakes, so no real outage is needed).
 - `apps/api/test/auth.test.ts` (against the test database): register stores a cost-12 bcrypt hash and only the SHA-256 of the refresh token, and sets an `HttpOnly`, `SameSite=Lax`, `/api/v1/auth` cookie; duplicate email (any case) returns 409; wrong password and unknown email return the same 401; `/me` rejects a missing, expired or forged token; refresh rotates the token within its family; replaying an old token revokes the whole family; logout makes the refresh token stop working.
 - `apps/api/test/orgs.test.ts` (against the test database): loops over every role × action and checks both `can()` and the real `requireOrgPermission` middleware against a hand-written policy table; a non-member gets 404 for every action, identical to a nonexistent org; creating an org makes the creator OWNER; owners add members by email, managers get 403; the last OWNER can't be demoted or removed; two owners demoting each other concurrently leave exactly one OWNER.
+- `apps/api/test/orders.test.ts` (against the test database, parallel HTTP requests): see the table under [Preventing oversells](#preventing-oversells-day-11); also a missing or non-UUID `Idempotency-Key` (400 on the header), no login (401), a tier of another event and duplicate tiers (400), drafts (404), `SALE_NOT_STARTED` and `EVENT_CLOSED`, and that the hold lasts `HOLD_MINUTES` and copies the tier price.
+- `packages/db/test/booking.test.ts`: when another transaction stores the same idempotency key first, the booking rolls back completely (no order, `sold_count` unchanged) and returns `key-reused`.
 - `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; queue settings default to off at 50/s and survive unrelated edits, and a rate of 0 is a 400; the org list sums sold and capacity over tiers; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
@@ -470,7 +524,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 08 (Fri 06 Nov): Banner uploads with pre-signed URLs
 - [x] Day 09 (Sat 07 Nov): Organizer dashboard UI
 - [x] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
-- [ ] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
+- [x] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
 - [ ] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
 - [ ] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
 - [ ] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
@@ -604,6 +658,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** ISR plus on-demand revalidation instead of rendering every request: during a sale spike everyone gets the cached HTML and the API isn't touched, while an organizer's edit still appears in well under a second. Availability on that cached page is only a hint; booking checks live stock.
 **Verify:** `pnpm test`, then `pnpm build && pnpm --filter @festpass/web start` with the API running, open http://localhost:3000/e/mait-alumni-meet-2026, view source, and edit the event in the dashboard: the public page changes on the next reload.
 **Next:** Day 11 starts the booking engine: holding tickets with a single conditional `UPDATE` in Postgres.
+
+### Day 11: Booking engine I: Postgres correctness (2026-11-09)
+**Built:**
+- `POST /events/:eventId/orders` with a required `Idempotency-Key`: holds tickets in a `PENDING` order that expires after `HOLD_MINUTES` (10), after checking the event is published and on sale.
+- `packages/db/src/booking.ts`: one raw-SQL transaction with a per-(user, event) advisory lock, the per-user limit check, a conditional `UPDATE` per tier in tier-ID order, and the order with its items.
+- An `idempotency_keys` table: the answer (201 or 409) is stored in the same transaction as the order and replayed for retries; the same key with a different body is a 422.
+- Concurrency tests through the HTTP API: 200 buyers for 10 tickets, one buyer racing themselves, opposite lock orders, and idempotent retries.
+
+**Key decision:** a single conditional `UPDATE ... WHERE sold_count + qty <= capacity` instead of reading the count and then writing, so the database decides who gets the last ticket under the row lock, with no read-then-write gap; tier rows are always locked in ID order so multi-tier orders can't deadlock.
+**Verify:** `pnpm --filter @festpass/api exec vitest run test/orders.test.ts` (5 times in a row: 10 × 201 and 190 × SOLD_OUT every time), then `pnpm test`.
+**Next:** Day 12 puts a Redis gate in front of Postgres so most of a flash-sale crowd is turned away before touching the database.
 
 <!-- BUILD-LOG:END -->
 
