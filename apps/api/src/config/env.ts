@@ -23,6 +23,8 @@ const envSchema = z.object({
     .default('http://localhost:3000')
     .transform((s) => s.split(',').map((o) => o.trim()))
     .pipe(z.array(z.url())),
+  // How long a booking holds its tickets before they go back on sale if unpaid.
+  HOLD_MINUTES: z.coerce.number().int().min(1).max(60).default(10),
   // The web app's on-demand revalidation route, called when a public event changes. Same secret on both sides.
   WEB_REVALIDATE_URL: z.url().default('http://localhost:3000/api/revalidate'),
   REVALIDATE_SECRET: z.string().min(32),
