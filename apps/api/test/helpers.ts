@@ -32,3 +32,22 @@ export async function makeOrg(owner: TestUser, name = 'Coding Club') {
 export async function addMember(orgId: string, userId: string, role: OrgRole) {
   await prisma.orgMember.create({ data: { orgId, userId, role } });
 }
+
+/** Many users in one insert, for concurrency tests (200 separate inserts would dominate the run time). */
+export async function makeUsers(count: number): Promise<TestUser[]> {
+  const stamp = Date.now();
+  const users = await prisma.user.createManyAndReturn({
+    data: Array.from({ length: count }, (_, i) => ({
+      email: `crowd${i}-${stamp}@test.dev`,
+      name: `Buyer ${i}`,
+      passwordHash: 'x',
+    })),
+  });
+  return users.map((user) => {
+    const token = jwt.sign({}, process.env.JWT_ACCESS_SECRET!, {
+      subject: user.id,
+      algorithm: 'HS256',
+    });
+    return { id: user.id, email: user.email, auth: { Authorization: `Bearer ${token}` } };
+  });
+}
