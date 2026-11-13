@@ -64,6 +64,7 @@ model User {
   tickets           Ticket[]        @relation("TicketOwner")
   checkedInTickets  Ticket[]        @relation("TicketCheckedInBy")
   sponsorMembership SponsorMember[]
+  idempotencyKeys   IdempotencyKey[]
 
   @@map("users")
 }
@@ -279,4 +280,23 @@ model Booth {
 
   @@unique([sponsorId, name])
   @@map("booths")
+}
+
+// The stored answer to a booking request, keyed by the client's Idempotency-Key. A retry with the same key
+// and body gets this answer again instead of booking twice; the same key with another body is refused.
+model IdempotencyKey {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  key         String   @db.Uuid
+  // SHA-256 of the request (event and items), to recognise "same key, different body".
+  requestHash String   @map("request_hash")
+  // HTTP status of the stored answer: 201 (order created) or 409 (e.g. SOLD_OUT).
+  status      Int
+  response    Json
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@map("idempotency_keys")
 }
