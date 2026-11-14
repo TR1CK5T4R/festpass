@@ -12,6 +12,8 @@ if (!process.env.DATABASE_URL_TEST) {
 process.env.NODE_ENV = 'test';
 process.env.LOG_LEVEL = 'silent';
 process.env.DATABASE_URL = process.env.DATABASE_URL_TEST;
+// Redis database 15 for tests, so flushing it between tests never touches dev data in database 0.
+process.env.REDIS_URL = new URL('/15', process.env.REDIS_URL ?? 'redis://localhost:6380').href;
 // Nothing listens on port 9, so revalidation calls fail at once instead of reaching a running web app.
 process.env.WEB_REVALIDATE_URL = 'http://127.0.0.1:9/api/revalidate';
 
