@@ -18,6 +18,11 @@
       "development": "./src/booking.ts",
       "types": "./dist/booking.d.ts",
       "default": "./dist/booking.js"
+    },
+    "./inventory": {
+      "development": "./src/inventory.ts",
+      "types": "./dist/inventory.d.ts",
+      "default": "./dist/inventory.js"
     }
   },
   "scripts": {

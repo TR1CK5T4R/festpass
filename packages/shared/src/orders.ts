@@ -44,3 +44,25 @@ export interface OrderView {
   expiresAt: string;
   items: OrderItemView[];
 }
+
+/** A booking refusal: the Redis gate and Postgres build it the same way, so clients can't tell them apart. */
+export interface BookingRefusal {
+  code: 'SOLD_OUT' | 'PER_USER_LIMIT';
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export const soldOut = (tier: { id: string; name: string }): BookingRefusal => ({
+  code: 'SOLD_OUT',
+  message: `Not enough "${tier.name}" tickets left`,
+  details: { tierId: tier.id, tierName: tier.name },
+});
+
+export const perUserLimit = (
+  tier: { id: string; name: string; perUserLimit: number },
+  held: number,
+): BookingRefusal => ({
+  code: 'PER_USER_LIMIT',
+  message: `You can hold at most ${tier.perUserLimit} "${tier.name}" ticket(s) and already have ${held}`,
+  details: { tierId: tier.id, limit: tier.perUserLimit, held },
+});

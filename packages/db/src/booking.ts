@@ -1,4 +1,4 @@
-import type { OrderView } from '@festpass/shared';
+import { perUserLimit, soldOut, type OrderView } from '@festpass/shared';
 import { Prisma, prisma } from './index.js';
 
 // The booking path, in hand-written SQL so every lock it takes is visible and explainable.
@@ -35,6 +35,13 @@ export interface ReserveInput {
   requestHash: string;
 }
 
+/**
+ * What one call did: booked the order, refused it (sold out, over the limit), or returned an earlier
+ * answer for the same key. The caller gives Redis stock back unless it booked.
+ */
+export type BookingOutcome =
+  { answer: BookingAnswer; outcome: 'booked' | 'rejected' | 'replayed' } | 'key-reused';
+
 /** The stored answer for this key, 'key-reused' if the key belongs to a different request, or null. */
 export async function findStoredAnswer(
   db: Db,
@@ -52,9 +59,9 @@ export async function findStoredAnswer(
 
 /**
  * Reserves tickets and creates a PENDING order that holds them for `holdMinutes`, in one transaction.
- * Returns the answer (also stored under the Idempotency-Key), or 'key-reused'.
+ * Returns the answer (also stored under the Idempotency-Key) and what happened, or 'key-reused'.
  */
-export async function reserveTickets(input: ReserveInput): Promise<BookingAnswer | 'key-reused'> {
+export async function reserveTickets(input: ReserveInput): Promise<BookingOutcome> {
   try {
     return await prisma.$transaction((tx) => reserveInTransaction(tx, input), {
       // READ COMMITTED is enough: a conditional UPDATE re-checks its WHERE clause against the latest
@@ -77,14 +84,14 @@ export async function reserveTickets(input: ReserveInput): Promise<BookingAnswer
       input.requestHash,
     );
     if (!stored) throw err;
-    return stored;
+    return stored === 'key-reused' ? stored : { answer: stored, outcome: 'replayed' };
   }
 }
 
 async function reserveInTransaction(
   tx: Prisma.TransactionClient,
   { userId, eventId, items, holdMinutes, idempotencyKey, requestHash }: ReserveInput,
-): Promise<BookingAnswer | 'key-reused'> {
+): Promise<BookingOutcome> {
   // 1. One user's requests for one event run one at a time from here until COMMIT or ROLLBACK, when
   //    Postgres releases the lock by itself. Without it, 20 parallel requests from one user could all
   //    read "you hold 0 tickets" before any of them inserts its order, and all pass the per-user limit.
@@ -93,11 +100,14 @@ async function reserveInTransaction(
 
   // 2. A retry of the same request that was waiting on the lock now finds the first one's answer.
   const stored = await findStoredAnswer(tx, userId, idempotencyKey, requestHash);
-  if (stored) return stored;
+  if (stored === 'key-reused') return stored;
+  if (stored) return { answer: stored, outcome: 'replayed' };
 
-  const answer = (a: BookingAnswer) => storeAnswer(tx, userId, idempotencyKey, requestHash, a);
-  const reject = (status: 404 | 409, code: string, message: string, details = {}) =>
-    answer({ status, body: { code, message, details } });
+  const store = (a: BookingAnswer) => storeAnswer(tx, userId, idempotencyKey, requestHash, a);
+  const reject = async (
+    status: 404 | 409,
+    body: { code: string; message: string; details: Record<string, unknown> },
+  ) => ({ answer: await store({ status, body }), outcome: 'rejected' }) as const;
 
   // 3. Per-user limit: tickets this user already holds in each tier (unpaid holds count too, or someone
   //    could stack holds to block a tier), plus this request, must stay within the tier's limit.
@@ -115,14 +125,15 @@ async function reserveInTransaction(
   const byId = new Map(tiers.map((t) => [t.id, t]));
   for (const item of items) {
     const tier = byId.get(item.tierId);
-    if (!tier) return reject(404, 'NOT_FOUND', 'Ticket tier not found', { tierId: item.tierId });
+    if (!tier) {
+      return reject(404, {
+        code: 'NOT_FOUND',
+        message: 'Ticket tier not found',
+        details: { tierId: item.tierId },
+      });
+    }
     if (tier.held + item.qty > tier.per_user_limit) {
-      return reject(
-        409,
-        'PER_USER_LIMIT',
-        `You can hold at most ${tier.per_user_limit} "${tier.name}" ticket(s) and already have ${tier.held}`,
-        { tierId: tier.id, limit: tier.per_user_limit, held: tier.held },
-      );
+      return reject(409, perUserLimit({ ...tier, perUserLimit: tier.per_user_limit }, tier.held));
     }
   }
 
@@ -142,11 +153,7 @@ async function reserveInTransaction(
       RETURNING price_paise`;
     if (!row) {
       await tx.$executeRaw`ROLLBACK TO SAVEPOINT reserve`;
-      const name = byId.get(item.tierId)!.name;
-      return reject(409, 'SOLD_OUT', `Not enough "${name}" tickets left`, {
-        tierId: item.tierId,
-        tierName: name,
-      });
+      return reject(409, soldOut(byId.get(item.tierId)!));
     }
     // The price comes from the locked row, so an organizer's edit can't change it mid-booking.
     prices.set(item.tierId, row.price_paise);
@@ -165,7 +172,7 @@ async function reserveInTransaction(
       VALUES (${order!.id}::uuid, ${item.tierId}::uuid, ${item.qty}, ${prices.get(item.tierId)!})`;
   }
 
-  return answer({
+  const created = await store({
     status: 201,
     body: {
       order: {
@@ -183,6 +190,7 @@ async function reserveInTransaction(
       },
     },
   });
+  return { answer: created, outcome: 'booked' };
 }
 
 /** Saves the answer under the key in the same transaction as the order, so they commit or fail together. */
