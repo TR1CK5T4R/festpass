@@ -3,7 +3,8 @@ import { connectMongo, disconnectMongo } from '@festpass/mongo';
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './lib/logger.js';
-import { redis } from './lib/redis.js';
+import { gateRedis, redis } from './lib/redis.js';
+import { logBookingStatsEvery } from './modules/orders/stats.js';
 
 // Mongoose needs an explicit first connect; Prisma and ioredis connect on first use.
 // Failing fast here lets the process manager restart us instead of serving with a dead dependency.
@@ -17,6 +18,8 @@ try {
 const server = createApp().listen(env.API_PORT, () => {
   logger.info(`api listening on http://localhost:${env.API_PORT}`);
 });
+
+logBookingStatsEvery(60_000);
 
 let shuttingDown = false;
 
@@ -34,7 +37,12 @@ async function shutdown(signal: NodeJS.Signals) {
   // 1. Stop accepting connections and let in-flight requests finish (Node also closes idle keep-alive sockets).
   await new Promise<void>((resolve) => server.close(() => resolve()));
   // 2. Only then close the stores those requests were using.
-  await Promise.allSettled([prisma.$disconnect(), redis.quit(), disconnectMongo()]);
+  await Promise.allSettled([
+    prisma.$disconnect(),
+    redis.quit(),
+    gateRedis.quit(),
+    disconnectMongo(),
+  ]);
   logger.info('shutdown complete');
   process.exit(0);
 }

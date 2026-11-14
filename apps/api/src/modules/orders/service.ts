@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto';
 import { findStoredAnswer, reserveTickets, type BookingAnswer } from '@festpass/db/booking';
 import { prisma } from '@festpass/db';
-import type { CreateOrderInput } from '@festpass/shared';
+import { perUserLimit, soldOut, type CreateOrderInput } from '@festpass/shared';
 import { env } from '../../config/env.js';
 import { AppError, bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { releaseInRedis, reserveInRedis, type GateItem } from './gate.js';
+import { syncInventory } from './inventory.js';
 import * as repo from './repository.js';
+import { bookingStats } from './stats.js';
 
 const keyReused = () =>
   new AppError(
@@ -27,6 +30,7 @@ function hashRequest(eventId: string, items: CreateOrderInput['items']) {
 /**
  * Checks done before the transaction, so it only ever runs for an event that can be booked right now.
  * Reads without locks: if the event changes a moment later, the transaction's own checks still hold.
+ * Returns the requested tiers (name and limit), which the gate needs.
  */
 async function assertOnSale(eventId: string, items: CreateOrderInput['items'], now: Date) {
   const event = await repo.findEventForBooking(eventId);
@@ -57,6 +61,7 @@ async function assertOnSale(eventId: string, items: CreateOrderInput['items'], n
       throw new ConflictError('SALE_ENDED', 'Ticket sales have ended', { tierId: tier.id });
     }
   }
+  return tiers;
 }
 
 export interface OrderResult {
@@ -78,17 +83,52 @@ export async function createOrder(
   if (stored === 'key-reused') throw keyReused();
   if (stored) return { answer: stored, replayed: true };
 
-  await assertOnSale(eventId, input.items, new Date());
-  const answer = await reserveTickets({
-    userId,
-    eventId,
-    items: input.items,
-    holdMinutes: env.HOLD_MINUTES,
-    idempotencyKey,
-    requestHash,
-  });
-  if (answer === 'key-reused') throw keyReused();
-  // Not perfectly exact: a concurrent duplicate that waited on the lock also gets a stored answer here,
-  // and is reported as new. The answer itself is the same either way.
-  return { answer, replayed: false };
+  const tiers = await assertOnSale(eventId, input.items, new Date());
+  const gateItems: GateItem[] = input.items.map((i) => ({
+    ...i,
+    perUserLimit: tiers.get(i.tierId)!.perUserLimit,
+  }));
+
+  // 1. Redis gate: most of a flash-sale crowd is refused here, in memory. Its "no" answers are not
+  //    stored under the Idempotency-Key (that would cost a Postgres write per refusal, which is what
+  //    the gate exists to avoid): nothing was booked, so a retry simply asks again.
+  const gate = await reserveInRedis(eventId, userId, idempotencyKey, gateItems);
+  if (gate.kind === 'sold-out' || gate.kind === 'over-limit') {
+    bookingStats.rejectedAtGate++;
+    const tier = tiers.get(gate.tierId)!;
+    const refusal = gate.kind === 'sold-out' ? soldOut(tier) : perUserLimit(tier, gate.held);
+    throw new ConflictError(refusal.code, refusal.message, refusal.details);
+  }
+  if (gate.kind === 'skipped') bookingStats.gateSkipped++;
+
+  // 2. Postgres decides (Day 11). 3. Compensation: if Redis took stock for an order Postgres didn't
+  //    book (refused, a replay, or an error), give it back so Redis doesn't drift low.
+  const compensate = async () => {
+    if (gate.kind !== 'passed') return;
+    bookingStats.compensated++;
+    await releaseInRedis(eventId, userId, gateItems);
+  };
+  let result;
+  try {
+    result = await reserveTickets({
+      userId,
+      eventId,
+      items: input.items,
+      holdMinutes: env.HOLD_MINUTES,
+      idempotencyKey,
+      requestHash,
+    });
+  } catch (err) {
+    await compensate();
+    throw err;
+  }
+  if (result === 'key-reused' || result.outcome !== 'booked') await compensate();
+  // Tiers Redis didn't know get their keys now (after the commit, so they include this booking), and
+  // the next request is gated again.
+  if (gate.kind === 'skipped' && gate.reason.startsWith('no inventory key'))
+    void syncInventory(eventId);
+  if (result === 'key-reused') throw keyReused();
+  if (result.outcome === 'booked') bookingStats.booked++;
+  if (result.outcome === 'rejected') bookingStats.rejectedAtPostgres++;
+  return { answer: result.answer, replayed: result.outcome === 'replayed' };
 }
