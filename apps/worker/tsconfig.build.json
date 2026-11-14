@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    // The build compiles only this app and uses the other packages' built dist/ files.
+    "customConditions": []
+  },
+  "include": ["src"]
+}

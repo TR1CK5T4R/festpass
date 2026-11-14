@@ -15,6 +15,7 @@ import { bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.
 import { slugify } from '../../lib/slug.js';
 import { revalidateEventPages } from '../../lib/revalidate.js';
 import { publicUrl } from '../../lib/storage.js';
+import { syncInventory } from '../orders/inventory.js';
 import { verifyBanner } from '../uploads/service.js';
 import * as repo from './repository.js';
 import { assertTransition } from './status.js';
@@ -137,6 +138,8 @@ export async function publishEvent(orgId: string, eventId: string) {
   if (!(await repo.transitionStatus(eventId, 'DRAFT', 'PUBLISHED'))) throw statusChanged();
   // Also clears a cached 404 from anyone who opened the link while it was still a draft.
   refreshPublicPages({ slug: event.slug, status: 'PUBLISHED' });
+  // Redis learns each tier's stock before the first booking arrives.
+  await syncInventory(eventId);
   return getEvent(orgId, eventId);
 }
 
@@ -159,6 +162,7 @@ export async function createTier(orgId: string, eventId: string, input: CreateTi
   if (!tier)
     throw new ConflictError('TIER_NAME_TAKEN', 'This event already has a tier with that name');
   refreshPublicPages(event);
+  await syncInventory(eventId); // capacity changed (or a tier came or went)
   return toTierView(tier);
 }
 
@@ -192,6 +196,7 @@ export async function updateTier(
   });
   if (!tier) throw new NotFoundError('Tier not found');
   refreshPublicPages(event);
+  await syncInventory(eventId);
   return toTierView(tier);
 }
 
@@ -203,6 +208,7 @@ export async function deleteTier(orgId: string, eventId: string, tierId: string)
     throw new ConflictError('TIER_HAS_SALES', 'A tier with sold tickets cannot be deleted');
   }
   refreshPublicPages(event);
+  await syncInventory(eventId);
 }
 
 // ---- Public side ----

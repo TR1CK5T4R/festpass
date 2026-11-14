@@ -9,3 +9,5 @@ allowBuilds:
   prisma: true
   # bcrypt is a native module; its install script loads a prebuilt binary (or compiles one).
   bcrypt: true
+  # Optional native speed-up for BullMQ's serializer; the pure-JS fallback is fine.
+  msgpackr-extract: false
