@@ -33,7 +33,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Web app: auth screens, silent refresh, organizer dashboard | Done (Days 7, 9) |
 | Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages with ISR and on-demand revalidation (Day 10) |
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
-| Oversell-proof booking engine (Postgres + Redis gate) | Postgres booking with idempotent retries done (Day 11); Redis gate planned (Day 12) |
+| Oversell-proof booking engine (Postgres + Redis gate) | Done (API): Postgres booking with idempotent retries (Day 11), Redis gate with compensation, fallback and reconciliation (Day 12) |
 | Automatic hold expiry and rate limiting | Planned (Days 13–14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Planned (Days 17–18) |
@@ -78,7 +78,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Done (API Day 6, dashboard Day 9) |
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
-| 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Postgres part done (Day 11, API only); Redis gate planned (Day 12) |
+| 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Planned (Days 13–16) |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Planned (Days 17–18) |
 | 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
@@ -238,9 +238,53 @@ INSERT INTO order_items ...;  INSERT INTO idempotency_keys (..., status, respons
 
 `packages/db/test/booking.test.ts` forces the unique-index case deterministically (another transaction holds the same key uncommitted) and checks the booking rolls back completely and reports the key as reused.
 
+#### Two layers: the Redis gate in front of Postgres (Day 12)
+
+Postgres alone is correct, but in a flash sale every refused request still costs a transaction, a connection and a wait on the same tier row. A Redis gate turns most of the crowd away in memory first. It may only ever say **no** early; every **yes** is decided again by Postgres.
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant A as API
+  participant R as Redis (gate)
+  participant P as Postgres (truth)
+  B->>A: POST /events/:id/orders + Idempotency-Key
+  A->>P: stored answer for this key? (replay)
+  A->>R: reserve script: stock and per-user limit, all items or none
+  alt Redis says no
+    R-->>A: SOLD_OUT or LIMIT
+    A-->>B: 409 (no Postgres transaction)
+  else Redis says yes, or no answer within 50 ms
+    A->>P: one transaction: advisory lock, conditional UPDATE per tier, order + stored answer
+    alt Postgres booked it
+      A-->>B: 201 order
+    else Postgres refused or failed
+      A->>R: release script (compensation)
+      A-->>B: 409 or error
+    end
+  end
+  Note over R,P: every minute the worker resets inv:* from Postgres (reconciliation)
+```
+
+- **Keys:** `inv:{tierId}` = tickets left (`capacity - sold_count`), set when an event is published and whenever a tier changes; `usr:{eventId}:{userId}:{tierId}` = tickets the user holds. Names live in `packages/shared/src/redis-keys.ts`.
+- **One Lua script** (`apps/api/src/modules/orders/gate.ts`) checks every item's stock and per-user limit, then decrements all of them or none. Redis runs a script as one step, so no other request can run between the check and the write; separate `GET` and `DECRBY` calls from Node would reopen the exact race the conditional `UPDATE` closes in Postgres.
+- **Compensation:** if Redis said yes but Postgres didn't book (sold out after all, over the limit, a replay, an error), a matching `release` script gives the stock back.
+- **Duplicates:** a request that passes the gate leaves a 60-second `req:{userId}:{key}` marker, so copies of the same request (double click) skip the gate instead of taking stock twice; Postgres gives them the first answer.
+- **Refusals from the gate aren't stored** under the Idempotency-Key (that would be a Postgres write per refusal, which is what the gate avoids). Nothing was booked, so a retry simply asks again.
+- **Reconciliation:** `reconcileInventory()` (`packages/db/src/inventory.ts`) sets every `inv:*` of events still on sale from Postgres and reports what it fixed. The worker runs it every minute as a BullMQ job scheduler; the API runs it for one event after publishing or a tier change.
+- **Counters:** the API logs `booked`, `rejectedAtGate`, `rejectedAtPostgres`, `gateSkipped` and `compensated` once a minute. In the 200-buyer test with the gate on: 190 refused at Redis, 0 at Postgres.
+
+#### When Redis is down
+
+- The gate uses its own client with no offline queue and a 50 ms limit, so a dead or slow Redis costs at most 50 ms. The API logs a warning and books through **Postgres only**, which is always correct, just with more load on the database.
+- Tested: the whole booking suite runs three times, with Redis working, with every Redis command failing, and with Redis never answering. All three give exactly 10 orders for 10 tickets and the same answers.
+- Publishing still works: syncing `inv:*` has a 1 s limit and only logs if Redis is unreachable.
+- When Redis comes back empty (restarted without data), a tier with no `inv:` key is booked through Postgres and its key is filled in right after; the worker refills the rest within a minute.
+- Ways Redis can drift from Postgres, and how each heals: a release that failed while Redis was down (Redis too low until reconciliation), a script that timed out but still ran (too low), reconciliation racing a booking in flight (briefly too high, which Postgres refuses). Too high only costs a Postgres refusal; too low would show "sold out" for tickets that exist, which reconciliation fixes within a minute.
+
 **Planned:**
 
-- Redis gate in front of Postgres (Day 12), load-tested (Day 24)
+- Load test of the two-layer design (Day 24)
 - Hold expiry (Day 13)
 - Rate limiting (Day 14)
 - Payment idempotency and the order state machine (Days 15–16)
@@ -378,7 +422,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `MONGO_PORT` | docker compose | Host port for MongoDB (default 27018) |
 | `MONGODB_URI` | api | MongoDB connection string |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
-| `REDIS_URL` | api (worker from Day 13) | Redis connection string |
+| `REDIS_URL` | api, worker | Redis connection string (booking gate, BullMQ queues). Tests use database 15 of the same server |
 | `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid (1–60, default 10) |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
 | `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
@@ -467,7 +511,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/health.test.ts`: liveness; readiness returns 200 when all checks pass, and 503 naming the dependency when a check fails or hangs (checks are injected fakes, so no real outage is needed).
 - `apps/api/test/auth.test.ts` (against the test database): register stores a cost-12 bcrypt hash and only the SHA-256 of the refresh token, and sets an `HttpOnly`, `SameSite=Lax`, `/api/v1/auth` cookie; duplicate email (any case) returns 409; wrong password and unknown email return the same 401; `/me` rejects a missing, expired or forged token; refresh rotates the token within its family; replaying an old token revokes the whole family; logout makes the refresh token stop working.
 - `apps/api/test/orgs.test.ts` (against the test database): loops over every role × action and checks both `can()` and the real `requireOrgPermission` middleware against a hand-written policy table; a non-member gets 404 for every action, identical to a nonexistent org; creating an org makes the creator OWNER; owners add members by email, managers get 403; the last OWNER can't be demoted or removed; two owners demoting each other concurrently leave exactly one OWNER.
-- `apps/api/test/orders.test.ts` (against the test database, parallel HTTP requests): see the table under [Preventing oversells](#preventing-oversells-day-11); also a missing or non-UUID `Idempotency-Key` (400 on the header), no login (401), a tier of another event and duplicate tiers (400), drafts (404), `SALE_NOT_STARTED` and `EVENT_CLOSED`, and that the hold lasts `HOLD_MINUTES` and copies the tier price.
+- `apps/api/test/orders.test.ts` (against the test database, parallel HTTP requests): every booking test runs three times, with Redis working, failing and hanging (both Redis states mocked on the gate client), with identical results; see the table under [Preventing oversells](#preventing-oversells-day-11). The gate tests check publishing fills `inv:*`, compensation gives stock back when Postgres refuses, a gate refusal isn't stored under the key, a missing key is refilled after the booking, and reconciliation fixes a corrupted and a missing key (and finds nothing on a second run). Also a missing or non-UUID `Idempotency-Key` (400 on the header), no login (401), a tier of another event and duplicate tiers (400), drafts (404), `SALE_NOT_STARTED` and `EVENT_CLOSED`, and that the hold lasts `HOLD_MINUTES` and copies the tier price.
 - `packages/db/test/booking.test.ts`: when another transaction stores the same idempotency key first, the booking rolls back completely (no order, `sold_count` unchanged) and returns `key-reused`.
 - `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; queue settings default to off at 50/s and survive unrelated edits, and a rate of 0 is a 400; the org list sums sold and capacity over tiers; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
@@ -525,7 +569,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 09 (Sat 07 Nov): Organizer dashboard UI
 - [x] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
 - [x] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
-- [ ] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
+- [x] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
 - [ ] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
 - [ ] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
 - [ ] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
@@ -669,6 +713,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** a single conditional `UPDATE ... WHERE sold_count + qty <= capacity` instead of reading the count and then writing, so the database decides who gets the last ticket under the row lock, with no read-then-write gap; tier rows are always locked in ID order so multi-tier orders can't deadlock.
 **Verify:** `pnpm --filter @festpass/api exec vitest run test/orders.test.ts` (5 times in a row: 10 × 201 and 190 × SOLD_OUT every time), then `pnpm test`.
 **Next:** Day 12 puts a Redis gate in front of Postgres so most of a flash-sale crowd is turned away before touching the database.
+
+### Day 12: Booking engine II: the Redis gate (2026-11-10)
+**Built:**
+- A Lua `reserve` script checks stock (`inv:{tierId}`) and the per-user limit (`usr:...`) for every item and takes all or none; a `release` script gives stock back when Postgres doesn't book (compensation).
+- Order flow: replay check, on-sale checks, Redis gate, then the Day 11 Postgres transaction. If Redis fails or takes over 50 ms, the gate is skipped and Postgres alone decides.
+- `reconcileInventory()` sets `inv:*` from Postgres after publishing and tier changes, and every minute from a BullMQ job in the worker (its first real job), logging any drift it fixes.
+- Counters of refusals at the gate vs at Postgres, logged every minute; the booking suite runs with Redis working, failing and hanging.
+
+**Key decision:** Redis is only a gate that can say no early, never the source of truth: every yes is decided again by the conditional `UPDATE` in Postgres, Redis numbers are reset from Postgres, and losing Redis only costs speed.
+**Verify:** `pnpm --filter @festpass/api exec vitest run test/orders.test.ts` (47 tests: the booking suite in three Redis modes plus the gate tests), `pnpm test`, and `pnpm --filter @festpass/worker dev` to see the reconciliation job run.
+**Next:** Day 13 expires unpaid holds with delayed BullMQ jobs and gives their tickets back in both Postgres and Redis.
 
 <!-- BUILD-LOG:END -->
 

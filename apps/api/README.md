@@ -18,7 +18,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Events and ticket tiers | `apps/api` | Done (Day 6) |
 | Pre-signed banner uploads | `apps/api`, `packages/shared` | Done (Day 8) |
 | Booking engine: Postgres correctness and idempotency | `packages/db`, `apps/api` | Done (Day 11) |
-| Booking engine: Redis gate | `apps/api` | Planned (Day 12) |
+| Booking engine: Redis gate, compensation, fallback, reconciliation job | `apps/api`, `apps/worker`, `packages/db` | Done (Day 12) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -35,7 +35,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 | Process | Started by | Job |
 |---|---|---|
 | **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
-| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ): expiring unpaid holds, issuing tickets, building PDFs, sending email, refunds, reports. |
+| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: inventory reconciliation every minute (Day 12). Later: expiring unpaid holds, issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
 
@@ -45,7 +45,7 @@ They are separate processes so a slow PDF or a stuck email can never slow down b
 |---|---|---|
 | **PostgreSQL 16** | Users, orgs, events, tiers, orders, payments, tickets | The source of truth for money and capacity. It has transactions, row locks and CHECK constraints, so overselling is blocked by the database itself. |
 | **MongoDB 7** | Scan events (time-series), copilot conversations | Many small append-only writes, read through aggregations for analytics. |
-| **Redis 7** | Inventory gate, rate limits, waiting room, job queues | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking. |
+| **Redis 7** | Inventory gate (`inv:*`, `usr:*`, `req:*`, Day 12), job queues (BullMQ, Day 12); later rate limits and the waiting room | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking, and every number in it is reset from Postgres. |
 | **S3 storage** (SeaweedFS locally, R2 in production) | Event banners (public), ticket PDFs (private, Day 18) | S3-compatible object storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
 
 Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 6380 and 9000, bound to 127.0.0.1.
@@ -57,7 +57,7 @@ apps/api/
   src/config/env.ts                 Zod schema for every env var; exits with a readable list if any is invalid
   src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, Set-Cookie)
   src/lib/errors.ts                 AppError + NotFound, Validation, Conflict, Forbidden, Unauthorized, RateLimited
-  src/lib/redis.ts                  ioredis client (lazy connect, auto-reconnect)
+  src/lib/redis.ts                  ioredis clients: `redis` (lazy connect, auto-reconnect) and `gateRedis` (no offline queue: fails fast for the booking gate)
   src/lib/slug.ts                   slugify() for org and event URLs
   src/lib/cursor.ts                 Opaque (startsAt, id) cursors for keyset pagination
   src/lib/revalidate.ts             revalidateEventPages(slug): tells the web app to rebuild /e/{slug} and / (fire and forget)
@@ -72,7 +72,8 @@ apps/api/
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
-  src/modules/orders/               routes (POST /events/:eventId/orders), controller (replays stored answers), service (request hash, on-sale checks), repository
+  src/modules/orders/               routes (POST /events/:eventId/orders), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation), repository
+                                    gate.ts (Lua reserve/release, 50 ms limit), inventory.ts (syncInventory after publish and tier changes), stats.ts (booking counters)
   src/modules/uploads/              routes, controller, service (presignBanner with the permission check, verifyBanner with HeadObject)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
   src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
@@ -83,13 +84,15 @@ apps/api/
   tsconfig.json                     Typecheck config (src, test and scripts)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
 apps/worker/
-  src/index.ts           Starts, logs "worker started", exits cleanly on SIGTERM/SIGINT
+  src/index.ts           Zod env check, pino logger, BullMQ queue `inventory` with a job scheduler (every 60 s) and a
+                         worker that runs reconcileInventory(); closes the worker, queue, Prisma and Redis on SIGTERM/SIGINT
 packages/db/
   prisma/schema.prisma   All Postgres tables, enums, relations and indexes (snake_case via @map/@@map)
   prisma/migrations/     *_init (generated from the schema) and *_check_constraints (hand-written SQL)
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/inventory.ts       @festpass/db/inventory: reconcileInventory(store) sets inv:{tierId} from Postgres and reports drift
   src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer()
   src/testing.ts         @festpass/db/testing: migrateTestDatabase(), truncateAll() (only on *_test databases)
   src/generated/         Generated Prisma client (git-ignored, rebuilt by `prisma generate` on install)
@@ -102,6 +105,8 @@ packages/shared/
   src/pagination.ts      paginationQuerySchema and the Page<T> response type
   src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, EventView, EventSummary, TierView
   src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
+  src/redis-keys.ts      redisKeys.inventory / userHeld, QUEUES and JOBS names (shared by API and worker)
+  src/orders.ts          createOrderSchema, idempotencyHeadersSchema, OrderView, soldOut() / perUserLimit() refusals
   src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
   test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
 packages/mongo/
@@ -178,13 +183,13 @@ packages/mongo/
 
 ### Booking a ticket
 
-Done (Day 11): steps 1 and 3–4. Planned: the Redis gate (Day 12) and hold expiry (Day 13).
+Done (Days 11–12): steps 1–5. Planned: hold expiry (Day 13).
 
 `POST /events/:eventId/orders` → `orders/service.ts` → `@festpass/db/booking`:
 
 1. **Idempotency first.** The body is hashed (SHA-256 of the event and the items sorted by tier). If `idempotency_keys` already has this user's key, the stored answer is returned (`Idempotent-Replayed: true`), even if the sale has closed since; a different hash is `422 IDEMPOTENCY_KEY_REUSED`.
 2. **Pre-checks, no locks:** the event exists and isn't a draft (else 404), isn't closed (`409 EVENT_CLOSED`), every tier belongs to it (400 on `items.N.tierId`), and every tier's sale window (its own, or the event's) is open (`SALE_NOT_STARTED`, `SALE_ENDED`).
-3. **_Planned (Day 12):_ Redis gate:** a Lua script checks stock and the per-user limit in one atomic step, so most of the crowd is turned away before Postgres.
+3. **Redis gate** (`gate.ts`, Day 12): one Lua script, run atomically by Redis, checks every item's `inv:{tierId}` stock and `usr:{eventId}:{userId}:{tierId}` held count against the tier limit, then takes all or nothing and leaves a 60 s `req:{userId}:{key}` marker. Results: `OK` (continue), `SOLD_OUT` / `LIMIT` (409 straight away, same error shape as Postgres, counted as `rejectedAtGate`, not stored under the key), `DUPLICATE` (a copy of a request in flight: skip the gate), `MISS` (no key yet: skip the gate, refill the key after the booking). A Redis error or no answer within 50 ms also skips the gate with a warning; Postgres then decides alone.
 4. **One transaction** (`reserveTickets`, READ COMMITTED, raw SQL):
    1. `pg_advisory_xact_lock(hashtextextended(userId || ':' || eventId, 0))`: one user's requests for one event take turns until COMMIT/ROLLBACK, which releases the lock. Without it, one user's 20 parallel requests got 11 tickets against a limit of 2 in testing.
    2. Re-read the idempotency key: a duplicate that waited on the lock returns the first request's answer.
@@ -198,8 +203,10 @@ Done (Day 11): steps 1 and 3–4. Planned: the Redis gate (Day 12) and hold expi
       No row means sold out: `ROLLBACK TO SAVEPOINT reserve` gives back the tiers already taken and the answer is `409 SOLD_OUT` naming the tier. The price comes from the locked row.
    5. `INSERT` the `PENDING` order (`expires_at = now() + HOLD_MINUTES`) and its items (with `unit_price_paise`).
    6. `INSERT` the answer (status and body) into `idempotency_keys`, in the same transaction, so the order and its stored answer commit or fail together.
-5. If two requests use the same key for different events at once (different advisory locks), the unique `(user_id, key)` index makes the second one's INSERT fail; its whole transaction rolls back and it answers `422`.
-6. **_Planned (Day 13):_** a delayed job expires unpaid holds and gives the tickets back.
+5. **Compensation:** if the gate took stock but the transaction didn't book (refused, a replay, `key-reused` or an exception), the `release` script gives it back (`INCRBY` only on an existing `inv:` key, `DECRBY` the user's count). If that fails, Redis is left too low until reconciliation.
+6. If two requests use the same key for different events at once (different advisory locks), the unique `(user_id, key)` index makes the second one's INSERT fail; its whole transaction rolls back and it answers `422`.
+7. **Reconciliation:** `reconcileInventory()` sets `inv:*` from `capacity - sold_count` for published events whose sale hasn't ended: after publishing and tier changes (one event, 1 s limit) and every minute in the worker (all events). Drift is logged.
+8. **_Planned (Day 13):_** a delayed job expires unpaid holds and gives the tickets back in Postgres and Redis.
 
 No network call happens inside the transaction. `maxWait`/`timeout` are 10 s because in a flash sale many short transactions queue for the same tier row and for pool connections.
 
@@ -296,7 +303,7 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
@@ -315,3 +322,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 9:** event responses include `queueMode` and `admitRatePerSec` (validated 1–1000, no defaults on update); the org event list sums `capacity` and `soldCount` over tiers; shared `money.ts` (rupee/paise) with Vitest tests in `packages/shared`; friendlier shared messages for dates and numbers.
 - **Day 10:** on-demand revalidation of the public pages: `revalidateEventPages()` POSTs to the web app's `/api/revalidate` with a shared secret after public event, tier or banner changes; `WEB_REVALIDATE_URL` and `REVALIDATE_SECRET` env vars; shared `revalidateEventSchema` and `PublicEventView`; tests with `fetch` spied.
 - **Day 11:** booking engine in Postgres: `POST /events/:eventId/orders` with a required `Idempotency-Key`; `@festpass/db/booking` (advisory lock per user and event, per-user limit, conditional `UPDATE` per tier in ID order, savepoint for sold-out rollback, order and stored answer in one transaction); `idempotency_keys` table; `validate()` checks headers; `HOLD_MINUTES`; concurrency, idempotency and rollback tests.
+- **Day 12:** Redis gate in front of the booking transaction: Lua `reserve`/`release` scripts on a fail-fast client (50 ms, no offline queue), compensation, duplicate-request marker, fallback to Postgres only; `@festpass/db/inventory` reconciliation run after publish and tier changes and every minute by the worker's first BullMQ job; booking counters logged every minute; booking tests in three Redis modes.
