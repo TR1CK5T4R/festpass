@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 export const eventIdParamsSchema = z.object({ eventId: z.uuid() });
+export const orderIdParamsSchema = z.object({ orderId: z.uuid() });
 
 /** Each tier at most once; a few tickets per tier (the tier's own perUserLimit is checked by the API). */
 export const createOrderSchema = z.object({

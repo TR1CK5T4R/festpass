@@ -8,6 +8,11 @@
       "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./server": {
+      "development": "./src/server.ts",
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
     }
   },
   "scripts": {
@@ -16,6 +21,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "bullmq": "^6.5.4",
+    "ioredis": "^6.0.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {

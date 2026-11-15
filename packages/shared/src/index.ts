@@ -26,3 +26,4 @@ export * from './uploads.ts';
 export * from './money.ts';
 export * from './orders.ts';
 export * from './redis-keys.ts';
+export * from './queues.ts';

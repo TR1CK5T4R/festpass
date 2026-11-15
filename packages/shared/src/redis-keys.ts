@@ -1,5 +1,5 @@
-// Redis key and queue names, shared by the API (booking gate) and the worker (reconciliation) so the two
-// can never disagree on a name.
+// Redis key names, shared by the API (booking gate) and the worker (reconciliation, hold expiry) so the
+// two can never disagree on a name.
 
 export const redisKeys = {
   /** Tickets left in a tier as Redis believes it: capacity - sold_count, kept in step with Postgres. */
@@ -8,6 +8,3 @@ export const redisKeys = {
   userHeld: (eventId: string, userId: string, tierId: string) =>
     `usr:${eventId}:${userId}:${tierId}`,
 };
-
-export const QUEUES = { inventory: 'inventory' } as const;
-export const JOBS = { reconcileInventory: 'reconcile-inventory' } as const;

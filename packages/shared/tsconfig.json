@@ -2,7 +2,9 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     // This code runs in the browser too, so it may only use APIs both have (e.g. TextEncoder).
-    "lib": ["ES2023", "DOM"]
+    "lib": ["ES2023", "DOM"],
+    // Only for the server-only entry (src/server.ts: BullMQ, ioredis); browser files must not use Node APIs.
+    "types": ["node"]
   },
   "include": ["src", "test"]
 }
