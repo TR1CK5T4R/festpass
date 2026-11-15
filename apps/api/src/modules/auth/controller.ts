@@ -2,6 +2,7 @@ import type { AuthResponse } from '@festpass/shared';
 import type { Request, RequestHandler, Response } from 'express';
 import { env } from '../../config/env.js';
 import * as auth from './service.js';
+import { readCookie } from '../../lib/cookies.js';
 
 // The refresh token lives only in this cookie. httpOnly: page scripts (and XSS) can't read it.
 // SameSite=Lax: other sites can't make the browser send it with a POST. Path: it is only sent to
@@ -14,13 +15,7 @@ const cookieOptions = {
   path: '/api/v1/auth',
 } as const;
 
-function readRefreshCookie(req: Request): string | undefined {
-  for (const part of (req.headers.cookie ?? '').split(';')) {
-    const [name, ...value] = part.trim().split('=');
-    if (name === REFRESH_COOKIE) return value.join('=');
-  }
-  return undefined;
-}
+const readRefreshCookie = (req: Request) => readCookie(req, REFRESH_COOKIE);
 
 function sendSession(res: Response, status: number, session: auth.Session) {
   res.cookie(REFRESH_COOKIE, session.refreshToken, {

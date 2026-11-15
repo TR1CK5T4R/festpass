@@ -15,10 +15,13 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1161.0",
     "@aws-sdk/s3-presigned-post": "^3.1161.0",
+    "@bull-board/api": "^9.11.0",
+    "@bull-board/express": "^9.11.0",
     "@festpass/db": "workspace:*",
     "@festpass/mongo": "workspace:*",
     "@festpass/shared": "workspace:*",
     "bcrypt": "^6.0.0",
+    "bullmq": "^6.5.4",
     "express": "^5.3.0",
     "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
