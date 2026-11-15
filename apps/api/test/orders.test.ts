@@ -5,6 +5,7 @@ import { truncateAll } from '@festpass/db/testing';
 import { redisKeys } from '@festpass/shared';
 import request from 'supertest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ordersQueue } from '../src/lib/queues.js';
 import { gateRedis } from '../src/lib/redis.js';
 import { bookingStats } from '../src/modules/orders/stats.js';
 import { app, makeOrg, makeUser, makeUsers, type TestUser } from './helpers.js';
@@ -92,7 +93,7 @@ describe.each(REDIS_MODES)('with redis %s', (mode) => {
       mode === 'throwing'
         ? Promise.reject(new Error('Connection is closed.'))
         : new Promise<never>(() => {}); // never answers
-    for (const command of ['festpassReserve', 'festpassRelease', 'mget', 'set'] as const) {
+    for (const command of ['festpassReserve', 'eval', 'mget', 'set'] as const) {
       vi.spyOn(gateRedis, command).mockImplementation(fail as never);
     }
   });
@@ -440,5 +441,71 @@ describe('redis gate', () => {
     );
     expect([await stock(regular), await stock(vip)]).toEqual(['6', '3']);
     expect(await reconcileInventory(gateRedis)).toEqual([]); // nothing left to fix
+  });
+});
+
+describe('hold expiry and cancel', () => {
+  const stock = async (tierId: string) => gateRedis.get(redisKeys.inventory(tierId));
+  const cancel = (user: TestUser, orderId: string) =>
+    request(app).post(`/api/v1/orders/${orderId}/cancel`).set(user.auth);
+
+  it('booking queues one expire-order job per order, keyed by the order ID, due when the hold ends', async () => {
+    const { eventId, tierIds } = await saleEvent([{ name: 'Regular', capacity: 10 }]);
+    const buyer = await makeUser();
+    const key = randomUUID();
+    const items = [{ tierId: tierIds[0]!, qty: 1 }];
+
+    const res = await book(buyer, eventId, items, key);
+    await book(buyer, eventId, items, key); // a replay must not queue a second job
+    const orderId = res.body.order.id as string;
+    const job = await ordersQueue.getJob(orderId);
+
+    expect(job).toMatchObject({ name: 'expire-order', data: { orderId } });
+    expect(job!.opts.delay).toBeGreaterThan(9.9 * 60_000);
+    expect(job!.opts.delay).toBeLessThanOrEqual(10 * 60_000);
+    expect(await ordersQueue.getDelayedCount()).toBe(1);
+  });
+
+  it('the owner can cancel a pending hold: tickets go back in Postgres and Redis', async () => {
+    const { eventId, tierIds } = await saleEvent([{ name: 'Regular', capacity: 10 }]);
+    const tierId = tierIds[0]!;
+    const buyer = await makeUser();
+    const booked = await book(buyer, eventId, [{ tierId, qty: 3 }]);
+    expect(await stock(tierId)).toBe('7');
+
+    const res = await cancel(buyer, booked.body.order.id);
+
+    expect(res.status).toBe(200);
+    expect(res.body.order).toMatchObject({ id: booked.body.order.id, status: 'CANCELLED' });
+    expect(await soldCount(tierId)).toBe(0);
+    expect(await stock(tierId)).toBe('10');
+    expect(await gateRedis.exists(redisKeys.userHeld(eventId, buyer.id, tierId))).toBe(0);
+  });
+
+  it("cancelling twice, or a paid order, is a 409; someone else's order is a 404", async () => {
+    const { eventId, tierIds } = await saleEvent([{ name: 'Regular', capacity: 10 }]);
+    const [buyer, other] = await makeUsers(2);
+    const first = await book(buyer!, eventId, [{ tierId: tierIds[0]!, qty: 1 }]);
+    const paid = await book(buyer!, eventId, [{ tierId: tierIds[0]!, qty: 1 }]);
+    await prisma.order.update({ where: { id: paid.body.order.id }, data: { status: 'PAID' } });
+
+    await cancel(buyer!, first.body.order.id);
+    const again = await cancel(buyer!, first.body.order.id);
+    const paidCancel = await cancel(buyer!, paid.body.order.id);
+    const notMine = await cancel(other!, first.body.order.id);
+    const noLogin = await request(app).post(`/api/v1/orders/${first.body.order.id}/cancel`);
+
+    expect(again.status).toBe(409);
+    expect(again.body.error).toMatchObject({
+      code: 'ORDER_NOT_PENDING',
+      details: { status: 'CANCELLED' },
+    });
+    expect(paidCancel.body.error).toMatchObject({
+      code: 'ORDER_NOT_PENDING',
+      details: { status: 'PAID' },
+    });
+    expect(notMine.status).toBe(404);
+    expect(noLogin.status).toBe(401);
+    expect(await soldCount(tierIds[0]!)).toBe(1); // only the paid order still holds a ticket
   });
 });
