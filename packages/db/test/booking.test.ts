@@ -60,7 +60,7 @@ describe('reserveTickets', () => {
           userId,
           eventId,
           items: [{ tierId, qty: 1 }],
-          holdMinutes: 10,
+          holdSeconds: 600,
           idempotencyKey: key,
           requestHash: 'this-request',
         });

@@ -23,6 +23,11 @@
       "development": "./src/inventory.ts",
       "types": "./dist/inventory.d.ts",
       "default": "./dist/inventory.js"
+    },
+    "./order-state": {
+      "development": "./src/order-state.ts",
+      "types": "./dist/order-state.d.ts",
+      "default": "./dist/order-state.js"
     }
   },
   "scripts": {

@@ -1,5 +1,6 @@
 import { perUserLimit, soldOut, type OrderView } from '@festpass/shared';
 import { Prisma, prisma } from './index.js';
+import { transition } from './order-state.js';
 
 // The booking path, in hand-written SQL so every lock it takes is visible and explainable.
 //
@@ -29,7 +30,8 @@ export interface ReserveInput {
   userId: string;
   eventId: string;
   items: BookingItem[];
-  holdMinutes: number;
+  /** How long the order holds its tickets before they go back on sale if unpaid. */
+  holdSeconds: number;
   idempotencyKey: string;
   /** SHA-256 of the request, to tell a retry from a different request that reuses the key. */
   requestHash: string;
@@ -58,7 +60,7 @@ export async function findStoredAnswer(
 }
 
 /**
- * Reserves tickets and creates a PENDING order that holds them for `holdMinutes`, in one transaction.
+ * Reserves tickets and creates a PENDING order that holds them for `holdSeconds`, in one transaction.
  * Returns the answer (also stored under the Idempotency-Key) and what happened, or 'key-reused'.
  */
 export async function reserveTickets(input: ReserveInput): Promise<BookingOutcome> {
@@ -90,7 +92,7 @@ export async function reserveTickets(input: ReserveInput): Promise<BookingOutcom
 
 async function reserveInTransaction(
   tx: Prisma.TransactionClient,
-  { userId, eventId, items, holdMinutes, idempotencyKey, requestHash }: ReserveInput,
+  { userId, eventId, items, holdSeconds, idempotencyKey, requestHash }: ReserveInput,
 ): Promise<BookingOutcome> {
   // 1. One user's requests for one event run one at a time from here until COMMIT or ROLLBACK, when
   //    Postgres releases the lock by itself. Without it, 20 parallel requests from one user could all
@@ -164,7 +166,7 @@ async function reserveInTransaction(
   const [order] = await tx.$queryRaw<{ id: string; expires_at: Date }[]>`
     INSERT INTO orders (user_id, event_id, status, amount_paise, expires_at)
     VALUES (${userId}::uuid, ${eventId}::uuid, 'PENDING', ${amount},
-            now() + make_interval(mins => ${holdMinutes}::int))
+            now() + make_interval(secs => ${holdSeconds}::double precision))
     RETURNING id, expires_at`;
   for (const item of items) {
     await tx.$executeRaw`
@@ -206,6 +208,55 @@ async function storeAnswer(
     VALUES (${userId}::uuid, ${idempotencyKey}::uuid, ${requestHash}, ${answer.status},
             ${JSON.stringify(answer.body)}::jsonb)`;
   return answer;
+}
+
+export interface ReleasedHold {
+  orderId: string;
+  eventId: string;
+  userId: string;
+  items: BookingItem[];
+}
+
+/**
+ * Ends a PENDING hold (EXPIRED when its time is up, CANCELLED by the buyer) and gives its tickets back
+ * to the tiers, in one transaction. Returns what was released, or null if there was nothing to do.
+ *
+ * Safe to run any number of times: the guarded transition PENDING -> `to` succeeds for exactly one
+ * caller, and the stock is only returned by that caller, in the same transaction. A second expiry job,
+ * the sweeper and a cancel racing each other can't return the same tickets twice. The caller gives the
+ * Redis stock back after the commit, and only when this returned a hold.
+ */
+export async function releaseHold(
+  orderId: string,
+  to: 'EXPIRED' | 'CANCELLED',
+): Promise<ReleasedHold | null> {
+  return prisma.$transaction(async (tx) => {
+    const [order] = await tx.$queryRaw<{ event_id: string; user_id: string; due: boolean }[]>`
+      SELECT event_id, user_id, expires_at <= now() AS due FROM orders WHERE id = ${orderId}::uuid`;
+    // Expiry never runs early: a job that fires ahead of time (clock skew) leaves the hold alone, and
+    // the sweeper picks it up once it's really due.
+    if (!order || (to === 'EXPIRED' && !order.due)) return null;
+    if (!(await transition(tx, orderId, 'PENDING', to))) return null;
+
+    // Sorted by tier, like booking, so a release and a booking lock tier rows in the same order.
+    const items = await tx.$queryRaw<{ tierId: string; qty: number }[]>`
+      SELECT tier_id AS "tierId", qty FROM order_items WHERE order_id = ${orderId}::uuid
+      ORDER BY tier_id`;
+    for (const item of items) {
+      await tx.$executeRaw`
+        UPDATE ticket_tiers SET sold_count = sold_count - ${item.qty}, updated_at = now()
+        WHERE id = ${item.tierId}::uuid`;
+    }
+    return { orderId, eventId: order.event_id, userId: order.user_id, items };
+  });
+}
+
+/** PENDING orders whose hold has run out, oldest first: what the sweeper expires. */
+export async function findOverdueHolds(limit: number): Promise<string[]> {
+  const rows = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT id FROM orders WHERE status = 'PENDING' AND expires_at <= now()
+    ORDER BY expires_at LIMIT ${limit}`;
+  return rows.map((r) => r.id);
 }
 
 function isUniqueViolation(err: unknown): boolean {
