@@ -9,13 +9,15 @@
 ![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
 
 <details>
-<summary>More screenshots: public event page, event editor, team</summary>
+<summary>More screenshots: public event page, event editor, team, job queues</summary>
 
 ![Public event page: server-rendered with the banner, times in IST and ticket tiers](.github/screenshots/public-event.png)
 
 ![Event editor: banner, ticket tiers in rupees, details with the waiting-room setting](.github/screenshots/organizer-event.png)
 
 ![Team page: add a member by email, change roles, remove](.github/screenshots/organizer-members.png)
+
+![Bull Board: an expire-order job, keyed by the order ID, completed with released: true](.github/screenshots/bull-board.png)
 
 </details>
 
@@ -34,7 +36,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages with ISR and on-demand revalidation (Day 10) |
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Done (API): Postgres booking with idempotent retries (Day 11), Redis gate with compensation, fallback and reconciliation (Day 12) |
-| Automatic hold expiry and rate limiting | Planned (Days 13–14) |
+| Automatic hold expiry and rate limiting | Hold expiry, cancel and a job dashboard done (Day 13); rate limiting planned (Day 14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Planned (Days 17–18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Planned (Days 19–20) |
@@ -79,7 +81,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
-| 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Planned (Days 13–16) |
+| 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Hold expiry and cancel done (Day 13); payments planned (Days 15–16) |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Planned (Days 17–18) |
 | 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
 | 8. Measure | Booth scans feed sponsor dashboards (totals only, never names), organizers get live and post-event analytics, and an AI copilot answers questions using permission-checked tools. | Scan events are stored with the fields analytics needs, so dashboards are single aggregation queries. | Planned (Days 21–27) |
@@ -282,10 +284,41 @@ sequenceDiagram
 - When Redis comes back empty (restarted without data), a tier with no `inv:` key is booked through Postgres and its key is filled in right after; the worker refills the rest within a minute.
 - Ways Redis can drift from Postgres, and how each heals: a release that failed while Redis was down (Redis too low until reconciliation), a script that timed out but still ran (too low), reconciliation racing a booking in flight (briefly too high, which Postgres refuses). Too high only costs a Postgres refusal; too low would show "sold out" for tickets that exist, which reconciliation fixes within a minute.
 
+### Hold expiry (Day 13)
+
+**Problem:** a booking holds tickets for 10 minutes. If the buyer never pays, those tickets must go back on sale, exactly once: not never (a sold-out event with empty seats), and not twice (more tickets than seats). Jobs can run twice (a retry, a race with the sweeper), run late (worker down), or get lost (Redis without persistence).
+
+**Approach:**
+- **Order state machine** (`packages/db/src/order-state.ts`): the allowed moves are one table, and `transition(orderId, from, to)` is a guarded `UPDATE orders SET status = to WHERE id = $1 AND status = from`. It returns whether it hit a row; a move the table doesn't allow throws. All status changes go through it.
+- **One delayed job per order:** after the booking commits, the API adds `expire-order` with `jobId = orderId` and `delay = expiresAt - now`. BullMQ keeps one job per ID, so a retry or a replayed request can't queue a second one.
+- **Release** (`releaseHold` in `packages/db/src/booking.ts`): one transaction runs the guarded `PENDING → EXPIRED` (or `→ CANCELLED`). Only if it hit a row does it run `sold_count = sold_count - qty` for each item (in tier-ID order, like booking). After the commit, the Redis stock and the user's count go back too. A job that fires before `expires_at` (clock skew) does nothing.
+- **Cancel:** `POST /orders/:id/cancel` is the same release with `→ CANCELLED`; the expiry job still fires later and finds nothing to do.
+- **Sweeper:** a BullMQ job scheduler runs `sweep-expired-orders` every minute: `PENDING` orders past `expires_at` (served by the `orders(status, expires_at)` index), released through the same function. It catches holds whose own job never ran.
+- **Retries:** every queue (one factory, `packages/shared/src/server.ts`) retries a failed job 5 times with exponential backoff (1 s, 2 s, 4 s, 8 s) and keeps failed jobs for inspection in Bull Board (`/admin/queues`, `ADMIN_EMAILS` only).
+- **Traceable:** the job carries the booking's request ID, so the worker's "hold expired" log line can be matched to the request that made the hold.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING: booking (tickets held)
+  PENDING --> EXPIRED: hold ran out (job or sweeper)
+  PENDING --> CANCELLED: owner cancels
+  PENDING --> PAID: payment (Day 16)
+  PAID --> TICKETED: tickets issued (Day 17)
+  PAID --> REFUNDED: refund (Day 16)
+  TICKETED --> REFUNDED: refund (Day 16)
+  EXPIRED --> [*]
+  CANCELLED --> [*]
+```
+
+Leaving `PENDING` gives the tickets back (`EXPIRED`, `CANCELLED`) or keeps them (`PAID`); every arrow is a guarded `UPDATE`, so only one of them can ever win for a given order.
+
+**Alternatives:** a cron job only (simple, but every hold would wait for the next run and nothing would be precise); checking expiry lazily at read time (the stock would stay taken until someone looked); a database trigger or `pg_cron` (hard to test, and the Redis release still needs code).
+
+**Tested by:** `apps/worker/test/expiry.test.ts` (real BullMQ worker, test database, Redis database 15): a 2-second hold is still `PENDING` with 3 sold, then its delayed job expires it and `sold_count`, Redis stock and the user's count all go back; running the expiry twice releases once; the job and the sweeper racing on one order release it once; a job that fires early leaves the hold alone; the sweeper expires only overdue holds. `apps/api/test/orders.test.ts` checks the job is queued once per order with the right delay, and cancel (pending, twice, paid, someone else's). Watched live: a 30-second hold's job in Bull Board went from delayed to completed with `released: true`, and the tier's availability went from 98 back to 100.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Hold expiry (Day 13)
 - Rate limiting (Day 14)
 - Payment idempotency and the order state machine (Days 15–16)
 - Forgery-proof QR tickets and offline scanning (Days 17, 20)
@@ -423,7 +456,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `MONGODB_URI` | api | MongoDB connection string |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api, worker | Redis connection string (booking gate, BullMQ queues). Tests use database 15 of the same server |
-| `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid (1–60, default 10) |
+| `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid: minutes, up to 60, default 10. Fractions are allowed (`0.5` = 30 s, handy for watching an expiry) |
+| `ADMIN_EMAILS` | api | Comma-separated emails allowed to open the job dashboard (Bull Board) at `/admin/queues`. Empty means nobody. Local `.env` lists the seed organizer |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
 | `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
 | `S3_REGION` | api | Signing region (default `us-east-1`; `auto` for R2) |
@@ -440,7 +474,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `pnpm build` | Builds every package and app |
 | `pnpm lint` | ESLint over the whole repo |
 | `pnpm typecheck` | TypeScript checks in every package |
-| `pnpm test` | Runs all test suites (Vitest) |
+| `pnpm test` | Runs all test suites (Vitest), one package at a time because the API and worker tests share the test database and Redis database 15 |
 | `pnpm format` | Formats code with Prettier |
 | `pnpm infra:up` | Starts Postgres, MongoDB, Redis and SeaweedFS and waits for healthchecks |
 | `pnpm infra:down` | Stops the containers (data stays in named volumes) |
@@ -460,7 +494,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT` (409), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING` (409), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie.
@@ -493,6 +527,9 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | GET | `/api/v1/events` | none | Published events that haven't ended, soonest first. `?cursor=&limit=&orgId=`. `{ items, nextCursor }` |
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
+| POST | `/api/v1/orders/:orderId/cancel` | Bearer (the order's owner) | `PENDING` → `CANCELLED`: the tickets go back on sale at once. `200 { order }`; `409 ORDER_NOT_PENDING` (with `details.status`) for any other status; `404` for someone else's order |
+| POST | `/api/v1/admin/session` | Bearer, email in `ADMIN_EMAILS` | Sets a 15-minute `fp_admin` cookie (`httpOnly`, `SameSite=Lax`, `Path=/admin`) and returns `204`; `403` for everyone else. The web app's `/dashboard/queues` calls it, then opens the board |
+| GET | `/admin/queues` | `fp_admin` cookie | Bull Board for the `orders` and `inventory` queues: delayed, completed and failed jobs, retry and clean. `401` without the cookie, `403` if the email is no longer in `ADMIN_EMAILS` |
 | GET | `/api/v1/health/live` | none | Liveness: `200 { "status": "ok" }` whenever the process can answer. Checks no dependencies |
 | POST | `/api/v1/auth/register` | none | Body `{ email, password (8+ chars, max 72 bytes), name, college?, branch?, graduationYear? }`. `201 { user, accessToken }` and sets the `fp_refresh` cookie. `409 EMAIL_TAKEN` if the email (case-insensitive) exists |
 | POST | `/api/v1/auth/login` | none | Body `{ email, password }`. `200 { user, accessToken }` and a new `fp_refresh` cookie (a new token family). `401 INVALID_CREDENTIALS` for a wrong password or unknown email alike |
@@ -516,6 +553,8 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/events.test.ts` (against the test database): the full organizer flow ends with the event on `GET /events`; slug collisions get a suffix; every tier rule (capacity, price, per-user limit, sale window) returns 400 on its field; after a sale (soldCount set directly) the price is locked, capacity only grows and the tier can't be deleted; publishing needs tiers and a future start; DRAFT → PUBLISHED → CLOSED only; drafts never appear publicly; queue settings default to off at 50/s and survive unrelated edits, and a rate of 0 is a 400; the org list sums sold and capacity over tiers; paging through 7 events (3 with the same start time) with `limit=3` returns each exactly once in order, even when a new event is inserted between pages.
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
+- `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
+- `apps/api/test/admin.test.ts`: only `ADMIN_EMAILS` get the admin cookie (`Path=/admin`, `HttpOnly`, `SameSite=Lax`); Bull Board needs it and lists both queues; an access token doesn't work as the cookie and the cookie doesn't work as an access token (separate signing keys); someone removed from `ADMIN_EMAILS` loses access with a valid cookie.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
 - `apps/api/test/uploads.test.ts` (S3 mocked with a spy on the client's `send`): presign signs a fixed key under the event's banner prefix with `content-length-range` and `Content-Type` in the policy; a bad content type returns 400, a non-member 404, a scanner 403, no login 401; PATCH saves a confirmed `bannerKey` and returns `bannerUrl`, rejects a missing object, an object over 2 MB and a non-image type, rejects another event's key without calling storage, and `null` clears the banner.
 - `apps/web/src/app/api/revalidate/route.test.ts` (`next/cache` mocked): a wrong secret, no header, or the secret without `Bearer` get 401 and revalidate nothing; the right secret revalidates `/e/{slug}` and `/`; a slug like `../dashboard` is a 400.
@@ -570,7 +609,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 10 (Sun 08 Nov): Public event pages with SSR and ISR
 - [x] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
 - [x] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
-- [ ] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
+- [x] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
 - [ ] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
 - [ ] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
 - [ ] Day 16 (Sat 14 Nov): Webhooks and the order state machine
@@ -724,6 +763,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** Redis is only a gate that can say no early, never the source of truth: every yes is decided again by the conditional `UPDATE` in Postgres, Redis numbers are reset from Postgres, and losing Redis only costs speed.
 **Verify:** `pnpm --filter @festpass/api exec vitest run test/orders.test.ts` (47 tests: the booking suite in three Redis modes plus the gate tests), `pnpm test`, and `pnpm --filter @festpass/worker dev` to see the reconciliation job run.
 **Next:** Day 13 expires unpaid holds with delayed BullMQ jobs and gives their tickets back in both Postgres and Redis.
+
+### Day 13: Hold expiry with BullMQ (2026-11-11)
+**Built:**
+- The order state machine (`order-state.ts`: a transition table and a guarded `UPDATE ... WHERE status = $from`), and `releaseHold()`, which returns tickets only if its transition hit a row, in the same transaction, then gives Redis its stock back after the commit.
+- A delayed `expire-order` job per order (`jobId` = order ID, delay = time left on the hold), a sweeper every minute for holds whose job never ran, and `POST /orders/:id/cancel` on the same release path.
+- A shared queue factory (5 attempts, exponential backoff, failed jobs kept) and job payload schemas; Bull Board at `/admin/queues` behind a 15-minute admin cookie for `ADMIN_EMAILS`, opened from `/dashboard/queues`.
+- Worker tests with a real BullMQ worker and a 2-second hold, double runs and races; cancel and admin tests in the API.
+
+**Key decision:** the guarded transition, not the job system, makes the release happen exactly once: `UPDATE orders ... WHERE status = 'PENDING'` succeeds for one caller only, and stock is returned only by that caller. That is what allows both a per-order delayed job and a sweeper, since either may run twice or late without harm.
+**Verify:** `pnpm test`; then `HOLD_MINUTES=0.5 pnpm --filter @festpass/api dev`, `pnpm --filter @festpass/worker dev` and `pnpm --filter @festpass/web dev`, book a ticket, log in as `organizer@festpass.dev`, open http://localhost:3000/dashboard/queues and watch the job go from delayed to completed.
+**Next:** Day 14 adds rate limiting with a token bucket in Redis.
 
 <!-- BUILD-LOG:END -->
 

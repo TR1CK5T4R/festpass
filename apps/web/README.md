@@ -56,6 +56,7 @@ apps/web/
     (app)/(dashboard)/dashboard/orgs/[orgId]/events/[eventId]/page.tsx  Event editor: banner, tiers, details, publish/close
     (app)/(dashboard)/dashboard/members/page.tsx   Add by email with a role, change roles, remove
     (app)/(dashboard)/dashboard/orgs/new/page.tsx  Create-club form
+    (app)/(dashboard)/dashboard/queues/page.tsx    For admins: gets the API's admin cookie, then opens Bull Board (/admin/queues on the API)
   src/components/ui/                Button, Input/Textarea/Select/Checkbox, Card, Badge, Toast, EmptyState, ConfirmDialog
   src/components/events/            EventForm, TierEditor, BannerUploader, EventActions (publish/close), StatusBadge
   src/lib/
@@ -169,3 +170,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 7:** route groups, design tokens and base components, API client with in-memory token and refresh-once retry, AuthProvider with silent refresh, register and login with shared Zod schemas, protected dashboard with org switcher and create-club flow.
 - **Day 9:** organizer dashboard: events list with status and sold / capacity, create and edit event (dates, sale window, waiting-room toggle and admit rate), tier editor in rupees with paise sent to the API, banner uploader with preview and progress, publish and close behind confirmation dialogs, members page; `sharedSchemaResolver`, Textarea/Select/Checkbox/ConfirmDialog components, `warning` colour token; resolver and date tests.
 - **Day 10:** public pages: `/` and `/e/[slug]` as Server Components with ISR (60 s) and on-demand revalidation through a secret-protected `POST /api/revalidate`; `generateMetadata` with Open Graph banner; tier cards with sale state; loading, error and not-found states; `next/image` for banners; env validation in `next.config.ts`; auth and dashboard moved under an `(app)` group so public pages don't load the auth client.
+- **Day 13:** `/dashboard/queues` opens the job dashboard: it trades the in-memory login for the API's 15-minute admin cookie (only for `ADMIN_EMAILS`) and navigates to Bull Board on the API.

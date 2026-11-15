@@ -19,6 +19,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Pre-signed banner uploads | `apps/api`, `packages/shared` | Done (Day 8) |
 | Booking engine: Postgres correctness and idempotency | `packages/db`, `apps/api` | Done (Day 11) |
 | Booking engine: Redis gate, compensation, fallback, reconciliation job | `apps/api`, `apps/worker`, `packages/db` | Done (Day 12) |
+| Hold expiry (delayed job + sweeper), cancel, order state machine, Bull Board | `apps/worker`, `apps/api`, `packages/db`, `packages/shared` | Done (Day 13) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -35,7 +36,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 | Process | Started by | Job |
 |---|---|---|
 | **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
-| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: inventory reconciliation every minute (Day 12). Later: expiring unpaid holds, issuing tickets, building PDFs, sending email, refunds, reports. |
+| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13) and inventory reconciliation every minute (Day 12). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
 
@@ -57,6 +58,8 @@ apps/api/
   src/config/env.ts                 Zod schema for every env var; exits with a readable list if any is invalid
   src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, Set-Cookie)
   src/lib/errors.ts                 AppError + NotFound, Validation, Conflict, Forbidden, Unauthorized, RateLimited
+  src/lib/queues.ts                 `ordersQueue`, `inventoryQueue` from the shared factory, on the fail-fast client (the API only adds jobs)
+  src/lib/cookies.ts                readCookie() for the refresh and admin cookies
   src/lib/redis.ts                  ioredis clients: `redis` (lazy connect, auto-reconnect) and `gateRedis` (no offline queue: fails fast for the booking gate)
   src/lib/slug.ts                   slugify() for org and event URLs
   src/lib/cursor.ts                 Opaque (startsAt, id) cursors for keyset pagination
@@ -72,7 +75,8 @@ apps/api/
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
-  src/modules/orders/               routes (POST /events/:eventId/orders), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation), repository
+  src/modules/orders/               routes (POST /events/:eventId/orders, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
+  src/modules/admin/                POST /admin/session (admin cookie for ADMIN_EMAILS), Bull Board at /admin/queues behind it
                                     gate.ts (Lua reserve/release, 50 ms limit), inventory.ts (syncInventory after publish and tier changes), stats.ts (booking counters)
   src/modules/uploads/              routes, controller, service (presignBanner with the permission check, verifyBanner with HeadObject)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
@@ -84,16 +88,20 @@ apps/api/
   tsconfig.json                     Typecheck config (src, test and scripts)
   tsconfig.build.json               Build config (src only, output to dist/, uses packages' built dist/)
 apps/worker/
-  src/index.ts           Zod env check, pino logger, BullMQ queue `inventory` with a job scheduler (every 60 s) and a
-                         worker that runs reconcileInventory(); closes the worker, queue, Prisma and Redis on SIGTERM/SIGINT
+  src/index.ts           Zod env check, pino logger, `inventory` and `orders` queues with job schedulers (reconcile and sweep,
+                         every 60 s) and one worker per queue; closes workers, queues, Prisma and Redis on SIGTERM/SIGINT
+  src/processors.ts      expireOrder(), sweepExpiredOrders(), reconcile(), and processJob() routing by job name
+  test/expiry.test.ts    real BullMQ worker with a 2-second hold, double runs, job vs sweeper race, early job, sweeper
 packages/db/
   prisma/schema.prisma   All Postgres tables, enums, relations and indexes (snake_case via @map/@@map)
   prisma/migrations/     *_init (generated from the schema) and *_check_constraints (hand-written SQL)
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/order-state.ts     @festpass/db/order-state: ORDER_TRANSITIONS, canTransition(), guarded transition()
   src/inventory.ts       @festpass/db/inventory: reconcileInventory(store) sets inv:{tierId} from Postgres and reports drift
-  src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer()
+  src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer(),
+                         releaseHold() (guarded transition + sold_count back), findOverdueHolds()
   src/testing.ts         @festpass/db/testing: migrateTestDatabase(), truncateAll() (only on *_test databases)
   src/generated/         Generated Prisma client (git-ignored, rebuilt by `prisma generate` on install)
   test/                  global-setup.ts (migrates the test DB), constraints.test.ts, seed.test.ts, booking.test.ts
@@ -105,7 +113,9 @@ packages/shared/
   src/pagination.ts      paginationQuerySchema and the Page<T> response type
   src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, EventView, EventSummary, TierView
   src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
-  src/redis-keys.ts      redisKeys.inventory / userHeld, QUEUES and JOBS names (shared by API and worker)
+  src/redis-keys.ts      redisKeys.inventory / userHeld (shared by API and worker)
+  src/queues.ts          QUEUES and JOBS names, expireOrderJobSchema (the worker validates job payloads)
+  src/server.ts          @festpass/shared/server (Node only): createQueue() with retry/backoff defaults, releaseRedisStock()
   src/orders.ts          createOrderSchema, idempotencyHeadersSchema, OrderView, soldOut() / perUserLimit() refusals
   src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
   test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
@@ -206,7 +216,7 @@ Done (Days 11–12): steps 1–5. Planned: hold expiry (Day 13).
 5. **Compensation:** if the gate took stock but the transaction didn't book (refused, a replay, `key-reused` or an exception), the `release` script gives it back (`INCRBY` only on an existing `inv:` key, `DECRBY` the user's count). If that fails, Redis is left too low until reconciliation.
 6. If two requests use the same key for different events at once (different advisory locks), the unique `(user_id, key)` index makes the second one's INSERT fail; its whole transaction rolls back and it answers `422`.
 7. **Reconciliation:** `reconcileInventory()` sets `inv:*` from `capacity - sold_count` for published events whose sale hasn't ended: after publishing and tier changes (one event, 1 s limit) and every minute in the worker (all events). Drift is logged.
-8. **_Planned (Day 13):_** a delayed job expires unpaid holds and gives the tickets back in Postgres and Redis.
+8. **Expiry** (Day 13): after the commit the API adds an `expire-order` job with `jobId = orderId` and `delay = expiresAt - now` (500 ms limit; if Redis is down, the sweeper handles it). The worker's `releaseHold(orderId, 'EXPIRED')` does nothing before `expires_at`, runs the guarded `PENDING → EXPIRED`, and only if that hit a row returns `sold_count` per item (tier-ID order) in the same transaction; then it gives Redis the stock and the user's count back. A sweeper every minute releases overdue `PENDING` orders the same way. `POST /orders/:id/cancel` uses `releaseHold(orderId, 'CANCELLED')`.
 
 No network call happens inside the transaction. `maxWait`/`timeout` are 10 s because in a flash sale many short transactions queue for the same tier row and for pool connections.
 
@@ -221,7 +231,7 @@ _Planned (Days 15–16)._
 
 ### Order states
 
-_Planned (Days 13 and 16)._ Status only changes through a guarded `UPDATE ... WHERE status = $from`, so two jobs racing on the same order can't both succeed.
+Done (Day 13): the state machine in `packages/db/src/order-state.ts`, with PENDING → EXPIRED and PENDING → CANCELLED in use. _Planned (Day 16):_ the payment moves below. Status only changes through `transition(tx, orderId, from, to)`: it refuses a move the table doesn't allow and runs a guarded `UPDATE orders SET status = $to WHERE id = $1 AND status = $from`, so two jobs racing on the same order can't both succeed.
 
 ```mermaid
 stateDiagram-v2
@@ -278,6 +288,9 @@ _Planned (Days 17–19)._
 | DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` |
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
+| POST | `/api/v1/orders/:orderId/cancel` | Bearer (owner) | PENDING → CANCELLED, tickets back on sale; `409 ORDER_NOT_PENDING`; `404` for others' orders |
+| POST | `/api/v1/admin/session` | Bearer, `ADMIN_EMAILS` | `204` + 15-minute `fp_admin` cookie (`Path=/admin`); `403` otherwise |
+| GET | `/admin/queues` | `fp_admin` cookie | Bull Board (`orders`, `inventory`) |
 | POST | `/api/v1/events/:eventId/orders` | Bearer + `Idempotency-Key` | Hold tickets: `201 { order }` (`PENDING`, `expiresAt`); `409 SOLD_OUT`, `PER_USER_LIMIT`, `SALE_NOT_STARTED`, `SALE_ENDED`, `EVENT_CLOSED`; `422 IDEMPOTENCY_KEY_REUSED`; replays carry `Idempotent-Replayed: true` |
 | POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | `201 { upload: { url, fields, key, maxBytes, expiresAt } }` for a JPEG/PNG/WebP banner up to 2 MB; `400` other types, `404` non-members, `403` scanners |
 | GET | `/api/v1/health/live` | none | `200 { "status": "ok" }` whenever the process can answer |
@@ -303,11 +316,11 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/admin.test.ts` covers who gets the admin cookie and what Bull Board accepts. `apps/worker/test/expiry.test.ts` runs a real BullMQ worker against the test database. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (1–60, default 10), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -323,3 +336,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 10:** on-demand revalidation of the public pages: `revalidateEventPages()` POSTs to the web app's `/api/revalidate` with a shared secret after public event, tier or banner changes; `WEB_REVALIDATE_URL` and `REVALIDATE_SECRET` env vars; shared `revalidateEventSchema` and `PublicEventView`; tests with `fetch` spied.
 - **Day 11:** booking engine in Postgres: `POST /events/:eventId/orders` with a required `Idempotency-Key`; `@festpass/db/booking` (advisory lock per user and event, per-user limit, conditional `UPDATE` per tier in ID order, savepoint for sold-out rollback, order and stored answer in one transaction); `idempotency_keys` table; `validate()` checks headers; `HOLD_MINUTES`; concurrency, idempotency and rollback tests.
 - **Day 12:** Redis gate in front of the booking transaction: Lua `reserve`/`release` scripts on a fail-fast client (50 ms, no offline queue), compensation, duplicate-request marker, fallback to Postgres only; `@festpass/db/inventory` reconciliation run after publish and tier changes and every minute by the worker's first BullMQ job; booking counters logged every minute; booking tests in three Redis modes.
+- **Day 13:** order state machine (`order-state.ts`); `releaseHold()` and `findOverdueHolds()`; `expire-order` job per order (`jobId` = order ID) and a sweeper every minute in the worker (`processors.ts`); `POST /orders/:id/cancel`; shared queue names, job schemas and a queue factory with retries and backoff (`@festpass/shared/server`); Bull Board at `/admin/queues` behind an admin cookie for `ADMIN_EMAILS`; the gate's per-user key now lives for the hold plus 5 minutes; holds in seconds (`HOLD_MINUTES` may be fractional); worker tests.
