@@ -1,13 +1,14 @@
 import { prisma } from '@festpass/db';
-import { reconcileInventory } from '@festpass/db/inventory';
 import { JOBS, QUEUES } from '@festpass/shared';
-import { Queue, Worker } from 'bullmq';
+import { createQueue } from '@festpass/shared/server';
+import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { pino } from 'pino';
 import { z } from 'zod';
+import { processJob } from './processors.js';
 
 // Background jobs, in their own process so a slow job can never slow down the API.
-// Today: inventory reconciliation. Hold expiry, tickets and emails come on later days.
+// Today: hold expiry (each order's own delayed job plus a sweeper) and inventory reconciliation.
 
 const parsed = z
   .object({
@@ -31,36 +32,39 @@ const logger = pino({ level: env.LOG_LEVEL, base: { process: 'worker' } });
 const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
 connection.on('error', (err) => logger.warn({ err: err.message }, 'redis connection error'));
 
-const inventoryQueue = new Queue(QUEUES.inventory, { connection });
+const inventoryQueue = createQueue(QUEUES.inventory, connection);
+const ordersQueue = createQueue(QUEUES.orders, connection);
 
-// Every minute, set inv:{tierId} in Redis from Postgres for every event whose sale hasn't ended.
-// upsertJobScheduler is idempotent: restarting the worker (or running two) keeps one schedule.
+// Repeating jobs. upsertJobScheduler is idempotent: restarting the worker (or running two) keeps one
+// schedule per ID. Every minute: reset inv:* from Postgres, and expire holds whose own job never ran.
 await inventoryQueue.upsertJobScheduler(
   JOBS.reconcileInventory,
   { every: 60_000 },
-  { name: JOBS.reconcileInventory, opts: { removeOnComplete: 100, removeOnFail: 100 } },
+  { name: JOBS.reconcileInventory },
+);
+await ordersQueue.upsertJobScheduler(
+  JOBS.sweepExpiredOrders,
+  { every: 60_000 },
+  { name: JOBS.sweepExpiredOrders },
 );
 
-const worker = new Worker(
-  QUEUES.inventory,
-  async (job) => {
-    const drift = await reconcileInventory(connection);
-    // Drift means the gate and Postgres disagreed: a failed release, a timed-out script, a restart.
-    if (drift.length > 0) logger.warn({ job: job.id, drift }, 'fixed inventory drift in redis');
-    else logger.debug({ job: job.id }, 'inventory in step with postgres');
-    return { fixed: drift.length };
-  },
-  { connection },
-);
-worker.on('failed', (job, err) => logger.error({ job: job?.id, err }, 'job failed'));
+// Each queue gets its own worker so a backlog of one can't delay the other.
+const workers = [QUEUES.inventory, QUEUES.orders].map((name) => {
+  const worker = new Worker(name, (job) => processJob(job, connection, logger), { connection });
+  // Failed jobs are retried with backoff (createQueue) and kept in Bull Board once attempts run out.
+  worker.on('failed', (job, err) =>
+    logger.error({ job: job?.id, name: job?.name, attempt: job?.attemptsMade, err }, 'job failed'),
+  );
+  return worker;
+});
 
-logger.info({ queues: [QUEUES.inventory] }, 'worker started');
+logger.info({ queues: [QUEUES.inventory, QUEUES.orders] }, 'worker started');
 
 async function shutdown(signal: NodeJS.Signals) {
   logger.info({ signal }, 'worker shutting down');
   // close() waits for the job in progress to finish, so a reconciliation is never cut in half.
-  await worker.close();
-  await inventoryQueue.close();
+  await Promise.all(workers.map((w) => w.close()));
+  await Promise.all([inventoryQueue.close(), ordersQueue.close()]);
   await Promise.allSettled([prisma.$disconnect(), connection.quit()]);
   process.exit(0);
 }
