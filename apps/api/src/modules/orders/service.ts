@@ -1,10 +1,23 @@
 import { createHash } from 'node:crypto';
-import { findStoredAnswer, reserveTickets, type BookingAnswer } from '@festpass/db/booking';
+import {
+  findStoredAnswer,
+  releaseHold,
+  reserveTickets,
+  type BookingAnswer,
+} from '@festpass/db/booking';
 import { prisma } from '@festpass/db';
-import { perUserLimit, soldOut, type CreateOrderInput } from '@festpass/shared';
+import {
+  JOBS,
+  perUserLimit,
+  soldOut,
+  type CreateOrderInput,
+  type OrderView,
+} from '@festpass/shared';
 import { env } from '../../config/env.js';
 import { AppError, bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
-import { releaseInRedis, reserveInRedis, type GateItem } from './gate.js';
+import { logger } from '../../lib/logger.js';
+import { ordersQueue } from '../../lib/queues.js';
+import { releaseInRedis, reserveInRedis, withTimeout, type GateItem } from './gate.js';
 import { syncInventory } from './inventory.js';
 import * as repo from './repository.js';
 import { bookingStats } from './stats.js';
@@ -70,11 +83,35 @@ export interface OrderResult {
   replayed: boolean;
 }
 
+/**
+ * Queues the hold's expiry for the moment it runs out. jobId = orderId, so adding it twice (a retry,
+ * a replay) is a no-op: BullMQ keeps one job per ID. Added after the commit, never inside the
+ * transaction. If Redis is down, the order still stands and the worker's sweeper expires it.
+ */
+async function scheduleExpiry(order: OrderView, requestId: string | undefined) {
+  try {
+    await withTimeout(
+      ordersQueue.add(
+        JOBS.expireOrder,
+        { orderId: order.id, requestId },
+        { jobId: order.id, delay: Math.max(0, Date.parse(order.expiresAt) - Date.now()) },
+      ),
+      500,
+    );
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, orderId: order.id },
+      'could not queue hold expiry; the sweeper will expire it',
+    );
+  }
+}
+
 export async function createOrder(
   userId: string,
   eventId: string,
   idempotencyKey: string,
   input: CreateOrderInput,
+  requestId?: string,
 ): Promise<OrderResult> {
   const requestHash = hashRequest(eventId, input.items);
 
@@ -114,7 +151,7 @@ export async function createOrder(
       userId,
       eventId,
       items: input.items,
-      holdMinutes: env.HOLD_MINUTES,
+      holdSeconds: env.HOLD_MINUTES * 60,
       idempotencyKey,
       requestHash,
     });
@@ -128,7 +165,35 @@ export async function createOrder(
   if (gate.kind === 'skipped' && gate.reason.startsWith('no inventory key'))
     void syncInventory(eventId);
   if (result === 'key-reused') throw keyReused();
-  if (result.outcome === 'booked') bookingStats.booked++;
+  if (result.outcome === 'booked') {
+    bookingStats.booked++;
+    if (result.answer.status === 201) await scheduleExpiry(result.answer.body.order, requestId);
+  }
   if (result.outcome === 'rejected') bookingStats.rejectedAtPostgres++;
   return { answer: result.answer, replayed: result.outcome === 'replayed' };
+}
+
+/**
+ * The buyer gives up a hold before it expires: PENDING -> CANCELLED through the same release as expiry
+ * (guarded, so a cancel racing the expiry job returns the tickets once). The expiry job still fires
+ * later and finds nothing to do.
+ */
+export async function cancelOrder(userId: string, orderId: string): Promise<OrderView> {
+  const order = await repo.findOrder(orderId);
+  // Someone else's order looks exactly like a missing one, so order IDs can't be probed.
+  if (!order || order.userId !== userId) throw new NotFoundError('Order not found');
+
+  const released = order.view.status === 'PENDING' && (await releaseHold(orderId, 'CANCELLED'));
+  if (!released) {
+    // Not pending any more, or it stopped being pending a moment ago (expired, paid).
+    const status = (await repo.findOrder(orderId))!.view.status;
+    throw new ConflictError(
+      'ORDER_NOT_PENDING',
+      `Only a pending order can be cancelled; this one is ${status}`,
+      { status },
+    );
+  }
+  // After the commit: the gate gets the stock back too (never throws; reconciliation is the backup).
+  await releaseInRedis(released.eventId, released.userId, released.items);
+  return (await repo.findOrder(orderId))!.view;
 }

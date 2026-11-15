@@ -1,4 +1,9 @@
-import { createOrderSchema, eventIdParamsSchema, idempotencyHeadersSchema } from '@festpass/shared';
+import {
+  createOrderSchema,
+  eventIdParamsSchema,
+  idempotencyHeadersSchema,
+  orderIdParamsSchema,
+} from '@festpass/shared';
 import { Router } from 'express';
 import { requireAuth } from '../../middleware/require-auth.js';
 import { validate } from '../../middleware/validate.js';
@@ -16,6 +21,18 @@ export function orderRoutes(): Router {
       body: createOrderSchema,
     }),
     controller.create,
+  );
+  return router;
+}
+
+/** Mounted at /api/v1/orders: actions on one order by its owner. */
+export function orderActionRoutes(): Router {
+  const router = Router();
+  router.post(
+    '/:orderId/cancel',
+    requireAuth,
+    validate({ params: orderIdParamsSchema }),
+    controller.cancel,
   );
   return router;
 }

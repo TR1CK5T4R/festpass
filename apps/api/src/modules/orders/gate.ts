@@ -1,4 +1,6 @@
 import { redisKeys } from '@festpass/shared';
+import { releaseRedisStock } from '@festpass/shared/server';
+import { env } from '../../config/env.js';
 import { gateRedis } from '../../lib/redis.js';
 import { logger } from '../../lib/logger.js';
 
@@ -36,36 +38,23 @@ end
 redis.call('SET', request, 1, 'EX', ARGV[#ARGV])
 return {'OK'}`;
 
-/**
- * Gives back what RESERVE took (KEYS as above; ARGV: qty per item). Stock is only added to a key that
- * still exists: creating a missing key with just the released quantity would claim far too few
- * tickets are left. Reconciliation sets missing keys from Postgres instead.
- */
-const RELEASE = `
-for i = 1, #KEYS / 2 do
-  local qty = tonumber(ARGV[i])
-  if redis.call('EXISTS', KEYS[2 * i - 1]) == 1 then redis.call('INCRBY', KEYS[2 * i - 1], qty) end
-  if redis.call('DECRBY', KEYS[2 * i], qty) <= 0 then redis.call('DEL', KEYS[2 * i]) end
-end
-return 'OK'`;
-
 declare module 'ioredis' {
   interface RedisCommander {
     festpassReserve(
       numKeys: number,
       ...args: (string | number)[]
     ): Promise<[string, number?, number?]>;
-    festpassRelease(numKeys: number, ...args: (string | number)[]): Promise<string>;
   }
 }
 // Sent once and then called by SHA (EVALSHA), so each booking sends only keys and numbers.
 gateRedis.defineCommand('festpassReserve', { lua: RESERVE });
-gateRedis.defineCommand('festpassRelease', { lua: RELEASE });
 
 /** Slower than this and the gate is skipped: the point of the gate is to be faster than Postgres. */
 const GATE_TIMEOUT_MS = 50;
-// The usr key outlives any hold; it only needs to last through the sale. It is a hint, not the record.
-const USER_KEY_TTL_SECONDS = 24 * 60 * 60;
+// The usr key only has to cover holds still in flight: after that, Postgres counts paid tickets
+// anyway. Keeping it short also means a release that never happened (a crash between the Postgres
+// commit and the Redis call) heals by itself within minutes.
+const USER_KEY_TTL_SECONDS = Math.ceil(env.HOLD_MINUTES * 60) + 5 * 60;
 // Long enough to cover retries of an in-flight request; after that the stored answer in Postgres
 // (checked before the gate) handles them.
 const REQUEST_KEY_TTL_SECONDS = 60;
@@ -134,19 +123,18 @@ export async function reserveInRedis(
   }
 }
 
-/** Compensation: gives back what reserveInRedis took when Postgres didn't book the order. */
-export async function releaseInRedis(eventId: string, userId: string, items: GateItem[]) {
+/**
+ * Gives tickets back to the gate: compensation when Postgres didn't book, and after a hold is
+ * cancelled or expires. Never throws; if Redis is unreachable, it stays too low until reconciliation.
+ */
+export async function releaseInRedis(
+  eventId: string,
+  userId: string,
+  items: { tierId: string; qty: number }[],
+) {
   try {
-    await withTimeout(
-      gateRedis.festpassRelease(
-        items.length * 2,
-        ...keysFor(eventId, userId, items),
-        ...items.map((i) => i.qty),
-      ),
-      GATE_TIMEOUT_MS,
-    );
+    await withTimeout(releaseRedisStock(gateRedis, eventId, userId, items), GATE_TIMEOUT_MS);
   } catch (err) {
-    // Redis now shows fewer tickets than Postgres has; reconciliation puts it right within a minute.
     logger.warn(
       { err: (err as Error).message, eventId },
       'could not release redis stock; reconciliation will fix it',

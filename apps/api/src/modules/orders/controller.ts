@@ -8,6 +8,7 @@ export const create: RequestHandler = async (req, res) => {
     String(req.params.eventId),
     String(req.header('idempotency-key')),
     req.body,
+    String(req.id),
   );
   if (replayed) res.setHeader('Idempotent-Replayed', 'true');
   // Stored rejections (SOLD_OUT, PER_USER_LIMIT) go through the error handler like any other error,
@@ -17,4 +18,8 @@ export const create: RequestHandler = async (req, res) => {
     throw new AppError(answer.status, code, message, details);
   }
   res.status(201).json(answer.body);
+};
+
+export const cancel: RequestHandler = async (req, res) => {
+  res.json({ order: await orders.cancelOrder(req.user!.id, String(req.params.orderId)) });
 };
