@@ -36,7 +36,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Events and ticket tiers, SEO-friendly public pages | API (Day 6) and organizer UI (Day 9) done: create, edit, tiers in rupees, publish and close; public pages with ISR and on-demand revalidation (Day 10) |
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Done (API): Postgres booking with idempotent retries (Day 11), Redis gate with compensation, fallback and reconciliation (Day 12) |
-| Automatic hold expiry and rate limiting | Hold expiry, cancel and a job dashboard done (Day 13); rate limiting planned (Day 14) |
+| Automatic hold expiry and rate limiting | Done: hold expiry, cancel and a job dashboard (Day 13); token-bucket rate limiting on login, register, booking and uploads (Day 14) |
 | Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Planned (Days 17–18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Planned (Days 19–20) |
@@ -316,10 +316,28 @@ Leaving `PENDING` gives the tickets back (`EXPIRED`, `CANCELLED`) or keeps them 
 
 **Tested by:** `apps/worker/test/expiry.test.ts` (real BullMQ worker, test database, Redis database 15): a 2-second hold is still `PENDING` with 3 sold, then its delayed job expires it and `sold_count`, Redis stock and the user's count all go back; running the expiry twice releases once; the job and the sweeper racing on one order release it once; a job that fires early leaves the hold alone; the sweeper expires only overdue holds. `apps/api/test/orders.test.ts` checks the job is queued once per order with the right delay, and cancel (pending, twice, paid, someone else's). Watched live: a 30-second hold's job in Bull Board went from delayed to completed with `released: true`, and the tier's availability went from 98 back to 100.
 
+### Rate limiting (Day 14)
+
+**Problem:** login invites password guessing, register invites fake accounts, and during a flash sale one script can hammer **Book** or upload endlessly. Each endpoint needs a cap per client that allows normal bursts (a double click, a retry) but stops sustained abuse.
+
+**Approach** (`apps/api/src/lib/rate-limit.ts`, the only place the algorithm lives):
+- **Token bucket in one Redis Lua script.** Each key (`rl:{name}:{who}`) is a hash with `tokens` and `ts`. On every request the script reads Redis `TIME`, adds `elapsed × rate` tokens up to the capacity, takes one if there is one, and saves both. Nothing runs between requests: the refill is computed when the next request arrives, and an idle key expires once it would be full again.
+- **Redis TIME, not the server clock:** all API instances share one clock, so a server whose clock runs ahead can't mint extra tokens and one that runs behind can't refuse too early. The script is atomic: 20 parallel requests on a bucket of 3 let exactly 3 through.
+- **Routes only declare limits:** `rateLimit({ name, keyFn, capacity, refillPerSec })`. Login counts per IP **and** email (slows guessing one account without locking out a campus behind one IP), register per IP (a generous limit for the same reason), booking and presign per user. Limits come from env as `<burst>/<per minute>`; `createApp({ rateLimits })` lets tests use tiny ones.
+- **Headers:** every answer carries `RateLimit-Limit` (burst), `RateLimit-Remaining` and `RateLimit-Reset` (seconds until full); a `429 RATE_LIMITED` adds `Retry-After` (seconds until the next token) and the same number in `details.retryAfterSeconds`.
+- **Fail open:** if Redis errors or takes over 50 ms, the request goes through and a warning is logged. The limiter guards against abuse, not against bad data: Postgres constraints, the per-user ticket limit, idempotency keys and bcrypt's cost all still hold without it. Failing closed would turn a Redis outage into an outage of login and booking, exactly what the booking gate (Day 12) was built to avoid. The cost: during an outage, password guessing is limited only by bcrypt (about 4 guesses per second per CPU core), which the warning logs make visible.
+
+| Algorithm | How it counts | Problem |
+|---|---|---|
+| Fixed window | A counter per minute that resets on the minute | A client can send the full limit at 0:59 and again at 1:00: double the rate at the boundary |
+| Sliding log | A timestamp per request, counting those in the last minute | Exact, but stores every request (memory grows with traffic) |
+| **Token bucket** (chosen) | Two numbers per key: tokens and the last refill time | Allows a burst up to the capacity, then exactly the refill rate; constant memory |
+
+**Tested by:** `apps/api/test/rate-limit.test.ts` against real Redis with tiny limits: a burst of 3 passes and the 4th gets `429` with `Retry-After`; headers on allowed and limited answers; a token comes back after the refill time; 20 parallel requests on a bucket of 3 let exactly 3 through; login counts per account (case and spaces ignored); register per IP; booking and presign per user; with Redis failing, requests pass without rate headers. Live with the defaults (`RATE_LIMIT_LOGIN=5/5`): attempts 1–5 got 401 with `RateLimit-Remaining` 4 → 0, attempts 6–8 got 429 with `Retry-After: 11`, and another account from the same IP still logged in.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Rate limiting (Day 14)
 - Payment idempotency and the order state machine (Days 15–16)
 - Forgery-proof QR tickets and offline scanning (Days 17, 20)
 - Exactly-once entry (Day 19)
@@ -457,6 +475,10 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api, worker | Redis connection string (booking gate, BullMQ queues). Tests use database 15 of the same server |
 | `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid: minutes, up to 60, default 10. Fractions are allowed (`0.5` = 30 s, handy for watching an expiry) |
+| `RATE_LIMIT_LOGIN` | api | Token bucket for login, per IP + email, as `<burst>/<per minute>` (default `5/5`) |
+| `RATE_LIMIT_REGISTER` | api | Register, per IP (default `20/10`; generous because a campus can share one public IP) |
+| `RATE_LIMIT_ORDERS` | api | Booking, per user (default `10/30`) |
+| `RATE_LIMIT_PRESIGN` | api | Banner upload signing, per user (default `10/10`) |
 | `ADMIN_EMAILS` | api | Comma-separated emails allowed to open the job dashboard (Bull Board) at `/admin/queues`. Empty means nobody. Local `.env` lists the seed organizer |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
 | `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
@@ -500,6 +522,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie.
 - **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20) and return `{ items, nextCursor }`; pass `nextCursor` back to get the next page (`null` on the last page). Cursors are opaque and keyset-based on `(startsAt, id)`, so pages stay correct when events are added between requests.
+- **Rate limits:** login, register, booking and presign answer with `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers; over the limit they return `429 RATE_LIMITED` with `Retry-After` (seconds) and `details.retryAfterSeconds`.
 - **Idempotency:** `POST /events/:eventId/orders` requires an `Idempotency-Key` header (a UUID the client generates once per booking attempt). Retrying with the same key and body returns the stored answer, with `Idempotent-Replayed: true`, and books nothing new; the same key with a different body is a `422`.
 - **Dates:** ISO 8601 with a timezone, e.g. `2026-12-12T10:00:00+05:30`; stored and returned in UTC.
 - **Banners:** every event response includes `bannerKey` and `bannerUrl` (a public URL, or `null`).
@@ -554,6 +577,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
+- `apps/api/test/rate-limit.test.ts`: see [Rate limiting](#rate-limiting-day-14).
 - `apps/api/test/admin.test.ts`: only `ADMIN_EMAILS` get the admin cookie (`Path=/admin`, `HttpOnly`, `SameSite=Lax`); Bull Board needs it and lists both queues; an access token doesn't work as the cookie and the cookie doesn't work as an access token (separate signing keys); someone removed from `ADMIN_EMAILS` loses access with a valid cookie.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
 - `apps/api/test/uploads.test.ts` (S3 mocked with a spy on the client's `send`): presign signs a fixed key under the event's banner prefix with `content-length-range` and `Content-Type` in the policy; a bad content type returns 400, a non-member 404, a scanner 403, no login 401; PATCH saves a confirmed `bannerKey` and returns `bannerUrl`, rejects a missing object, an object over 2 MB and a non-image type, rejects another event's key without calling storage, and `null` clears the banner.
@@ -610,7 +634,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 11 (Mon 09 Nov): Booking engine I: Postgres correctness
 - [x] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
 - [x] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
-- [ ] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
+- [x] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
 - [ ] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
 - [ ] Day 16 (Sat 14 Nov): Webhooks and the order state machine
 - [ ] Day 17 (Sun 15 Nov): Signed QR tickets
@@ -774,6 +798,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** the guarded transition, not the job system, makes the release happen exactly once: `UPDATE orders ... WHERE status = 'PENDING'` succeeds for one caller only, and stock is returned only by that caller. That is what allows both a per-order delayed job and a sweeper, since either may run twice or late without harm.
 **Verify:** `pnpm test`; then `HOLD_MINUTES=0.5 pnpm --filter @festpass/api dev`, `pnpm --filter @festpass/worker dev` and `pnpm --filter @festpass/web dev`, book a ticket, log in as `organizer@festpass.dev`, open http://localhost:3000/dashboard/queues and watch the job go from delayed to completed.
 **Next:** Day 14 adds rate limiting with a token bucket in Redis.
+
+### Day 14: Rate limiting with a token bucket (2026-11-12)
+**Built:**
+- A token bucket in one Redis Lua script that uses Redis `TIME` as the clock and refills lazily on each request, behind a `rateLimit({ name, keyFn, capacity, refillPerSec })` middleware.
+- Limits on login (per IP + email), register (per IP), booking and presign (per user), from `RATE_LIMIT_*` env vars, with `RateLimit-*` headers and `429 RATE_LIMITED` + `Retry-After`.
+- Fail open with a warning when Redis is down or slow, so a Redis outage never takes login or booking down with it.
+
+**Key decision:** a token bucket instead of a fixed window or a sliding log: it allows short bursts, holds a client to a steady rate, has no boundary spike and stores only two numbers per key.
+**Verify:** `pnpm --filter @festpass/api exec vitest run test/rate-limit.test.ts`, then with `pnpm dev` running, send 8 wrong logins for one email: the 6th gets `429` with `Retry-After`.
+**Next:** Day 15 starts payments: Razorpay checkout in test mode.
 
 <!-- BUILD-LOG:END -->
 
