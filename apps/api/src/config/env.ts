@@ -2,6 +2,18 @@ import { z } from 'zod';
 
 // Every variable the API reads, in one place. A missing or malformed value stops the process at startup
 // with a readable list, instead of failing later on the first request that happens to need it.
+// A rate limit as "<burst>/<per minute>": 5/6 allows 5 requests at once, then 6 a minute (one every 10 s).
+const rateLimit = (fallback: string) =>
+  z
+    .string()
+    .regex(/^\d+\/\d+(\.\d+)?$/, 'Use <burst>/<per minute>, e.g. 5/6')
+    .default(fallback)
+    .transform((s) => {
+      const [capacity, perMinute] = s.split('/').map(Number) as [number, number];
+      return { capacity, refillPerSec: perMinute / 60 };
+    })
+    .refine((l) => l.capacity >= 1 && l.refillPerSec > 0, 'Burst and rate must be above 0');
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   API_PORT: z.coerce.number().int().min(1).max(65_535).default(4000),
@@ -26,6 +38,12 @@ const envSchema = z.object({
   // How long a booking holds its tickets before they go back on sale if unpaid. Fractions are allowed
   // so tests can use a 2-second hold (0.034).
   HOLD_MINUTES: z.coerce.number().positive().max(60).default(10),
+  // Token-bucket limits per endpoint. Login counts per IP + email, register per IP (generous: a whole
+  // campus can share one public IP), orders and presign per user.
+  RATE_LIMIT_LOGIN: rateLimit('5/5'),
+  RATE_LIMIT_REGISTER: rateLimit('20/10'),
+  RATE_LIMIT_ORDERS: rateLimit('10/30'),
+  RATE_LIMIT_PRESIGN: rateLimit('10/10'),
   // Who may open the job dashboard (Bull Board) at /admin/queues, comma-separated. Empty: nobody.
   ADMIN_EMAILS: z
     .string()
