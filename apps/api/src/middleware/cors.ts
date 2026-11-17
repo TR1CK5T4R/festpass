@@ -14,10 +14,18 @@ export function cors(allowedOrigins: readonly string[]): RequestHandler {
 
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id');
+    // Response headers the web app may read (others are hidden from cross-origin scripts).
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'X-Request-Id, Idempotent-Replayed, Retry-After, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset',
+    );
     if (req.method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Request-Id');
+      // Every custom request header the web app sends must be listed, or the browser blocks the request.
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, X-Request-Id, Idempotency-Key',
+      );
       res.setHeader('Access-Control-Max-Age', '600');
       res.status(204).end();
       return;
