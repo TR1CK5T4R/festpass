@@ -1,5 +1,5 @@
 import { prisma } from '@festpass/db';
-import type { OrderView } from '@festpass/shared';
+import type { OrderDetails, OrderView } from '@festpass/shared';
 
 /** What the pre-checks and the gate need: the event's status and sale window, and its tiers. */
 export function findEventForBooking(eventId: string) {
@@ -16,10 +16,10 @@ export function findEventForBooking(eventId: string) {
   });
 }
 
-/** An order as the API shows it, and its owner (for the ownership check). */
+/** An order as the API shows it, its owner (for the ownership check) and its event. */
 export async function findOrder(
   orderId: string,
-): Promise<{ userId: string; view: OrderView } | null> {
+): Promise<{ userId: string; view: OrderView; event: OrderDetails['event'] } | null> {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
     select: {
@@ -29,6 +29,7 @@ export async function findOrder(
       status: true,
       amountPaise: true,
       expiresAt: true,
+      event: { select: { id: true, title: true, slug: true, venue: true, startsAt: true } },
       items: {
         select: { tierId: true, qty: true, unitPricePaise: true, tier: { select: { name: true } } },
         orderBy: { tierId: 'asc' },
@@ -36,9 +37,10 @@ export async function findOrder(
     },
   });
   if (!order) return null;
-  const { userId, expiresAt, items, ...rest } = order;
+  const { userId, expiresAt, items, event, ...rest } = order;
   return {
     userId,
+    event: { ...event, startsAt: event.startsAt.toISOString() },
     view: {
       ...rest,
       expiresAt: expiresAt.toISOString(),

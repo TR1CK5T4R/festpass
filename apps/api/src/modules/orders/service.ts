@@ -11,6 +11,7 @@ import {
   perUserLimit,
   soldOut,
   type CreateOrderInput,
+  type OrderDetails,
   type OrderView,
 } from '@festpass/shared';
 import { env } from '../../config/env.js';
@@ -196,4 +197,11 @@ export async function cancelOrder(userId: string, orderId: string): Promise<Orde
   // After the commit: the gate gets the stock back too (never throws; reconciliation is the backup).
   await releaseInRedis(released.eventId, released.userId, released.items);
   return (await repo.findOrder(orderId))!.view;
+}
+
+/** The buyer's own order, for the checkout page and its polling. */
+export async function getOrder(userId: string, orderId: string): Promise<OrderDetails> {
+  const order = await repo.findOrder(orderId);
+  if (!order || order.userId !== userId) throw new NotFoundError('Order not found');
+  return { order: order.view, event: order.event };
 }

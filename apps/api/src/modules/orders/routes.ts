@@ -31,6 +31,7 @@ export function orderRoutes(limit: Limit): Router {
 /** Mounted at /api/v1/orders: actions on one order by its owner. */
 export function orderActionRoutes(): Router {
   const router = Router();
+  router.get('/:orderId', requireAuth, validate({ params: orderIdParamsSchema }), controller.get);
   router.post(
     '/:orderId/cancel',
     requireAuth,

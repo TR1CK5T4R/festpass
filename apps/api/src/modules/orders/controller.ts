@@ -23,3 +23,7 @@ export const create: RequestHandler = async (req, res) => {
 export const cancel: RequestHandler = async (req, res) => {
   res.json({ order: await orders.cancelOrder(req.user!.id, String(req.params.orderId)) });
 };
+
+export const get: RequestHandler = async (req, res) => {
+  res.json(await orders.getOrder(req.user!.id, String(req.params.orderId)));
+};
