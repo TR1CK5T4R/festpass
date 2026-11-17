@@ -13,7 +13,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | Organizer dashboard: events list, event editor, tier editor, publish/close, members | organizers | `/dashboard`, `/dashboard/events/new`, `/dashboard/orgs/[orgId]/events/[eventId]`, `/dashboard/members` | Done (Day 9) |
 | Banner uploads straight to storage, with preview and progress | organizers | inside the event editor | Done (Day 9; API Day 8) |
 | Public event list and event pages (SSR + ISR, on-demand revalidation) | attendees | `/`, `/e/[slug]` | Done (Day 10); Book button wired up on Days 11 and 15 |
-| Checkout with a hold countdown and Razorpay | attendees | `/checkout/[orderId]` | Planned (Day 15) |
+| Booking and checkout with a hold countdown and Razorpay (test mode) | attendees | `/book/[slug]`, `/checkout/[orderId]` | Done (Day 15); payment confirmation by webhook on Day 16 |
 | My Tickets with QR codes and PDF download | attendees | `/tickets` | Planned (Day 18) |
 | Scanner PWA with offline mode | volunteers | `/scan` | Planned (Day 20) |
 | Live availability and check-in counter | attendees, organizers | event page, dashboard | Planned (Day 21) |
@@ -46,6 +46,9 @@ apps/web/
     (public)/e/[slug]/loading.tsx, not-found.tsx  Skeleton; 404 for unknown slugs and drafts
     api/revalidate/route.ts         POST, called by the API: checks the secret, revalidates /e/{slug} and /
     api/revalidate/route.test.ts    401 for a wrong or missing secret, 400 for a bad slug, revalidation otherwise
+    (app)/(buyer)/layout.tsx        Login guard for booking and checkout (sends logged-out visitors to /login?next=...)
+    (app)/(buyer)/book/[slug]/page.tsx       Choose a quantity of one tier and hold it (POST /events/:id/orders with an Idempotency-Key)
+    (app)/(buyer)/checkout/[orderId]/page.tsx  Summary, countdown, Razorpay Checkout, "Confirming payment…" polling, expiry
     (app)/layout.tsx                Wraps login, register and the dashboard in <Providers>
     (app)/(auth)/layout.tsx         Centered card layout
     (app)/(auth)/login/page.tsx     Login form
@@ -69,6 +72,9 @@ apps/web/
     dates.ts                        datetime-local <-> UTC ISO, date formatting
     upload.ts                       Banner upload: presign, XHR POST to storage with progress, PATCH bannerKey
     use-api-data.ts                 useApiData(path): load, reload and replace one API resource
+    booking.ts (+ .test.ts)         bookingKey(): one Idempotency-Key per booking attempt, kept in sessionStorage for retries
+    razorpay.ts                     Loads checkout.js once and opens Razorpay Checkout
+    next-path.ts (+ .test.ts)       safeNextPath(): where to go after login, same-site paths only
     form-helpers.test.ts            Resolver and date conversion tests
     public-api.ts                   Server-side reads for public pages, cached with `next: { revalidate: 60 }`
     tier-state.ts (+ .test.ts)      On sale / opens at / ended / sold out / closed, for a tier at a given time
@@ -90,6 +96,14 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 - **Errors** come back in one shape and become an `ApiError` with `status`, `code`, `details` and `requestId`. `showApiError()` puts `VALIDATION_FAILED` fields on their inputs, maps codes like `EMAIL_TAKEN` or `SLUG_TAKEN` to a field, and shows anything else above the form.
 - **Server validation errors:** the API reports every invalid field as `{ path, message }`. `showApiError()` calls react-hook-form's `setError` for each, so the message appears under the same input a client-side error would, linked with `aria-describedby`. Rules only the server can check (a tier's sale window against the stored event, a duplicate tier name, `PRICE_LOCKED`) land on their field the same way. Errors from actions without a form (publish, close, remove) are shown inside the confirmation dialog, which stays open.
 - **Protection:** the dashboard layout only decides what to render. The API rejects every request without a valid token and checks org permissions on the server.
+
+## Booking and checkout (Day 15)
+
+- **Book** on a public event page is a plain link to `/book/[slug]?tier=...`, so the public page stays server-rendered with no auth code. Booking pages sit in the `(buyer)` group, whose layout sends logged-out visitors to `/login?next=<this page>`; login and register return there (`safeNextPath()` accepts only same-site paths, so `?next=` can't become an open redirect).
+- **Holding tickets:** the booking page posts the order with `Idempotency-Key: bookingKey(slug, tier, qty)`. The key is generated once per attempt with `crypto.randomUUID()` and kept in `sessionStorage`, so a double click, a timeout, a "Try again" or a reload sends the same key and gets the same order back. Another tier or quantity is another attempt with another key; "Book again" after a hold ends forgets the keys for that event.
+- **Checkout** shows the items, total and a countdown to `expiresAt` (ticking every second). **Pay** asks the API for the Razorpay order (`POST /orders/:id/pay`), loads Razorpay's `checkout.js` once and opens Checkout; card or UPI details go to Razorpay, never to FestPass.
+- **After paying:** the success callback is only a hint. The page shows "Confirming payment…" and polls `GET /orders/:id` every 2 s until the order is `PAID`/`TICKETED` (moved there only by the webhook, Day 16) or ended; after 3 minutes it says confirmation is taking longer.
+- **When the countdown reaches zero** (or the order is `EXPIRED`), Pay disappears and "Book again" links back to the event.
 
 ## Organizer dashboard
 
@@ -171,3 +185,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 9:** organizer dashboard: events list with status and sold / capacity, create and edit event (dates, sale window, waiting-room toggle and admit rate), tier editor in rupees with paise sent to the API, banner uploader with preview and progress, publish and close behind confirmation dialogs, members page; `sharedSchemaResolver`, Textarea/Select/Checkbox/ConfirmDialog components, `warning` colour token; resolver and date tests.
 - **Day 10:** public pages: `/` and `/e/[slug]` as Server Components with ISR (60 s) and on-demand revalidation through a secret-protected `POST /api/revalidate`; `generateMetadata` with Open Graph banner; tier cards with sale state; loading, error and not-found states; `next/image` for banners; env validation in `next.config.ts`; auth and dashboard moved under an `(app)` group so public pages don't load the auth client.
 - **Day 13:** `/dashboard/queues` opens the job dashboard: it trades the in-memory login for the API's 15-minute admin cookie (only for `ADMIN_EMAILS`) and navigates to Bull Board on the API.
+- **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.

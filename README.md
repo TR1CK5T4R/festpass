@@ -9,13 +9,15 @@
 ![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
 
 <details>
-<summary>More screenshots: public event page, event editor, team, job queues</summary>
+<summary>More screenshots: public event page, checkout, event editor, team, job queues</summary>
 
 ![Public event page: server-rendered with the banner, times in IST and ticket tiers](.github/screenshots/public-event.png)
 
 ![Event editor: banner, ticket tiers in rupees, details with the waiting-room setting](.github/screenshots/organizer-event.png)
 
 ![Team page: add a member by email, change roles, remove](.github/screenshots/organizer-members.png)
+
+![Checkout: the held tickets, the total and a countdown to the end of the hold](.github/screenshots/checkout.png)
 
 ![Bull Board: an expire-order job, keyed by the order ID, completed with released: true](.github/screenshots/bull-board.png)
 
@@ -37,7 +39,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Event banners uploaded straight from the browser to S3-compatible storage | Done: API and storage (Day 8), uploader with preview and progress (Day 9) |
 | Oversell-proof booking engine (Postgres + Redis gate) | Done (API): Postgres booking with idempotent retries (Day 11), Redis gate with compensation, fallback and reconciliation (Day 12) |
 | Automatic hold expiry and rate limiting | Done: hold expiry, cancel and a job dashboard (Day 13); token-bucket rate limiting on login, register, booking and uploads (Day 14) |
-| Razorpay payments with idempotent webhooks | Planned (Days 15–16) |
+| Razorpay payments with idempotent webhooks | Checkout in test mode done (Day 15: Book → hold → pay with a countdown); webhooks planned (Day 16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Planned (Days 17–18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Planned (Days 19–20) |
 | Live availability and check-in dashboards | Planned (Day 21) |
@@ -81,7 +83,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
-| 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Hold expiry and cancel done (Day 13); payments planned (Days 15–16) |
+| 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Checkout with a hold countdown and Razorpay test mode done (Day 15); the webhook that marks orders paid is next (Day 16) |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Planned (Days 17–18) |
 | 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
 | 8. Measure | Booth scans feed sponsor dashboards (totals only, never names), organizers get live and post-event analytics, and an AI copilot answers questions using permission-checked tools. | Scan events are stored with the fields analytics needs, so dashboards are single aggregation queries. | Planned (Days 21–27) |
@@ -335,10 +337,25 @@ Leaving `PENDING` gives the tickets back (`EXPIRED`, `CANCELLED`) or keeps them 
 
 **Tested by:** `apps/api/test/rate-limit.test.ts` against real Redis with tiny limits: a burst of 3 passes and the 4th gets `429` with `Retry-After`; headers on allowed and limited answers; a token comes back after the refill time; 20 parallel requests on a bucket of 3 let exactly 3 through; login counts per account (case and spaces ignored); register per IP; booking and presign per user; with Redis failing, requests pass without rate headers. Live with the defaults (`RATE_LIMIT_LOGIN=5/5`): attempts 1–5 got 401 with `RateLimit-Remaining` 4 → 0, attempts 6–8 got 429 with `Retry-After: 11`, and another account from the same IP still logged in.
 
+### Payments: why the webhook is the source of truth (Day 15)
+
+**Problem:** after paying in Razorpay Checkout, the browser runs a success callback. It is tempting to call the API from there and mark the order paid. But that callback runs on the buyer's machine: anyone can call it without paying (devtools, a script), and a real payment's callback can be lost (tab closed, phone locked, network gone right after paying).
+
+**Approach:**
+- `POST /orders/:id/pay` (`apps/api/src/modules/payments/`) only *starts* a payment: for a `PENDING`, unexpired order of the caller it creates a Razorpay order for the exact amount in paise, with `receipt` and `notes.orderId` set to our order ID, stores `razorpay_order_id` and returns what Checkout needs. A second call returns the stored Razorpay order instead of creating another; two parallel calls are settled by a guarded `UPDATE ... WHERE razorpay_order_id IS NULL`, so exactly one is kept.
+- The Razorpay call happens **outside any database transaction**, behind a 10 s limit: a transaction waiting on the network would hold locks and a pool connection for seconds. Nothing is written until Razorpay has answered, so a failure (`502`) leaves nothing half-done.
+- The browser's success callback only switches the checkout page to "Confirming payment…" and starts polling `GET /orders/:id`. **Only Razorpay's webhook, signed with a secret the browser never sees and verified on the server, will move an order to `PAID` (Day 16).** A faked callback changes nothing; a lost one doesn't lose the payment, because the webhook still arrives.
+- Test mode only: the API refuses to start with a live key (`rzp_live_...`), and card details are typed into Razorpay's own window, never into FestPass.
+- The web app's **Book** creates the hold with an Idempotency-Key the browser generates once and keeps in `sessionStorage`, so a double click, a timeout or a reload sends the same key and gets the same order back instead of a second hold.
+
+**Alternatives:** marking paid from the client callback (forgeable, and loses payments whose callback never runs); verifying Razorpay's payment signature in a "client says paid" endpoint (stops forgery, but still loses payments whose browser died, so the webhook is needed anyway); polling Razorpay's API for each order (works, but slow and rate-limited at flash-sale volume).
+
+**Tested by:** `apps/api/test/payments.test.ts` with Razorpay replaced by a fake (see [Testing](#testing)). In the browser (headless Chrome, test mode without keys): **Book** on a public event page → login with `?next=` → back on the booking page → 2 tickets held → checkout with a running countdown → booking the same attempt again returned the same order → **Pay** without keys showed "Payments are not set up on this server". A completed test-mode payment needs Razorpay test keys in `.env`.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Payment idempotency and the order state machine (Days 15–16)
+- Webhooks and payment idempotency (Day 16)
 - Forgery-proof QR tickets and offline scanning (Days 17, 20)
 - Exactly-once entry (Day 19)
 - Real-time updates (Day 21)
@@ -479,6 +496,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `RATE_LIMIT_REGISTER` | api | Register, per IP (default `20/10`; generous because a campus can share one public IP) |
 | `RATE_LIMIT_ORDERS` | api | Booking, per user (default `10/30`) |
 | `RATE_LIMIT_PRESIGN` | api | Banner upload signing, per user (default `10/10`) |
+| `RAZORPAY_KEY_ID` | api | Razorpay **test** key ID from the dashboard in Test Mode. Must start with `rzp_test_`: a live key stops the API at startup. Sent to the browser for Checkout (it is public) |
+| `RAZORPAY_KEY_SECRET` | api | Its secret, never sent anywhere. Set both or neither; without them `POST /orders/:id/pay` answers `503 PAYMENTS_NOT_CONFIGURED` |
 | `ADMIN_EMAILS` | api | Comma-separated emails allowed to open the job dashboard (Bull Board) at `/admin/queues`. Empty means nobody. Local `.env` lists the seed organizer |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
 | `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
@@ -516,10 +535,10 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING` (409), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY` (409), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
-- **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie.
+- **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie. Allowed request headers: `Content-Type`, `Authorization`, `X-Request-Id`, `Idempotency-Key`; readable response headers: `X-Request-Id`, `Idempotent-Replayed`, `Retry-After`, `RateLimit-*`.
 - **Auth:** protected endpoints need `Authorization: Bearer <accessToken>`. The refresh token is only ever an `fp_refresh` cookie; it never appears in a response body.
 - **Pagination:** list endpoints take `?cursor=&limit=` (`limit` 1–100, default 20) and return `{ items, nextCursor }`; pass `nextCursor` back to get the next page (`null` on the last page). Cursors are opaque and keyset-based on `(startsAt, id)`, so pages stay correct when events are added between requests.
 - **Rate limits:** login, register, booking and presign answer with `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers; over the limit they return `429 RATE_LIMITED` with `Retry-After` (seconds) and `details.retryAfterSeconds`.
@@ -550,6 +569,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | GET | `/api/v1/events` | none | Published events that haven't ended, soonest first. `?cursor=&limit=&orgId=`. `{ items, nextCursor }` |
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
+| GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
+| POST | `/api/v1/orders/:orderId/pay` | Bearer (owner) | Starts payment: creates a Razorpay order (amount in paise, `receipt` and `notes.orderId` = our order ID) or returns the one already stored. `200 { payment: { orderId, keyId, razorpayOrderId, amountPaise, currency, expiresAt, description, prefill } }`. `409 ORDER_NOT_PENDING` / `HOLD_EXPIRED` / `NOTHING_TO_PAY` (free order), `404` for others' orders, `502 PAYMENT_PROVIDER_ERROR`, `503 PAYMENTS_NOT_CONFIGURED`. Never marks anything paid |
 | POST | `/api/v1/orders/:orderId/cancel` | Bearer (the order's owner) | `PENDING` → `CANCELLED`: the tickets go back on sale at once. `200 { order }`; `409 ORDER_NOT_PENDING` (with `details.status`) for any other status; `404` for someone else's order |
 | POST | `/api/v1/admin/session` | Bearer, email in `ADMIN_EMAILS` | Sets a 15-minute `fp_admin` cookie (`httpOnly`, `SameSite=Lax`, `Path=/admin`) and returns `204`; `403` for everyone else. The web app's `/dashboard/queues` calls it, then opens the board |
 | GET | `/admin/queues` | `fp_admin` cookie | Bull Board for the `orders` and `inventory` queues: delayed, completed and failed jobs, retry and clean. `401` without the cookie, `403` if the email is no longer in `ADMIN_EMAILS` |
@@ -577,6 +598,8 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
+- `apps/api/test/payments.test.ts` (Razorpay replaced by a fake): pay creates one Razorpay order for the amount with our order ID, and repeated or parallel pay calls all get the one stored; someone else's order is 404; an expired hold (even before the sweeper), a paid and a cancelled order are 409; a Razorpay failure is a 502 that stores nothing. `GET /orders/:id` shows the owner the order and its event, and 404s for anyone else.
+- `apps/web/src/lib/booking.test.ts`: a retry of the same booking reuses its Idempotency-Key; another tier or quantity gets a new one; booking again after a hold ends gets a new one. `next-path.test.ts`: login only returns to paths on this site (no open redirect).
 - `apps/api/test/rate-limit.test.ts`: see [Rate limiting](#rate-limiting-day-14).
 - `apps/api/test/admin.test.ts`: only `ADMIN_EMAILS` get the admin cookie (`Path=/admin`, `HttpOnly`, `SameSite=Lax`); Bull Board needs it and lists both queues; an access token doesn't work as the cookie and the cookie doesn't work as an access token (separate signing keys); someone removed from `ADMIN_EMAILS` loses access with a valid cookie.
 - `apps/web/src/lib/api.test.ts` (Vitest, fake `fetch`): on a 401 the client refreshes once and retries with the new token; a retry that is still 401 is not retried again; a failed refresh stops immediately and reports the logout; two requests failing at once share one refresh call; error bodies become a typed `ApiError`.
@@ -635,7 +658,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 12 (Tue 10 Nov): Booking engine II: the Redis gate
 - [x] Day 13 (Wed 11 Nov): Hold expiry with BullMQ
 - [x] Day 14 (Thu 12 Nov): Rate limiting with a token bucket
-- [ ] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
+- [x] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
 - [ ] Day 16 (Sat 14 Nov): Webhooks and the order state machine
 - [ ] Day 17 (Sun 15 Nov): Signed QR tickets
 - [ ] Day 18 (Mon 16 Nov): PDF tickets and email delivery
@@ -808,6 +831,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** a token bucket instead of a fixed window or a sliding log: it allows short bursts, holds a client to a steady rate, has no boundary spike and stores only two numbers per key.
 **Verify:** `pnpm --filter @festpass/api exec vitest run test/rate-limit.test.ts`, then with `pnpm dev` running, send 8 wrong logins for one email: the 6th gets `429` with `Retry-After`.
 **Next:** Day 15 starts payments: Razorpay checkout in test mode.
+
+### Day 15: Razorpay checkout (test mode) (2026-11-13)
+**Built:**
+- A payments module on the Razorpay Node SDK (test keys only; a live key stops the API): `POST /orders/:id/pay` creates the Razorpay order outside any transaction and reuses it on repeat calls, and `GET /orders/:id` for the checkout to poll.
+- Web: **Book** on the public page links to `/book/[slug]` (login first with `?next=`), which holds the tickets with a browser-generated Idempotency-Key kept for retries, then `/checkout/[orderId]` with the summary, a countdown, Razorpay Checkout and "Confirming payment…" polling.
+- When the countdown reaches zero, payment is disabled and "Book again" starts a fresh attempt; CORS now allows the `Idempotency-Key` header (found by the browser test).
+
+**Key decision:** the browser's success callback is only a hint for the UI; an order becomes `PAID` only from Razorpay's signed webhook (Day 16), because the callback can be faked by anyone and lost for real payments.
+**Verify:** `pnpm test`; with Razorpay test keys in `.env` and `pnpm dev` running, open http://localhost:3000/e/mait-alumni-meet-2026, press **Book**, hold tickets and pay with a Razorpay test card. The order stays `PENDING` until the webhook arrives on Day 16.
+**Next:** Day 16 verifies Razorpay webhooks and moves orders to `PAID` through the state machine, exactly once.
 
 <!-- BUILD-LOG:END -->
 
