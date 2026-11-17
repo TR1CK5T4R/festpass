@@ -3,26 +3,29 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { registerSchema } from '@festpass/shared';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { api } from '@/lib/api';
 import { showApiError } from '@/lib/form-errors';
+import { safeNextPath } from '@/lib/next-path';
 
 // An empty optional input should mean "not given", not "an empty string" (which the schema rejects).
 const optional = (v: string) => (v.trim() === '' ? undefined : v);
 
 export default function RegisterPage() {
   const router = useRouter();
+  // Set when a page sent the user here to log in first (e.g. booking a ticket).
+  const next = useSearchParams().get('next');
   const form = useForm({ resolver: zodResolver(registerSchema) });
   const { errors, isSubmitting } = form.formState;
 
   const onSubmit = form.handleSubmit(async (values) => {
     try {
       await api.register(values);
-      router.replace('/dashboard');
+      router.replace(safeNextPath(next));
     } catch (err) {
       showApiError(err, form.setError, { EMAIL_TAKEN: 'email' });
     }
@@ -71,7 +74,10 @@ export default function RegisterPage() {
       </form>
       <p className="mt-6 text-center text-sm text-muted">
         Already have an account?{' '}
-        <Link href="/login" className="font-medium text-brand-600 hover:underline">
+        <Link
+          href={next ? `/login?next=${encodeURIComponent(next)}` : '/login'}
+          className="font-medium text-brand-600 hover:underline"
+        >
           Log in
         </Link>
       </p>

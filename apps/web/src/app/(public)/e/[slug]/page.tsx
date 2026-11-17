@@ -1,6 +1,7 @@
 import { formatPaise, type PublicEventView, type TierView } from '@festpass/shared';
 import type { Metadata } from 'next';
 import Image from 'next/image';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { Badge } from '@/components/ui/badge';
 import { formatEventTime } from '@/lib/dates';
@@ -124,14 +125,20 @@ function TierCard({ tier, event, now }: { tier: TierView; event: PublicEventView
         </p>
       </div>
       <p className="text-sm text-muted">{note}</p>
-      {/* shortcut: not wired yet; booking (Day 11) and checkout (Day 15) turn this into the real flow. */}
-      <button
-        type="button"
-        disabled
-        className="mt-auto rounded-control bg-brand-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-brand-600/50"
-      >
-        {state.kind === 'on-sale' ? 'Book' : state.kind === 'sold-out' ? 'Sold out' : 'Unavailable'}
-      </button>
+      {state.kind === 'on-sale' ? (
+        // A plain link: the public page stays server-rendered with no auth code; logging in (if
+        // needed) and holding the tickets happen on the booking page.
+        <Link
+          href={`/book/${event.slug}?tier=${tier.id}`}
+          className="mt-auto rounded-control bg-brand-600 px-4 py-2 text-center text-sm font-medium text-white hover:bg-brand-700"
+        >
+          Book
+        </Link>
+      ) : (
+        <span className="mt-auto rounded-control bg-brand-600/50 px-4 py-2 text-center text-sm font-medium text-white">
+          {state.kind === 'sold-out' ? 'Sold out' : 'Unavailable'}
+        </span>
+      )}
     </div>
   );
 }

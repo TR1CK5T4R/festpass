@@ -3,16 +3,19 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { loginSchema } from '@festpass/shared';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { api } from '@/lib/api';
 import { showApiError } from '@/lib/form-errors';
+import { safeNextPath } from '@/lib/next-path';
 
 export default function LoginPage() {
   const router = useRouter();
+  // Set when a page sent the user here to log in first (e.g. booking a ticket).
+  const next = useSearchParams().get('next');
   // The rules live in packages/shared (the same schema the API validates with), never here.
   const form = useForm({ resolver: zodResolver(loginSchema) });
   const { errors, isSubmitting } = form.formState;
@@ -20,7 +23,7 @@ export default function LoginPage() {
   const onSubmit = form.handleSubmit(async (values) => {
     try {
       await api.login(values);
-      router.replace('/dashboard');
+      router.replace(safeNextPath(next));
     } catch (err) {
       showApiError(err, form.setError);
     }
@@ -56,7 +59,10 @@ export default function LoginPage() {
       </form>
       <p className="mt-6 text-center text-sm text-muted">
         New here?{' '}
-        <Link href="/register" className="font-medium text-brand-600 hover:underline">
+        <Link
+          href={next ? `/register?next=${encodeURIComponent(next)}` : '/register'}
+          className="font-medium text-brand-600 hover:underline"
+        >
           Create an account
         </Link>
       </p>

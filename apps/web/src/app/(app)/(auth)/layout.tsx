@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import type { ReactNode } from 'react';
+import { Suspense, type ReactNode } from 'react';
 
 export default function AuthLayout({ children }: { children: ReactNode }) {
   return (
@@ -7,7 +7,10 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
       <Link href="/" className="text-2xl font-bold tracking-tight">
         FestPass
       </Link>
-      <div className="w-full max-w-sm">{children}</div>
+      {/* The forms read ?next= (useSearchParams), which needs a Suspense boundary to prerender. */}
+      <div className="w-full max-w-sm">
+        <Suspense>{children}</Suspense>
+      </div>
     </main>
   );
 }

@@ -44,12 +44,13 @@ export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: 
     for (const listener of listeners) listener(session);
   }
 
-  function send(path: string, method: string, body: unknown) {
+  function send(path: string, method: string, body: unknown, headers: Record<string, string> = {}) {
     return fetchFn(`${baseUrl}${path}`, {
       method,
       // Sends the refresh cookie (scoped to /api/v1/auth) to the API's origin.
       credentials: 'include',
       headers: {
+        ...headers,
         ...(body !== undefined && { 'Content-Type': 'application/json' }),
         ...(accessToken && { Authorization: `Bearer ${accessToken}` }),
       },
@@ -92,13 +93,16 @@ export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: 
     return refreshing;
   }
 
-  async function request<T>(path: string, init: { method?: string; body?: unknown } = {}) {
+  async function request<T>(
+    path: string,
+    init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+  ) {
     const method = init.method ?? 'GET';
-    let res = await send(path, method, init.body);
+    let res = await send(path, method, init.body, init.headers);
     // Access tokens expire after 15 minutes: refresh once and retry once. If the retry is also a 401
     // (or the refresh failed), give up with the error instead of looping. /auth/* calls never retry.
     if (res.status === 401 && !path.startsWith('/auth/') && (await refresh())) {
-      res = await send(path, method, init.body);
+      res = await send(path, method, init.body, init.headers);
     }
     return parse<T>(res);
   }
