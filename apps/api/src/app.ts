@@ -9,6 +9,7 @@ import { orgEventRoutes, publicEventRoutes } from './modules/events/routes.js';
 import { healthRoutes } from './modules/health/routes.js';
 import { adminApiRoutes, queueDashboard } from './modules/admin/routes.js';
 import { orderActionRoutes, orderRoutes } from './modules/orders/routes.js';
+import { paymentRoutes } from './modules/payments/routes.js';
 import { orgRoutes } from './modules/orgs/routes.js';
 import { uploadRoutes } from './modules/uploads/routes.js';
 import { defaultReadinessChecks, type ReadinessChecks } from './modules/health/service.js';
@@ -51,6 +52,7 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   app.use('/api/v1/orgs', orgRoutes());
   app.use('/api/v1/events/:eventId/orders', orderRoutes(limits.orders));
   app.use('/api/v1/orders', orderActionRoutes());
+  app.use('/api/v1/orders', paymentRoutes());
   app.use('/api/v1/admin', adminApiRoutes());
   app.use('/admin/queues', queueDashboard());
   app.use('/api/v1/events', publicEventRoutes());

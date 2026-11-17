@@ -67,3 +67,22 @@ export const perUserLimit = (
   message: `You can hold at most ${tier.perUserLimit} "${tier.name}" ticket(s) and already have ${held}`,
   details: { tierId: tier.id, limit: tier.perUserLimit, held },
 });
+
+/** What the browser needs to open Razorpay Checkout for an order. */
+export interface PaymentView {
+  orderId: string;
+  /** Razorpay's public key ID (rzp_test_...), not a secret. */
+  keyId: string;
+  razorpayOrderId: string;
+  amountPaise: number;
+  currency: 'INR';
+  expiresAt: string;
+  description: string;
+  prefill: { name: string; email: string };
+}
+
+/** GET /orders/:orderId: the order and the event it is for. */
+export interface OrderDetails {
+  order: OrderView;
+  event: { id: string; title: string; slug: string; venue: string; startsAt: string };
+}
