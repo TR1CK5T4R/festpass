@@ -15,6 +15,9 @@ process.env.DATABASE_URL = process.env.DATABASE_URL_TEST;
 // Redis database 15 for tests, so flushing it between tests never touches dev data in database 0.
 process.env.REDIS_URL = new URL('/15', process.env.REDIS_URL ?? 'redis://localhost:6380').href;
 process.env.ADMIN_EMAILS = 'admin@festpass.test';
+// Fake test-mode keys: tests replace paymentGateway.createOrder, so Razorpay is never called.
+process.env.RAZORPAY_KEY_ID = 'rzp_test_festpassTests';
+process.env.RAZORPAY_KEY_SECRET = 'not-a-real-secret';
 // Limits high enough that no other suite is throttled; rate-limit.test.ts builds apps with small ones.
 for (const name of ['LOGIN', 'REGISTER', 'ORDERS', 'PRESIGN']) {
   process.env[`RATE_LIMIT_${name}`] = '100000/600000';

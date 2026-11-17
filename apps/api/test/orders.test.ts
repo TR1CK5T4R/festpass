@@ -8,7 +8,16 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { ordersQueue } from '../src/lib/queues.js';
 import { gateRedis } from '../src/lib/redis.js';
 import { bookingStats } from '../src/modules/orders/stats.js';
-import { app, makeOrg, makeUser, makeUsers, type TestUser } from './helpers.js';
+import {
+  app,
+  book,
+  createSaleEvent,
+  makeOrg,
+  makeUser,
+  makeUsers,
+  type SaleTier,
+  type TestUser,
+} from './helpers.js';
 
 beforeEach(async () => {
   await truncateAll(prisma);
@@ -33,43 +42,7 @@ beforeEach(async () => {
   orgId = await makeOrg(owner);
 });
 
-/** A published event whose sale opened an hour ago, with the given tiers. */
-async function saleEvent(tiers: { name: string; capacity: number; perUserLimit?: number }[]) {
-  const created = await request(app)
-    .post(`/api/v1/orgs/${orgId}/events`)
-    .set(owner.auth)
-    .send({
-      title: `Fest ${randomUUID().slice(0, 6)}`,
-      venue: 'MAIT Auditorium',
-      startsAt: at(48 * HOUR),
-      endsAt: at(52 * HOUR),
-      saleStartsAt: at(-HOUR),
-      saleEndsAt: at(24 * HOUR),
-    });
-  const eventId = created.body.event.id as string;
-  const tierIds: string[] = [];
-  for (const t of tiers) {
-    const res = await request(app)
-      .post(`/api/v1/orgs/${orgId}/events/${eventId}/tiers`)
-      .set(owner.auth)
-      .send({ pricePaise: 29_900, perUserLimit: 4, ...t });
-    tierIds.push(res.body.tier.id);
-  }
-  await request(app).post(`/api/v1/orgs/${orgId}/events/${eventId}/publish`).set(owner.auth);
-  return { eventId, tierIds };
-}
-
-const book = (
-  user: TestUser,
-  eventId: string,
-  items: { tierId: string; qty: number }[],
-  key: string = randomUUID(),
-) =>
-  request(app)
-    .post(`/api/v1/events/${eventId}/orders`)
-    .set(user.auth)
-    .set('Idempotency-Key', key)
-    .send({ items });
+const saleEvent = (tiers: SaleTier[]) => createSaleEvent(owner, orgId, tiers);
 
 const soldCount = async (tierId: string) =>
   (await prisma.ticketTier.findUniqueOrThrow({ where: { id: tierId } })).soldCount;
