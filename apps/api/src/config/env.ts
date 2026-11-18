@@ -60,6 +60,9 @@ const envSchema = z
         .optional(),
     ),
     RAZORPAY_KEY_SECRET: z.preprocess(blankAsUnset, z.string().optional()),
+    // Chosen by us and entered in Razorpay's webhook settings; signs every webhook. Without it,
+    // POST /webhooks/razorpay answers 503 (Razorpay keeps retrying until it is set).
+    RAZORPAY_WEBHOOK_SECRET: z.preprocess(blankAsUnset, z.string().min(16).optional()),
     // Who may open the job dashboard (Bull Board) at /admin/queues, comma-separated. Empty: nobody.
     ADMIN_EMAILS: z
       .string()

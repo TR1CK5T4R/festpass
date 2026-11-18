@@ -12,6 +12,7 @@ import { orderActionRoutes, orderRoutes } from './modules/orders/routes.js';
 import { paymentRoutes } from './modules/payments/routes.js';
 import { orgRoutes } from './modules/orgs/routes.js';
 import { uploadRoutes } from './modules/uploads/routes.js';
+import { webhookRoutes } from './modules/webhooks/routes.js';
 import { defaultReadinessChecks, type ReadinessChecks } from './modules/health/service.js';
 
 export interface AppDeps {
@@ -44,6 +45,8 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   // First, so every later log line and error response carries the request ID.
   app.use(requestLogger);
   app.use(cors(env.WEB_ORIGINS));
+  // Webhooks first: they need the raw body, which express.json() below would consume.
+  app.use('/api/v1/webhooks', webhookRoutes());
   app.use(express.json());
 
   app.use('/api/v1/health', healthRoutes(readinessChecks));

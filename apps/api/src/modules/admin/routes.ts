@@ -2,7 +2,7 @@ import { createBullBoard } from '@bull-board/api';
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
 import { ExpressAdapter } from '@bull-board/express';
 import { Router } from 'express';
-import { inventoryQueue, ordersQueue } from '../../lib/queues.js';
+import { inventoryQueue, ordersQueue, paymentsQueue, ticketsQueue } from '../../lib/queues.js';
 import { requireAuth } from '../../middleware/require-auth.js';
 import * as controller from './controller.js';
 
@@ -18,7 +18,9 @@ export function queueDashboard(): Router {
   const serverAdapter = new ExpressAdapter();
   serverAdapter.setBasePath('/admin/queues');
   createBullBoard({
-    queues: [new BullMQAdapter(ordersQueue), new BullMQAdapter(inventoryQueue)],
+    queues: [ordersQueue, paymentsQueue, ticketsQueue, inventoryQueue].map(
+      (q) => new BullMQAdapter(q),
+    ),
     serverAdapter,
   });
   const router = Router();
