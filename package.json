@@ -20,7 +20,8 @@
     "db:seed": "pnpm --filter @festpass/db exec prisma db seed",
     "db:studio": "pnpm --filter @festpass/db exec prisma studio",
     "storage:init": "pnpm --filter @festpass/api storage:init",
-    "storage:upload-banner": "pnpm --filter @festpass/api storage:upload-banner"
+    "storage:upload-banner": "pnpm --filter @festpass/api storage:upload-banner",
+    "webhook:simulate": "pnpm --filter @festpass/api webhook:simulate"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

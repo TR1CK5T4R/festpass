@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "storage:init": "tsx --conditions=development --env-file-if-exists=../../.env scripts/storage-init.ts",
-    "storage:upload-banner": "tsx --env-file-if-exists=../../.env scripts/upload-banner.ts"
+    "storage:upload-banner": "tsx --env-file-if-exists=../../.env scripts/upload-banner.ts",
+    "webhook:simulate": "tsx --conditions=development --env-file-if-exists=../../.env scripts/webhook-simulate.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1161.0",
