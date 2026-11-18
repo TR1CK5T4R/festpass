@@ -2,15 +2,18 @@ import type { Prisma } from './index.js';
 
 // The order state machine. Every order status change goes through transition(), never through a plain
 // UPDATE elsewhere, so the allowed moves live in one table and every move is guarded the same way.
-// Day 16 extends it with payments.
+// Anything not in this table throws.
 
 export type OrderStatus = 'PENDING' | 'PAID' | 'TICKETED' | 'EXPIRED' | 'CANCELLED' | 'REFUNDED';
 
 export const ORDER_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
+  // The hold ends one of three ways: paid (webhook), ran out (expiry job or sweeper), or given up.
   PENDING: ['PAID', 'EXPIRED', 'CANCELLED'],
+  // Tickets issued (Day 17), or the money returned.
   PAID: ['TICKETED', 'REFUNDED'],
-  TICKETED: ['REFUNDED'],
-  EXPIRED: [],
+  // A payment that arrived after the hold ran out: re-reserved if tickets are left, else refunded.
+  EXPIRED: ['PAID', 'REFUNDED'],
+  TICKETED: [],
   CANCELLED: [],
   REFUNDED: [],
 };
