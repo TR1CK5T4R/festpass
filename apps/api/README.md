@@ -22,6 +22,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Hold expiry (delayed job + sweeper), cancel, order state machine, Bull Board | `apps/worker`, `apps/api`, `packages/db`, `packages/shared` | Done (Day 13) |
 | Rate limiting (token bucket) on login, register, booking, presign | `apps/api` | Done (Day 14) |
 | Starting a Razorpay payment (test mode), order details for checkout | `apps/api` | Done (Day 15) |
+| Signed, idempotent Razorpay webhooks; late payments re-reserved or refunded; refund job | `apps/api`, `packages/db`, `apps/worker` | Done (Day 16) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -79,6 +80,7 @@ apps/api/
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
+  src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
   src/modules/payments/             gateway.ts (Razorpay SDK, the only file that calls it), service (startPayment), repository, routes (POST /orders/:orderId/pay)
   src/modules/admin/                POST /admin/session (admin cookie for ADMIN_EMAILS), Bull Board at /admin/queues behind it
                                     gate.ts (Lua reserve/release, 50 ms limit), inventory.ts (syncInventory after publish and tier changes), stats.ts (booking counters)
@@ -94,7 +96,8 @@ apps/api/
 apps/worker/
   src/index.ts           Zod env check, pino logger, `inventory` and `orders` queues with job schedulers (reconcile and sweep,
                          every 60 s) and one worker per queue; closes workers, queues, Prisma and Redis on SIGTERM/SIGINT
-  src/processors.ts      expireOrder(), sweepExpiredOrders(), reconcile(), and processJob() routing by job name
+  src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), reconcile(), and processJob() routing by job name
+  src/refunds.ts         Razorpay refunds (the worker's only Razorpay code); "already fully refunded" counts as done
   test/expiry.test.ts    real BullMQ worker with a 2-second hold, double runs, job vs sweeper race, early job, sweeper
 packages/db/
   prisma/schema.prisma   All Postgres tables, enums, relations and indexes (snake_case via @map/@@map)
@@ -102,6 +105,8 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/payments.ts        @festpass/db/payments: recordCapturedPayment() (insert once, lock, transition, re-reserve or refund_pending),
+                         markPaymentRefunded(), findPayment(), findPendingRefunds()
   src/order-state.ts     @festpass/db/order-state: ORDER_TRANSITIONS, canTransition(), guarded transition()
   src/inventory.ts       @festpass/db/inventory: reconcileInventory(store) sets inv:{tierId} from Postgres and reports drift
   src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer(),
@@ -142,7 +147,8 @@ packages/mongo/
 
 1. **`requestLogger`** (pino-http) gives the request an ID: the incoming `X-Request-Id` if it is 1–64 characters of `[A-Za-z0-9_-]`, otherwise a new UUID. The ID goes into `req.id`, every log line (`req.log`) and the `X-Request-Id` response header. Responses are logged at `warn` for 4xx and `error` for 5xx.
 2. **`cors(env.WEB_ORIGINS)`**: if the request's `Origin` is on the allow-list it is echoed back with `Access-Control-Allow-Credentials: true` (credentials never work with `*`), preflights get a `204` allowing `Content-Type`, `Authorization`, `X-Request-Id` and `Idempotency-Key`, `Idempotent-Replayed`, `Retry-After` and `RateLimit-*` are exposed to the web app, and every response has `Vary: Origin`. Other origins get no CORS headers, so browsers won't let their pages read the response.
-3. **`express.json()`** parses bodies (100 kB limit).
+3. **`/api/v1/webhooks`** is mounted next, before any body parser, because its signature check needs the raw bytes (Day 16).
+   **`express.json()`** then parses bodies (100 kB limit).
    Hot endpoints then run **`rateLimit()`** (Day 14) before validation: a token bucket per IP + email (login), IP (register) or user (booking, presign). Over the limit: `429 RATE_LIMITED` with `Retry-After`; `RateLimit-*` headers on every answer; if Redis is down the request passes (fail open).
 4. **Feature routers** under `/api/v1`. Each feature is `modules/<feature>/{routes,controller,service,repository}.ts`: controllers handle HTTP only, services hold business rules, and repositories are the only code that touches a data store. `validate({ params, query, body })` runs before a controller, reports every invalid field at once and replaces the raw values with the parsed ones.
 5. **`notFound`** turns anything unmatched into a `NotFoundError`.
@@ -227,17 +233,19 @@ No network call happens inside the transaction. `maxWait`/`timeout` are 10 s bec
 
 ### Paying
 
-Done (Day 15): starting a payment. _Planned (Day 16):_ the webhook and what follows it.
+Done (Days 15–16): starting a payment, and the webhook with what follows it.
 
 - `POST /orders/:id/pay` (`modules/payments/`): owner only (others get 404), `PENDING` and before `expires_at` (`HOLD_EXPIRED` even if the sweeper hasn't run), not free. If `razorpay_order_id` is set, it is returned; otherwise `paymentGateway.createOrder()` (the only code that talks to Razorpay) creates one for `amount_paise` with `receipt` and `notes.orderId` = our order ID, **outside any database transaction** with a 10 s limit, and `attachProviderOrder()` stores it with `UPDATE ... WHERE razorpay_order_id IS NULL AND status = 'PENDING'` so parallel calls keep one. Razorpay errors are logged and answered `502 PAYMENT_PROVIDER_ERROR`; nothing is stored. The response has the public key ID, Razorpay order ID, amount and prefill for Checkout.
 - `GET /orders/:id` returns the owner's order and event; the checkout page polls it after payment.
 - The browser's "payment succeeded" callback only updates the screen. The order becomes `PAID` only when Razorpay's webhook arrives and its HMAC signature checks out against the raw request body.
-- Webhooks can be delivered more than once, so payments are inserted with `ON CONFLICT DO NOTHING` and only a new row moves the order forward.
-- A payment that arrives after the hold expired is either re-reserved (if tickets remain) or refunded automatically.
+- `POST /webhooks/razorpay` (`modules/webhooks/`) is mounted before `express.json()` with `express.raw`, so `isValidSignature()` checks `HMAC-SHA256(raw body, RAZORPAY_WEBHOOK_SECRET)` against `X-Razorpay-Signature` with `timingSafeEqual` before anything is parsed (`400 INVALID_SIGNATURE` otherwise; `503` without a secret). The order is found by the stored Razorpay order ID or our ID in the payment's notes; unknown orders and other events get `200` so Razorpay stops retrying.
+- Webhooks can be delivered more than once, so `recordCapturedPayment()` inserts with `ON CONFLICT (razorpay_payment_id) DO NOTHING RETURNING id`; only a new row continues, in the same transaction: `SELECT ... FOR UPDATE` on the order, then `PENDING → PAID`, or for `EXPIRED` a re-reserve with the booking's conditional `UPDATE` under a savepoint (`EXPIRED → PAID`, or the payment marked `refund_pending`). Cancelled orders and second payments for paid orders are marked `refund_pending` too.
+- After the commit, follow-ups are queued from the stored state: `issue-tickets` (jobId = order ID) for a `PAID` order, `refund-payment` (jobId = payment ID) for each `refund_pending` payment. A redelivery after a failed enqueue queues them.
+- `refund-payment` (worker): only for a payment still `refund_pending`; Razorpay's refund API outside any transaction ("already fully refunded" counts as done); then `markPaymentRefunded()` sets the payment `refunded` and moves an `EXPIRED` order to `REFUNDED` (a paid or cancelled order keeps its status).
 
 ### Order states
 
-Done (Day 13): the state machine in `packages/db/src/order-state.ts`, with PENDING → EXPIRED and PENDING → CANCELLED in use. _Planned (Day 16):_ the payment moves below. Status only changes through `transition(tx, orderId, from, to)`: it refuses a move the table doesn't allow and runs a guarded `UPDATE orders SET status = $to WHERE id = $1 AND status = $from`, so two jobs racing on the same order can't both succeed.
+Done (Days 13 and 16): the state machine in `packages/db/src/order-state.ts`; PAID → TICKETED arrives with tickets (Day 17). Status only changes through `transition(tx, orderId, from, to)`: it refuses a move the table doesn't allow and runs a guarded `UPDATE orders SET status = $to WHERE id = $1 AND status = $from`, so two jobs racing on the same order can't both succeed.
 
 ```mermaid
 stateDiagram-v2
@@ -248,7 +256,7 @@ stateDiagram-v2
   PAID --> TICKETED: tickets issued
   EXPIRED --> PAID: late payment, re-reserved
   EXPIRED --> REFUNDED: late payment, no stock
-  PAID --> REFUNDED
+  PAID --> REFUNDED: refund
 ```
 
 ### Entry at the gate
@@ -294,6 +302,7 @@ _Planned (Days 17–19)._
 | DELETE | `/api/v1/orgs/:orgId/events/:eventId/tiers/:tierId` | `event:update` | `204`; `409 TIER_HAS_SALES` |
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
+| POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | Verified on the raw body; `200 { handled, outcome }`; `400 INVALID_SIGNATURE` / `INVALID_PAYLOAD`; `503 WEBHOOKS_NOT_CONFIGURED` |
 | GET | `/api/v1/orders/:orderId` | Bearer (owner) | `200 { order, event }`; `404` for others |
 | POST | `/api/v1/orders/:orderId/pay` | Bearer (owner) | `200 { payment }` for Razorpay Checkout, creating or reusing the Razorpay order; `409 ORDER_NOT_PENDING` / `HOLD_EXPIRED` / `NOTHING_TO_PAY`, `502`, `503 PAYMENTS_NOT_CONFIGURED` |
 | POST | `/api/v1/orders/:orderId/cancel` | Bearer (owner) | PENDING → CANCELLED, tickets back on sale; `409 ORDER_NOT_PENDING`; `404` for others' orders |
@@ -324,11 +333,11 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/payments.test.ts` replaces `paymentGateway.createOrder` with a fake and covers ownership, expiry, status, reuse of the Razorpay order (sequential and parallel) and provider errors. `test/rate-limit.test.ts` builds apps with tiny limits (`createApp({ rateLimits })`) and checks bursts, refill, headers, parallel requests, keys and fail-open against real Redis; every other suite runs with limits too high to hit. `test/admin.test.ts` covers who gets the admin cookie and what Bull Board accepts. `apps/worker/test/expiry.test.ts` runs a real BullMQ worker against the test database. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/webhooks.test.ts` signs bodies with the test secret and covers bad signatures, 5 deliveries (sequential and parallel), a failed enqueue, late payments and refunds. `test/payments.test.ts` replaces `paymentGateway.createOrder` with a fake and covers ownership, expiry, status, reuse of the Razorpay order (sequential and parallel) and provider errors. `test/rate-limit.test.ts` builds apps with tiny limits (`createApp({ rateLimits })`) and checks bursts, refill, headers, parallel requests, keys and fail-open against real Redis; every other suite runs with limits too high to hit. `test/admin.test.ts` covers who gets the admin cookie and what Bull Board accepts. `apps/worker/test/expiry.test.ts` runs a real BullMQ worker against the test database. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN` (`<burst>/<per minute>`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN` (`<burst>/<per minute>`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -347,3 +356,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 13:** order state machine (`order-state.ts`); `releaseHold()` and `findOverdueHolds()`; `expire-order` job per order (`jobId` = order ID) and a sweeper every minute in the worker (`processors.ts`); `POST /orders/:id/cancel`; shared queue names, job schemas and a queue factory with retries and backoff (`@festpass/shared/server`); Bull Board at `/admin/queues` behind an admin cookie for `ADMIN_EMAILS`; the gate's per-user key now lives for the hold plus 5 minutes; holds in seconds (`HOLD_MINUTES` may be fractional); worker tests.
 - **Day 14:** token-bucket rate limiting (`lib/rate-limit.ts`: one Lua script, Redis `TIME`, lazy refill) on login, register, booking and presign with `RATE_LIMIT_*` env limits, `RateLimit-*` and `Retry-After` headers, fail-open when Redis is down; `createApp({ rateLimits })` for tests.
 - **Day 15:** payments module (Razorpay SDK behind `paymentGateway`, test keys only): `POST /orders/:id/pay` (Razorpay order created outside any transaction, reused on repeat and parallel calls), `GET /orders/:id`; CORS allows `Idempotency-Key` and exposes the booking and rate-limit headers; shared test helpers `createSaleEvent()` and `book()`.
+- **Day 16:** Razorpay webhooks (`express.raw`, HMAC with `timingSafeEqual`, `payment.captured` and `order.paid`); `@festpass/db/payments` (insert-once payments, late-payment re-reserve or `refund_pending`); state machine extended to exactly the listed transitions; `issue-tickets` and `refund-payment` jobs queued from stored state; worker refund job; `pnpm webhook:simulate`; `RAZORPAY_WEBHOOK_SECRET`.
