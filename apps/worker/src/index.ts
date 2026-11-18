@@ -6,6 +6,7 @@ import { Redis } from 'ioredis';
 import { pino } from 'pino';
 import { z } from 'zod';
 import { processJob } from './processors.js';
+import { razorpayRefunds } from './refunds.js';
 
 // Background jobs, in their own process so a slow job can never slow down the API.
 // Today: hold expiry (each order's own delayed job plus a sweeper) and inventory reconciliation.
@@ -14,6 +15,12 @@ const parsed = z
   .object({
     DATABASE_URL: z.url(),
     REDIS_URL: z.url(),
+    // Optional (blank means unset): without them, refund jobs fail and wait in Bull Board for a retry.
+    RAZORPAY_KEY_ID: z.preprocess(
+      (v) => (v === '' ? undefined : v),
+      z.string().startsWith('rzp_test_').optional(),
+    ),
+    RAZORPAY_KEY_SECRET: z.preprocess((v) => (v === '' ? undefined : v), z.string().optional()),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
@@ -34,6 +41,7 @@ connection.on('error', (err) => logger.warn({ err: err.message }, 'redis connect
 
 const inventoryQueue = createQueue(QUEUES.inventory, connection);
 const ordersQueue = createQueue(QUEUES.orders, connection);
+const refunds = razorpayRefunds(env.RAZORPAY_KEY_ID, env.RAZORPAY_KEY_SECRET);
 
 // Repeating jobs. upsertJobScheduler is idempotent: restarting the worker (or running two) keeps one
 // schedule per ID. Every minute: reset inv:* from Postgres, and expire holds whose own job never ran.
@@ -48,9 +56,12 @@ await ordersQueue.upsertJobScheduler(
   { name: JOBS.sweepExpiredOrders },
 );
 
-// Each queue gets its own worker so a backlog of one can't delay the other.
-const workers = [QUEUES.inventory, QUEUES.orders].map((name) => {
-  const worker = new Worker(name, (job) => processJob(job, connection, logger), { connection });
+// Each queue gets its own worker so a backlog of one can't delay the others. The tickets queue has no
+// worker yet: issue-tickets jobs wait there until ticket issuing exists (Day 17), and nothing is lost.
+const workers = [QUEUES.inventory, QUEUES.orders, QUEUES.payments].map((name) => {
+  const worker = new Worker(name, (job) => processJob(job, connection, logger, refunds), {
+    connection,
+  });
   // Failed jobs are retried with backoff (createQueue) and kept in Bull Board once attempts run out.
   worker.on('failed', (job, err) =>
     logger.error({ job: job?.id, name: job?.name, attempt: job?.attemptsMade, err }, 'job failed'),
@@ -58,7 +69,7 @@ const workers = [QUEUES.inventory, QUEUES.orders].map((name) => {
   return worker;
 });
 
-logger.info({ queues: [QUEUES.inventory, QUEUES.orders] }, 'worker started');
+logger.info({ queues: [QUEUES.inventory, QUEUES.orders, QUEUES.payments] }, 'worker started');
 
 async function shutdown(signal: NodeJS.Signals) {
   logger.info({ signal }, 'worker shutting down');
