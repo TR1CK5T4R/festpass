@@ -36,7 +36,7 @@ describe('job dashboard (Bull Board) access', () => {
     );
   });
 
-  it('the board needs the admin cookie, and shows both queues with it', async () => {
+  it('the board needs the admin cookie, and shows every queue with it', async () => {
     const cookie = await adminCookie(await makeAdmin());
 
     const without = await request(app).get('/admin/queues');
@@ -49,6 +49,8 @@ describe('job dashboard (Bull Board) access', () => {
     expect(queues.body.queues.map((q: { name: string }) => q.name).sort()).toEqual([
       'inventory',
       'orders',
+      'payments',
+      'tickets',
     ]);
   });
 

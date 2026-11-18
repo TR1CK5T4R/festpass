@@ -18,6 +18,7 @@ process.env.ADMIN_EMAILS = 'admin@festpass.test';
 // Fake test-mode keys: tests replace paymentGateway.createOrder, so Razorpay is never called.
 process.env.RAZORPAY_KEY_ID = 'rzp_test_festpassTests';
 process.env.RAZORPAY_KEY_SECRET = 'not-a-real-secret';
+process.env.RAZORPAY_WEBHOOK_SECRET = 'test-webhook-secret-0123456789';
 // Limits high enough that no other suite is throttled; rate-limit.test.ts builds apps with small ones.
 for (const name of ['LOGIN', 'REGISTER', 'ORDERS', 'PRESIGN']) {
   process.env[`RATE_LIMIT_${name}`] = '100000/600000';
