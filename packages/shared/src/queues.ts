@@ -6,12 +6,16 @@ import { z } from 'zod';
 export const QUEUES = {
   inventory: 'inventory',
   orders: 'orders',
+  payments: 'payments',
+  tickets: 'tickets',
 } as const;
 
 export const JOBS = {
   reconcileInventory: 'reconcile-inventory',
   expireOrder: 'expire-order',
   sweepExpiredOrders: 'sweep-expired-orders',
+  refundPayment: 'refund-payment',
+  issueTickets: 'issue-tickets',
 } as const;
 
 export const expireOrderJobSchema = z.object({
@@ -20,3 +24,16 @@ export const expireOrderJobSchema = z.object({
   requestId: z.string().optional(),
 });
 export type ExpireOrderJob = z.infer<typeof expireOrderJobSchema>;
+
+export const refundPaymentJobSchema = z.object({
+  /** Our payments row (status refund_pending), not Razorpay's payment ID. */
+  paymentId: z.uuid(),
+  requestId: z.string().optional(),
+});
+export type RefundPaymentJob = z.infer<typeof refundPaymentJobSchema>;
+
+export const issueTicketsJobSchema = z.object({
+  orderId: z.uuid(),
+  requestId: z.string().optional(),
+});
+export type IssueTicketsJob = z.infer<typeof issueTicketsJobSchema>;
