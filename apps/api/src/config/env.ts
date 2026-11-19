@@ -1,3 +1,4 @@
+import { loadTicketPrivateKey } from '@festpass/shared/server';
 import { z } from 'zod';
 
 // Every variable the API reads, in one place. A missing or malformed value stops the process at startup
@@ -63,6 +64,19 @@ const envSchema = z
     // Chosen by us and entered in Razorpay's webhook settings; signs every webhook. Without it,
     // POST /webhooks/razorpay answers 503 (Razorpay keeps retrying until it is set).
     RAZORPAY_WEBHOOK_SECRET: z.preprocess(blankAsUnset, z.string().min(16).optional()),
+    // Signs ticket QR codes (Ed25519, PKCS#8 base64url from `pnpm keys:generate`). Parsed here, so a
+    // missing or malformed key stops the API at startup, not on the first ticket.
+    TICKET_SIGNING_PRIVATE_KEY: z.string().transform((value, ctx) => {
+      try {
+        return loadTicketPrivateKey(value);
+      } catch (err) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `Not an Ed25519 private key (${(err as Error).message}); run pnpm keys:generate`,
+        });
+        return z.NEVER;
+      }
+    }),
     // Who may open the job dashboard (Bull Board) at /admin/queues, comma-separated. Empty: nobody.
     ADMIN_EMAILS: z
       .string()
