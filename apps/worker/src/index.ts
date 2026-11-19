@@ -9,7 +9,8 @@ import { processJob } from './processors.js';
 import { razorpayRefunds } from './refunds.js';
 
 // Background jobs, in their own process so a slow job can never slow down the API.
-// Today: hold expiry (each order's own delayed job plus a sweeper) and inventory reconciliation.
+// Hold expiry (each order's own delayed job plus a sweeper), refunds, ticket issuing and inventory
+// reconciliation.
 
 const parsed = z
   .object({
@@ -56,9 +57,9 @@ await ordersQueue.upsertJobScheduler(
   { name: JOBS.sweepExpiredOrders },
 );
 
-// Each queue gets its own worker so a backlog of one can't delay the others. The tickets queue has no
-// worker yet: issue-tickets jobs wait there until ticket issuing exists (Day 17), and nothing is lost.
-const workers = [QUEUES.inventory, QUEUES.orders, QUEUES.payments].map((name) => {
+// Each queue gets its own worker so a backlog of one can't delay the others.
+const QUEUE_NAMES = [QUEUES.inventory, QUEUES.orders, QUEUES.payments, QUEUES.tickets];
+const workers = QUEUE_NAMES.map((name) => {
   const worker = new Worker(name, (job) => processJob(job, connection, logger, refunds), {
     connection,
   });
@@ -69,7 +70,7 @@ const workers = [QUEUES.inventory, QUEUES.orders, QUEUES.payments].map((name) =>
   return worker;
 });
 
-logger.info({ queues: [QUEUES.inventory, QUEUES.orders, QUEUES.payments] }, 'worker started');
+logger.info({ queues: QUEUE_NAMES }, 'worker started');
 
 async function shutdown(signal: NodeJS.Signals) {
   logger.info({ signal }, 'worker shutting down');

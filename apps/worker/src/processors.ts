@@ -1,7 +1,13 @@
 import { findOverdueHolds, releaseHold, type ReleasedHold } from '@festpass/db/booking';
 import { findPayment, markPaymentRefunded } from '@festpass/db/payments';
+import { issueTickets } from '@festpass/db/tickets';
 import { reconcileInventory } from '@festpass/db/inventory';
-import { expireOrderJobSchema, JOBS, refundPaymentJobSchema } from '@festpass/shared';
+import {
+  expireOrderJobSchema,
+  issueTicketsJobSchema,
+  JOBS,
+  refundPaymentJobSchema,
+} from '@festpass/shared';
 import { releaseRedisStock } from '@festpass/shared/server';
 import type { Job } from 'bullmq';
 import type { Redis } from 'ioredis';
@@ -81,6 +87,16 @@ export async function refundPayment(data: unknown, refunds: RefundGateway, log: 
   return { refunded: true };
 }
 
+/** issue-tickets: one ticket per unit of a paid order, then TICKETED. Running it again does nothing. */
+export async function issueOrderTickets(data: unknown, log: Logger) {
+  const { orderId, requestId } = issueTicketsJobSchema.parse(data);
+  const result = await issueTickets(orderId);
+  if (!result) throw new Error(`order ${orderId} not found`);
+  if (result.issued > 0) log.info({ orderId, requestId, issued: result.issued }, 'tickets issued');
+  else log.debug({ orderId, status: result.status }, 'no tickets to issue');
+  return result;
+}
+
 export async function reconcile(redis: Redis, log: Logger) {
   const drift = await reconcileInventory(redis);
   // Drift means the gate and Postgres disagreed: a failed release, a timed-out script, a restart.
@@ -98,6 +114,8 @@ export function processJob(job: Job, redis: Redis, log: Logger, refunds?: Refund
       return sweepExpiredOrders(redis, jobLog);
     case JOBS.reconcileInventory:
       return reconcile(redis, jobLog);
+    case JOBS.issueTickets:
+      return issueOrderTickets(job.data, jobLog);
     case JOBS.refundPayment:
       if (!refunds) throw new Error('refund-payment needs a refund gateway');
       return refundPayment(job.data, refunds, jobLog);
