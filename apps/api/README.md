@@ -23,6 +23,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Rate limiting (token bucket) on login, register, booking, presign | `apps/api` | Done (Day 14) |
 | Starting a Razorpay payment (test mode), order details for checkout | `apps/api` | Done (Day 15) |
 | Signed, idempotent Razorpay webhooks; late payments re-reserved or refunded; refund job | `apps/api`, `packages/db`, `apps/worker` | Done (Day 16) |
+| Ed25519-signed QR tickets, issue-tickets job, my tickets, QR reissue | `packages/shared`, `packages/db`, `apps/worker`, `apps/api` | Done (Day 17) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -39,7 +40,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 | Process | Started by | Job |
 |---|---|---|
 | **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
-| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13) and inventory reconciliation every minute (Day 12). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
+| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16) and ticket issuing (`issue-tickets`, Day 17). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
 
@@ -80,6 +81,7 @@ apps/api/
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
+  src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue), service (QR signed on read, owner checks), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
   src/modules/payments/             gateway.ts (Razorpay SDK, the only file that calls it), service (startPayment), repository, routes (POST /orders/:orderId/pay)
   src/modules/admin/                POST /admin/session (admin cookie for ADMIN_EMAILS), Bull Board at /admin/queues behind it
@@ -96,7 +98,7 @@ apps/api/
 apps/worker/
   src/index.ts           Zod env check, pino logger, `inventory` and `orders` queues with job schedulers (reconcile and sweep,
                          every 60 s) and one worker per queue; closes workers, queues, Prisma and Redis on SIGTERM/SIGINT
-  src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), reconcile(), and processJob() routing by job name
+  src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), issueOrderTickets(), reconcile(), and processJob() routing by job name
   src/refunds.ts         Razorpay refunds (the worker's only Razorpay code); "already fully refunded" counts as done
   test/expiry.test.ts    real BullMQ worker with a 2-second hold, double runs, job vs sweeper race, early job, sweeper
 packages/db/
@@ -105,6 +107,7 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion()
   src/payments.ts        @festpass/db/payments: recordCapturedPayment() (insert once, lock, transition, re-reserve or refund_pending),
                          markPaymentRefunded(), findPayment(), findPendingRefunds()
   src/order-state.ts     @festpass/db/order-state: ORDER_TRANSITIONS, canTransition(), guarded transition()
@@ -124,7 +127,9 @@ packages/shared/
   src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
   src/redis-keys.ts      redisKeys.inventory / userHeld (shared by API and worker)
   src/queues.ts          QUEUES and JOBS names, expireOrderJobSchema (the worker validates job payloads)
-  src/server.ts          @festpass/shared/server (Node only): createQueue() with retry/backoff defaults, releaseRedisStock()
+  src/server.ts          @festpass/shared/server (Node only): createQueue() with retry/backoff defaults, releaseRedisStock(),
+                         loadTicketPrivateKey(), encodeTicket() / createTicketSigner() (Node crypto Ed25519)
+  src/qr.ts              QR format FP1.<payload>.<signature>, verifyTicket() (@noble/ed25519, Node and browser), base64url helpers
   src/orders.ts          createOrderSchema, idempotencyHeadersSchema, OrderView, soldOut() / perUserLimit() refusals
   src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
   test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
@@ -303,6 +308,9 @@ _Planned (Days 17–19)._
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
 | POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | Verified on the raw body; `200 { handled, outcome }`; `400 INVALID_SIGNATURE` / `INVALID_PAYLOAD`; `503 WEBHOOKS_NOT_CONFIGURED` |
+| GET | `/api/v1/me/tickets` | Bearer | The caller's tickets with signed QR strings |
+| GET | `/api/v1/tickets/:ticketId` | Bearer (owner) | One ticket; `404` for others |
+| POST | `/api/v1/tickets/:ticketId/reissue` | Bearer (owner) | Bumps `qrVersion` (old QRs outdated at the gate); `409 TICKET_USED` once checked in |
 | GET | `/api/v1/orders/:orderId` | Bearer (owner) | `200 { order, event }`; `404` for others |
 | POST | `/api/v1/orders/:orderId/pay` | Bearer (owner) | `200 { payment }` for Razorpay Checkout, creating or reusing the Razorpay order; `409 ORDER_NOT_PENDING` / `HOLD_EXPIRED` / `NOTHING_TO_PAY`, `502`, `503 PAYMENTS_NOT_CONFIGURED` |
 | POST | `/api/v1/orders/:orderId/cancel` | Bearer (owner) | PENDING → CANCELLED, tickets back on sale; `409 ORDER_NOT_PENDING`; `404` for others' orders |
@@ -337,7 +345,7 @@ Tests use Vitest and Supertest against `createApp()`, without opening a port. `t
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN` (`<burst>/<per minute>`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `TICKET_SIGNING_PRIVATE_KEY` (parsed as an Ed25519 key at startup), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN` (`<burst>/<per minute>`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -357,3 +365,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 14:** token-bucket rate limiting (`lib/rate-limit.ts`: one Lua script, Redis `TIME`, lazy refill) on login, register, booking and presign with `RATE_LIMIT_*` env limits, `RateLimit-*` and `Retry-After` headers, fail-open when Redis is down; `createApp({ rateLimits })` for tests.
 - **Day 15:** payments module (Razorpay SDK behind `paymentGateway`, test keys only): `POST /orders/:id/pay` (Razorpay order created outside any transaction, reused on repeat and parallel calls), `GET /orders/:id`; CORS allows `Idempotency-Key` and exposes the booking and rate-limit headers; shared test helpers `createSaleEvent()` and `book()`.
 - **Day 16:** Razorpay webhooks (`express.raw`, HMAC with `timingSafeEqual`, `payment.captured` and `order.paid`); `@festpass/db/payments` (insert-once payments, late-payment re-reserve or `refund_pending`); state machine extended to exactly the listed transitions; `issue-tickets` and `refund-payment` jobs queued from stored state; worker refund job; `pnpm webhook:simulate`; `RAZORPAY_WEBHOOK_SECRET`.
+- **Day 17:** Ed25519 QR tickets: `pnpm keys:generate`, `FP1.<payload>.<signature>` signed with Node crypto (`@festpass/shared/server`) and verified with `@noble/ed25519` (`@festpass/shared`); `issueTickets()` and the worker's `issue-tickets` job (the `tickets` queue is now worked); `GET /me/tickets`, `GET /tickets/:id`, `POST /tickets/:id/reissue`; `TICKET_SIGNING_PRIVATE_KEY` checked at startup.
