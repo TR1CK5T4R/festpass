@@ -1,0 +1,57 @@
+import { randomInt } from 'node:crypto';
+import { prisma } from './index.js';
+import { transition, type OrderStatus } from './order-state.js';
+
+// Unambiguous letters and digits (no 0/O, 1/I/L), so a code read out at the gate is typed correctly.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+/** A short code people can read out, e.g. "K7QM-X9PA": 31^8 ≈ 850 billion combinations. */
+function ticketCode(): string {
+  const chars = Array.from({ length: 8 }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]);
+  return `${chars.slice(0, 4).join('')}-${chars.slice(4).join('')}`;
+}
+
+/**
+ * Issues a paid order's tickets: one per unit, numbered 1..n across the order, then PAID -> TICKETED,
+ * in one transaction. Safe to run any number of times: the order row is locked and only a PAID order
+ * gets tickets, and unique(order_id, seq) would reject a second ticket #2 even if that check failed.
+ * (A clash on the random code itself fails the transaction; the job retries with new codes.)
+ */
+export async function issueTickets(
+  orderId: string,
+): Promise<{ issued: number; status: OrderStatus } | null> {
+  return prisma.$transaction(async (tx) => {
+    const [order] = await tx.$queryRaw<{ user_id: string; status: OrderStatus }[]>`
+      SELECT user_id, status FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`;
+    if (!order) return null;
+    if (order.status !== 'PAID') return { issued: 0, status: order.status }; // done before, or not paid
+
+    const items = await tx.$queryRaw<{ tier_id: string; qty: number }[]>`
+      SELECT tier_id, qty FROM order_items WHERE order_id = ${orderId}::uuid ORDER BY tier_id`;
+    let seq = 0;
+    let issued = 0;
+    for (const item of items) {
+      for (let unit = 0; unit < item.qty; unit++) {
+        seq++;
+        issued += await tx.$executeRaw`
+          INSERT INTO tickets (order_id, tier_id, owner_user_id, seq, code)
+          VALUES (${orderId}::uuid, ${item.tier_id}::uuid, ${order.user_id}::uuid, ${seq}, ${ticketCode()})
+          ON CONFLICT (order_id, seq) DO NOTHING`;
+      }
+    }
+    await transition(tx, orderId, 'PAID', 'TICKETED');
+    return { issued, status: 'TICKETED' };
+  });
+}
+
+/**
+ * Revocation: a new qr_version makes every QR printed or shared for an older version invalid at the
+ * gate. Not for tickets already used. Returns the new version, or null if the ticket can't be changed.
+ */
+export async function bumpQrVersion(ticketId: string): Promise<number | null> {
+  const [row] = await prisma.$queryRaw<{ qr_version: number }[]>`
+    UPDATE tickets SET qr_version = qr_version + 1
+    WHERE id = ${ticketId}::uuid AND checked_in_at IS NULL
+    RETURNING qr_version`;
+  return row?.qr_version ?? null;
+}

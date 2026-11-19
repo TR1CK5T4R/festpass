@@ -33,6 +33,11 @@
       "development": "./src/payments.ts",
       "types": "./dist/payments.d.ts",
       "default": "./dist/payments.js"
+    },
+    "./tickets": {
+      "development": "./src/tickets.ts",
+      "types": "./dist/tickets.d.ts",
+      "default": "./dist/tickets.js"
     }
   },
   "scripts": {
