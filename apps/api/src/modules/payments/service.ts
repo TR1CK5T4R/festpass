@@ -33,7 +33,8 @@ export async function startPayment(userId: string, orderId: string): Promise<Pay
   if (order.expiresAt <= new Date()) {
     throw new ConflictError('HOLD_EXPIRED', 'Your hold on these tickets has expired; book again');
   }
-  // shortcut: free orders can't go through Razorpay (minimum ₹1); they get confirmed with tickets on Day 17.
+  // shortcut: free orders can't go through Razorpay (minimum ₹1) and have no confirm path yet; add one
+  // (PENDING -> PAID without a payment, then issue-tickets) before selling free tiers.
   if (order.amountPaise === 0) {
     throw new ConflictError('NOTHING_TO_PAY', 'This order is free and needs no payment');
   }

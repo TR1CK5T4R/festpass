@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const eventIdParamsSchema = z.object({ eventId: z.uuid() });
 export const orderIdParamsSchema = z.object({ orderId: z.uuid() });
+export const ticketIdParamsSchema = z.object({ ticketId: z.uuid() });
 
 /** Each tier at most once; a few tickets per tier (the tier's own perUserLimit is checked by the API). */
 export const createOrderSchema = z.object({
@@ -84,5 +85,19 @@ export interface PaymentView {
 /** GET /orders/:orderId: the order and the event it is for. */
 export interface OrderDetails {
   order: OrderView;
+  event: { id: string; title: string; slug: string; venue: string; startsAt: string };
+}
+
+/** A ticket as its owner sees it, with the signed QR string to show at the gate. */
+export interface TicketView {
+  id: string;
+  /** Short code to read out if the QR can't be scanned, e.g. "K7QM-X9PA". */
+  code: string;
+  seq: number;
+  qrVersion: number;
+  qr: string;
+  checkedInAt: string | null;
+  orderId: string;
+  tier: { id: string; name: string };
   event: { id: string; title: string; slug: string; venue: string; startsAt: string };
 }

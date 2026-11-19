@@ -11,6 +11,7 @@ import { adminApiRoutes, queueDashboard } from './modules/admin/routes.js';
 import { orderActionRoutes, orderRoutes } from './modules/orders/routes.js';
 import { paymentRoutes } from './modules/payments/routes.js';
 import { orgRoutes } from './modules/orgs/routes.js';
+import { myTicketRoutes, ticketRoutes } from './modules/tickets/routes.js';
 import { uploadRoutes } from './modules/uploads/routes.js';
 import { webhookRoutes } from './modules/webhooks/routes.js';
 import { defaultReadinessChecks, type ReadinessChecks } from './modules/health/service.js';
@@ -56,6 +57,8 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   app.use('/api/v1/events/:eventId/orders', orderRoutes(limits.orders));
   app.use('/api/v1/orders', orderActionRoutes());
   app.use('/api/v1/orders', paymentRoutes());
+  app.use('/api/v1/me/tickets', myTicketRoutes());
+  app.use('/api/v1/tickets', ticketRoutes());
   app.use('/api/v1/admin', adminApiRoutes());
   app.use('/admin/queues', queueDashboard());
   app.use('/api/v1/events', publicEventRoutes());
