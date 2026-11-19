@@ -7,6 +7,8 @@ const valid = {
   MONGODB_URI: 'mongodb://localhost:27018/festpass',
   JWT_ACCESS_SECRET: 'x'.repeat(32),
   REVALIDATE_SECRET: 'y'.repeat(32),
+  // A real Ed25519 key, generated per run in vitest.config.ts.
+  TICKET_SIGNING_PRIVATE_KEY: process.env.TICKET_SIGNING_PRIVATE_KEY,
   S3_ENDPOINT: 'http://localhost:9000',
   S3_BUCKET: 'festpass',
   S3_ACCESS_KEY_ID: 'festpass',
@@ -32,6 +34,12 @@ describe('parseEnv', () => {
   it('lists every missing or invalid variable in one message', () => {
     expect(() => parseEnv({ ...valid, DATABASE_URL: undefined, API_PORT: 'abc' })).toThrow(
       /DATABASE_URL[\s\S]*API_PORT|API_PORT[\s\S]*DATABASE_URL/,
+    );
+  });
+
+  it('stops at startup if the ticket signing key is not an Ed25519 private key', () => {
+    expect(() => parseEnv({ ...valid, TICKET_SIGNING_PRIVATE_KEY: 'not-a-key' })).toThrow(
+      /TICKET_SIGNING_PRIVATE_KEY: Not an Ed25519 private key/,
     );
   });
 });
