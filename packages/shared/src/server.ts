@@ -1,5 +1,7 @@
+import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
 import { Queue, type ConnectionOptions } from 'bullmq';
 import type { Redis } from 'ioredis';
+import { signedPart, type TicketQrPayload } from './qr.ts';
 import { redisKeys } from './redis-keys.ts';
 
 // Server-only helpers (BullMQ, ioredis), imported as @festpass/shared/server by the API and the worker.
@@ -48,3 +50,30 @@ export function releaseRedisStock(
   ]);
   return redis.eval(RELEASE, keys.length, ...keys, ...items.map((i) => i.qty));
 }
+
+/** Reads the private ticket key (PKCS#8 DER, base64url, from `pnpm keys:generate`). Throws if it isn't Ed25519. */
+export function loadTicketPrivateKey(base64url: string): KeyObject {
+  const key = createPrivateKey({
+    key: Buffer.from(base64url, 'base64url'),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  if (key.asymmetricKeyType !== 'ed25519')
+    throw new Error('TICKET_SIGNING_PRIVATE_KEY is not an Ed25519 key');
+  return key;
+}
+
+/**
+ * Signs a ticket QR code with Node's crypto (server only: this module never reaches the browser, and
+ * neither does the key). Ed25519 is deterministic, so the same ticket and version always give the
+ * same QR string.
+ */
+export function encodeTicket({ t, e, v, iat }: TicketQrPayload, privateKey: KeyObject): string {
+  const payloadPart = Buffer.from(JSON.stringify({ t, e, v, iat })).toString('base64url');
+  const signature = sign(null, Buffer.from(signedPart(payloadPart)), privateKey);
+  return `${signedPart(payloadPart)}.${signature.toString('base64url')}`;
+}
+
+/** encodeTicket with the key bound once, e.g. the API's key from env. */
+export const createTicketSigner = (privateKey: KeyObject) => (payload: TicketQrPayload) =>
+  encodeTicket(payload, privateKey);
