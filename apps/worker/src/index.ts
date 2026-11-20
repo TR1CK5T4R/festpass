@@ -1,38 +1,21 @@
 import { prisma } from '@festpass/db';
 import { JOBS, QUEUES } from '@festpass/shared';
-import { createQueue } from '@festpass/shared/server';
+import { createQueue, createTicketSigner } from '@festpass/shared/server';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { pino } from 'pino';
-import { z } from 'zod';
-import { processJob } from './processors.js';
+import { consoleProvider } from './email/console.js';
+import { sendGridProvider } from './email/sendgrid.js';
+import { loadEnv } from './env.js';
+import { processJob, type WorkerDeps } from './processors.js';
 import { razorpayRefunds } from './refunds.js';
+import { s3TicketStorage } from './storage.js';
 
-// Background jobs, in their own process so a slow job can never slow down the API.
-// Hold expiry (each order's own delayed job plus a sweeper), refunds, ticket issuing and inventory
+// Background jobs, in their own process so a slow job can never slow down the API: hold expiry (each
+// order's own delayed job plus a sweeper), refunds, ticket issuing, ticket emails and inventory
 // reconciliation.
 
-const parsed = z
-  .object({
-    DATABASE_URL: z.url(),
-    REDIS_URL: z.url(),
-    // Optional (blank means unset): without them, refund jobs fail and wait in Bull Board for a retry.
-    RAZORPAY_KEY_ID: z.preprocess(
-      (v) => (v === '' ? undefined : v),
-      z.string().startsWith('rzp_test_').optional(),
-    ),
-    RAZORPAY_KEY_SECRET: z.preprocess((v) => (v === '' ? undefined : v), z.string().optional()),
-    LOG_LEVEL: z
-      .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
-      .default('info'),
-  })
-  .safeParse(process.env);
-if (!parsed.success) {
-  const problems = parsed.error.issues.map((i) => `  - ${i.path.join('.')}: ${i.message}`);
-  console.error(`Invalid environment variables:\n${problems.join('\n')}\nSee .env.example.`);
-  process.exit(1);
-}
-const env = parsed.data;
+const env = loadEnv();
 const logger = pino({ level: env.LOG_LEVEL, base: { process: 'worker' } });
 
 // BullMQ needs maxRetriesPerRequest: null: its blocking commands must wait for Redis to come back
@@ -40,29 +23,48 @@ const logger = pino({ level: env.LOG_LEVEL, base: { process: 'worker' } });
 const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
 connection.on('error', (err) => logger.warn({ err: err.message }, 'redis connection error'));
 
-const inventoryQueue = createQueue(QUEUES.inventory, connection);
-const ordersQueue = createQueue(QUEUES.orders, connection);
-const refunds = razorpayRefunds(env.RAZORPAY_KEY_ID, env.RAZORPAY_KEY_SECRET);
+const queues = Object.fromEntries(
+  Object.values(QUEUES).map((name) => [name, createQueue(name, connection)]),
+) as Record<(typeof QUEUES)[keyof typeof QUEUES], ReturnType<typeof createQueue>>;
+
+const deps: WorkerDeps = {
+  redis: connection,
+  log: logger,
+  refunds: razorpayRefunds(env.RAZORPAY_KEY_ID, env.RAZORPAY_KEY_SECRET),
+  email:
+    env.EMAIL_PROVIDER === 'sendgrid'
+      ? sendGridProvider({
+          apiKey: env.SENDGRID_API_KEY!,
+          from: env.EMAIL_FROM,
+          templateIds: {
+            'ticket-confirmation': env.SENDGRID_TEMPLATE_TICKET_CONFIRMATION!,
+            'order-expired': env.SENDGRID_TEMPLATE_ORDER_EXPIRED!,
+            'refund-issued': env.SENDGRID_TEMPLATE_REFUND_ISSUED!,
+          },
+        })
+      : consoleProvider(env.EMAIL_PREVIEW_DIR, logger),
+  storage: s3TicketStorage(env),
+  signTicket: createTicketSigner(env.TICKET_SIGNING_PRIVATE_KEY),
+  emailsQueue: queues.emails,
+  webUrl: env.PUBLIC_WEB_URL,
+};
 
 // Repeating jobs. upsertJobScheduler is idempotent: restarting the worker (or running two) keeps one
 // schedule per ID. Every minute: reset inv:* from Postgres, and expire holds whose own job never ran.
-await inventoryQueue.upsertJobScheduler(
+await queues.inventory.upsertJobScheduler(
   JOBS.reconcileInventory,
   { every: 60_000 },
   { name: JOBS.reconcileInventory },
 );
-await ordersQueue.upsertJobScheduler(
+await queues.orders.upsertJobScheduler(
   JOBS.sweepExpiredOrders,
   { every: 60_000 },
   { name: JOBS.sweepExpiredOrders },
 );
 
-// Each queue gets its own worker so a backlog of one can't delay the others.
-const QUEUE_NAMES = [QUEUES.inventory, QUEUES.orders, QUEUES.payments, QUEUES.tickets];
-const workers = QUEUE_NAMES.map((name) => {
-  const worker = new Worker(name, (job) => processJob(job, connection, logger, refunds), {
-    connection,
-  });
+// Each queue gets its own worker so a backlog of one (say, slow emails) can't delay the others.
+const workers = Object.keys(queues).map((name) => {
+  const worker = new Worker(name, (job) => processJob(job, deps), { connection });
   // Failed jobs are retried with backoff (createQueue) and kept in Bull Board once attempts run out.
   worker.on('failed', (job, err) =>
     logger.error({ job: job?.id, name: job?.name, attempt: job?.attemptsMade, err }, 'job failed'),
@@ -70,13 +72,13 @@ const workers = QUEUE_NAMES.map((name) => {
   return worker;
 });
 
-logger.info({ queues: QUEUE_NAMES }, 'worker started');
+logger.info({ queues: Object.keys(queues), email: env.EMAIL_PROVIDER }, 'worker started');
 
 async function shutdown(signal: NodeJS.Signals) {
   logger.info({ signal }, 'worker shutting down');
-  // close() waits for the job in progress to finish, so a reconciliation is never cut in half.
+  // close() waits for the job in progress to finish, so nothing is cut in half.
   await Promise.all(workers.map((w) => w.close()));
-  await Promise.all([inventoryQueue.close(), ordersQueue.close()]);
+  await Promise.all(Object.values(queues).map((q) => q.close()));
   await Promise.allSettled([prisma.$disconnect(), connection.quit()]);
   process.exit(0);
 }
