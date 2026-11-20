@@ -91,9 +91,13 @@ export default function CheckoutPage() {
       {order.status === 'TICKETED' || order.status === 'PAID' ? (
         <p role="status" className="rounded-control bg-success/10 px-4 py-3 text-sm text-success">
           Payment confirmed.{' '}
-          {order.status === 'TICKETED'
-            ? 'Your tickets are ready.'
-            : 'Your tickets are being issued.'}
+          {order.status === 'TICKETED' ? (
+            <Link href="/tickets" className="font-medium underline">
+              See your tickets
+            </Link>
+          ) : (
+            'Your tickets are being issued; we will email them to you.'
+          )}
         </p>
       ) : expired ? (
         <div className="flex flex-col gap-3 rounded-control bg-canvas px-4 py-4 text-sm">

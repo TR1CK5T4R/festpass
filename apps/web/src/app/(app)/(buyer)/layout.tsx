@@ -35,7 +35,10 @@ export default function BuyerLayout({ children }: { children: ReactNode }) {
           <Link href="/" className="text-lg font-bold tracking-tight">
             FestPass
           </Link>
-          <span className="ml-auto text-sm text-muted">{auth.user.name}</span>
+          <Link href="/tickets" className="ml-auto text-sm text-muted hover:text-ink">
+            My tickets
+          </Link>
+          <span className="text-sm text-muted">{auth.user.name}</span>
         </div>
       </header>
       <main className="mx-auto max-w-3xl px-6 py-8">
