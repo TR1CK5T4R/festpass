@@ -11,15 +11,22 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@types/pdfkit": "^0.17.7",
+    "@types/qrcode": "^1.5.6",
     "tsx": "^4.23.15",
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1161.0",
+    "@aws-sdk/s3-request-presigner": "^3.1161.0",
     "@festpass/db": "workspace:*",
     "@festpass/shared": "workspace:*",
+    "@sendgrid/mail": "^8.1.6",
     "bullmq": "^6.5.4",
     "ioredis": "^6.0.0",
+    "pdfkit": "^0.20.2",
     "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
     "razorpay": "^2.9.8",
     "zod": "^4.6.7"
   }
