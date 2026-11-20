@@ -1,4 +1,4 @@
-import { ticketIdParamsSchema } from '@festpass/shared';
+import { orderIdParamsSchema, ticketIdParamsSchema } from '@festpass/shared';
 import { Router } from 'express';
 import { requireAuth } from '../../middleware/require-auth.js';
 import { validate } from '../../middleware/validate.js';
@@ -17,5 +17,17 @@ export function ticketRoutes(): Router {
   const params = validate({ params: ticketIdParamsSchema });
   router.get('/:ticketId', requireAuth, params, controller.get);
   router.post('/:ticketId/reissue', requireAuth, params, controller.reissue);
+  return router;
+}
+
+/** Mounted at /api/v1/orders: the order's PDF tickets. */
+export function orderTicketRoutes(): Router {
+  const router = Router();
+  router.get(
+    '/:orderId/tickets-pdf',
+    requireAuth,
+    validate({ params: orderIdParamsSchema }),
+    controller.pdf,
+  );
   return router;
 }

@@ -1,8 +1,9 @@
 import { bumpQrVersion } from '@festpass/db/tickets';
-import type { TicketView } from '@festpass/shared';
+import { storageKeys, ticketQrPayload, type TicketView } from '@festpass/shared';
 import { createTicketSigner } from '@festpass/shared/server';
 import { env } from '../../config/env.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
+import { headObject, signedDownloadUrl } from '../../lib/storage.js';
 import * as repo from './repository.js';
 
 const encodeTicket = createTicketSigner(env.TICKET_SIGNING_PRIVATE_KEY);
@@ -19,12 +20,7 @@ function toView(ticket: repo.TicketRecord): TicketView {
     code: ticket.code,
     seq: ticket.seq,
     qrVersion: ticket.qrVersion,
-    qr: encodeTicket({
-      t: ticket.id,
-      e: event.id,
-      v: ticket.qrVersion,
-      iat: Math.floor(ticket.createdAt.getTime() / 1000),
-    }),
+    qr: encodeTicket(ticketQrPayload({ ...ticket, eventId: event.id })),
     checkedInAt: ticket.checkedInAt?.toISOString() ?? null,
     orderId: ticket.orderId,
     tier: ticket.tier,
@@ -57,4 +53,28 @@ export async function reissueQr(userId: string, ticketId: string): Promise<Ticke
     throw new ConflictError('TICKET_USED', 'This ticket has already been used at the gate');
   }
   return toView((await repo.findTicket(ticketId))!);
+}
+
+/** Download links are short: the page asks for a new one on every click, so it never needs to last. */
+const DOWNLOAD_LINK_SECONDS = 5 * 60;
+
+/**
+ * A fresh link to the order's PDF tickets. The PDF is private (not under the public banner prefix), so
+ * the only way to it is a pre-signed GET made for the owner, valid for 5 minutes.
+ */
+export async function ticketPdfLink(userId: string, orderId: string) {
+  const order = await repo.findOrderForPdf(orderId);
+  if (!order || order.userId !== userId) throw new NotFoundError('Order not found');
+  const key = storageKeys.ticketPdf(order.event.orgId, order.event.id, order.id);
+  // Built by the worker right after the tickets are issued; there is a short gap before it exists.
+  if (order.status !== 'TICKETED' || !(await headObject(key))) {
+    throw new ConflictError(
+      'PDF_NOT_READY',
+      'Your PDF tickets are still being prepared; try again in a moment',
+    );
+  }
+  return {
+    url: await signedDownloadUrl(key, DOWNLOAD_LINK_SECONDS, `festpass-${order.event.slug}.pdf`),
+    expiresAt: new Date(Date.now() + DOWNLOAD_LINK_SECONDS * 1000).toISOString(),
+  };
 }

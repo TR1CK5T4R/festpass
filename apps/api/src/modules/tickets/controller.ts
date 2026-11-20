@@ -12,3 +12,7 @@ export const get: RequestHandler = async (req, res) => {
 export const reissue: RequestHandler = async (req, res) => {
   res.json({ ticket: await tickets.reissueQr(req.user!.id, String(req.params.ticketId)) });
 };
+
+export const pdf: RequestHandler = async (req, res) => {
+  res.json({ pdf: await tickets.ticketPdfLink(req.user!.id, String(req.params.orderId)) });
+};

@@ -31,3 +31,16 @@ export function findTicketsForOwner(userId: string) {
 export function findTicket(ticketId: string) {
   return prisma.ticket.findUnique({ where: { id: ticketId }, select: ticketSelect });
 }
+
+/** What the PDF download needs: the owner, the status and where the PDF is stored. */
+export function findOrderForPdf(orderId: string) {
+  return prisma.order.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      userId: true,
+      status: true,
+      event: { select: { id: true, orgId: true, slug: true } },
+    },
+  });
+}
