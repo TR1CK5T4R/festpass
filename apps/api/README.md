@@ -24,6 +24,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Starting a Razorpay payment (test mode), order details for checkout | `apps/api` | Done (Day 15) |
 | Signed, idempotent Razorpay webhooks; late payments re-reserved or refunded; refund job | `apps/api`, `packages/db`, `apps/worker` | Done (Day 16) |
 | Ed25519-signed QR tickets, issue-tickets job, my tickets, QR reissue | `packages/shared`, `packages/db`, `apps/worker`, `apps/api` | Done (Day 17) |
+| PDF tickets in private storage, emails (SendGrid/console) sent once, PDF download links | `apps/worker`, `packages/db`, `apps/api` | Done (Day 18) |
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
@@ -40,7 +41,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 | Process | Started by | Job |
 |---|---|---|
 | **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
-| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16) and ticket issuing (`issue-tickets`, Day 17). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
+| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16), ticket issuing (`issue-tickets`, Day 17) and ticket, expiry and refund emails with PDF tickets (Day 18). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
 
@@ -51,7 +52,7 @@ They are separate processes so a slow PDF or a stuck email can never slow down b
 | **PostgreSQL 16** | Users, orgs, events, tiers, orders, payments, tickets | The source of truth for money and capacity. It has transactions, row locks and CHECK constraints, so overselling is blocked by the database itself. |
 | **MongoDB 7** | Scan events (time-series), copilot conversations | Many small append-only writes, read through aggregations for analytics. |
 | **Redis 7** | Inventory gate (`inv:*`, `usr:*`, `req:*`, Day 12), job queues (BullMQ, Days 12–13), rate-limit buckets (`rl:*`, Day 14); later the waiting room | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking, and every number in it is reset from Postgres. |
-| **S3 storage** (SeaweedFS locally, R2 in production) | Event banners (public), ticket PDFs (private, Day 18) | S3-compatible object storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
+| **S3 storage** (SeaweedFS locally, R2 in production) | Event banners (public prefix), ticket PDFs (private prefix, pre-signed GETs only, Day 18) | S3-compatible object storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
 
 Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 6380 and 9000, bound to 127.0.0.1.
 
@@ -81,7 +82,7 @@ apps/api/
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
-  src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue), service (QR signed on read, owner checks), repository
+  src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue, GET /orders/:id/tickets-pdf), service (QR signed on read, owner checks, PDF link), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
   src/modules/payments/             gateway.ts (Razorpay SDK, the only file that calls it), service (startPayment), repository, routes (POST /orders/:orderId/pay)
   src/modules/admin/                POST /admin/session (admin cookie for ADMIN_EMAILS), Bull Board at /admin/queues behind it
@@ -98,15 +99,22 @@ apps/api/
 apps/worker/
   src/index.ts           Zod env check, pino logger, `inventory` and `orders` queues with job schedulers (reconcile and sweep,
                          every 60 s) and one worker per queue; closes workers, queues, Prisma and Redis on SIGTERM/SIGINT
-  src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), issueOrderTickets(), reconcile(), and processJob() routing by job name
+  src/env.ts             Zod env check for the worker (keys, storage, email provider and templates)
+  src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), issueOrderTickets(), sendTickets(), sendOrderExpired(),
+                         sendRefundIssued(), reconcile(); processJob() routing by name, with every dependency passed in (WorkerDeps)
+  src/email/             provider.ts (EmailProvider interface), sendgrid.ts (dynamic templates), console.ts (log + HTML preview)
+  src/pdf.ts             buildTicketsPdf() (pdfkit, one A5 page per ticket) and qrPng() (qrcode)
+  src/storage.ts         TicketStorage: put() and signedDownloadUrl() on S3
   src/refunds.ts         Razorpay refunds (the worker's only Razorpay code); "already fully refunded" counts as done
   test/expiry.test.ts    real BullMQ worker with a 2-second hold, double runs, job vs sweeper race, early job, sweeper
+  test/emails.test.ts    PDF, send-tickets once (retry, race, failure), follow-up emails, console preview (fakes for email and storage)
 packages/db/
   prisma/schema.prisma   All Postgres tables, enums, relations and indexes (snake_case via @map/@@map)
   prisma/migrations/     *_init (generated from the schema) and *_check_constraints (hand-written SQL)
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  src/emails.ts          @festpass/db/emails: claimEmail() (email_log row + 5-minute lease), markEmailSent(), releaseEmailClaim(), findOrderForEmail()
   src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion()
   src/payments.ts        @festpass/db/payments: recordCapturedPayment() (insert once, lock, transition, re-reserve or refund_pending),
                          markPaymentRefunded(), findPayment(), findPendingRefunds()
@@ -309,6 +317,7 @@ _Planned (Days 17–19)._
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
 | POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | Verified on the raw body; `200 { handled, outcome }`; `400 INVALID_SIGNATURE` / `INVALID_PAYLOAD`; `503 WEBHOOKS_NOT_CONFIGURED` |
 | GET | `/api/v1/me/tickets` | Bearer | The caller's tickets with signed QR strings |
+| GET | `/api/v1/orders/:orderId/tickets-pdf` | Bearer (owner) | `200 { pdf: { url, expiresAt } }`, a 5-minute pre-signed GET; `404` for others; `409 PDF_NOT_READY` |
 | GET | `/api/v1/tickets/:ticketId` | Bearer (owner) | One ticket; `404` for others |
 | POST | `/api/v1/tickets/:ticketId/reissue` | Bearer (owner) | Bumps `qrVersion` (old QRs outdated at the gate); `409 TICKET_USED` once checked in |
 | GET | `/api/v1/orders/:orderId` | Bearer (owner) | `200 { order, event }`; `404` for others |
@@ -366,3 +375,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 15:** payments module (Razorpay SDK behind `paymentGateway`, test keys only): `POST /orders/:id/pay` (Razorpay order created outside any transaction, reused on repeat and parallel calls), `GET /orders/:id`; CORS allows `Idempotency-Key` and exposes the booking and rate-limit headers; shared test helpers `createSaleEvent()` and `book()`.
 - **Day 16:** Razorpay webhooks (`express.raw`, HMAC with `timingSafeEqual`, `payment.captured` and `order.paid`); `@festpass/db/payments` (insert-once payments, late-payment re-reserve or `refund_pending`); state machine extended to exactly the listed transitions; `issue-tickets` and `refund-payment` jobs queued from stored state; worker refund job; `pnpm webhook:simulate`; `RAZORPAY_WEBHOOK_SECRET`.
 - **Day 17:** Ed25519 QR tickets: `pnpm keys:generate`, `FP1.<payload>.<signature>` signed with Node crypto (`@festpass/shared/server`) and verified with `@noble/ed25519` (`@festpass/shared`); `issueTickets()` and the worker's `issue-tickets` job (the `tickets` queue is now worked); `GET /me/tickets`, `GET /tickets/:id`, `POST /tickets/:id/reissue`; `TICKET_SIGNING_PRIVATE_KEY` checked at startup.
+- **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.

@@ -14,7 +14,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | Banner uploads straight to storage, with preview and progress | organizers | inside the event editor | Done (Day 9; API Day 8) |
 | Public event list and event pages (SSR + ISR, on-demand revalidation) | attendees | `/`, `/e/[slug]` | Done (Day 10); Book button wired up on Days 11 and 15 |
 | Booking and checkout with a hold countdown and Razorpay (test mode) | attendees | `/book/[slug]`, `/checkout/[orderId]` | Done (Day 15); payment confirmation by webhook on Day 16 |
-| My Tickets with QR codes and PDF download | attendees | `/tickets` | Planned (Day 18) |
+| My Tickets with QR codes and PDF download | attendees | `/tickets` | Done (Day 18) |
 | Scanner PWA with offline mode | volunteers | `/scan` | Planned (Day 20) |
 | Live availability and check-in counter | attendees, organizers | event page, dashboard | Planned (Day 21) |
 | Virtual waiting room | attendees | `/e/[slug]/queue` | Planned (Day 22) |
@@ -48,6 +48,7 @@ apps/web/
     api/revalidate/route.test.ts    401 for a wrong or missing secret, 400 for a bad slug, revalidation otherwise
     (app)/(buyer)/layout.tsx        Login guard for booking and checkout (sends logged-out visitors to /login?next=...)
     (app)/(buyer)/book/[slug]/page.tsx       Choose a quantity of one tier and hold it (POST /events/:id/orders with an Idempotency-Key)
+    (app)/(buyer)/tickets/page.tsx  My Tickets: QR codes drawn in the browser (qrcode), grouped by order, Download PDF
     (app)/(buyer)/checkout/[orderId]/page.tsx  Summary, countdown, Razorpay Checkout, "Confirming payment…" polling, expiry
     (app)/layout.tsx                Wraps login, register and the dashboard in <Providers>
     (app)/(auth)/layout.tsx         Centered card layout
@@ -104,6 +105,12 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 - **Checkout** shows the items, total and a countdown to `expiresAt` (ticking every second). **Pay** asks the API for the Razorpay order (`POST /orders/:id/pay`), loads Razorpay's `checkout.js` once and opens Checkout; card or UPI details go to Razorpay, never to FestPass.
 - **After paying:** the success callback is only a hint. The page shows "Confirming payment…" and polls `GET /orders/:id` every 2 s until the order is `PAID`/`TICKETED` (moved there only by the webhook, Day 16) or ended; after 3 minutes it says confirmation is taking longer.
 - **When the countdown reaches zero** (or the order is `EXPIRED`), Pay disappears and "Book again" links back to the event.
+
+## My Tickets (Day 18)
+
+- `/tickets` (logged in) lists `GET /me/tickets`, grouped by order. The API sends each QR as its signed `FP1.…` text; the page draws it with `qrcode` (`toDataURL`), so the same string makes the same code in the email, the PDF and here.
+- **Download PDF** asks `GET /orders/:id/tickets-pdf` for a new 5-minute pre-signed link on every click and navigates to it; the PDF itself is private in storage. Until the worker has built it, the API answers `PDF_NOT_READY` and the page says so.
+- The header of booking pages links to My tickets, and checkout links there once the order is `TICKETED`.
 
 ## Organizer dashboard
 
@@ -186,3 +193,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 10:** public pages: `/` and `/e/[slug]` as Server Components with ISR (60 s) and on-demand revalidation through a secret-protected `POST /api/revalidate`; `generateMetadata` with Open Graph banner; tier cards with sale state; loading, error and not-found states; `next/image` for banners; env validation in `next.config.ts`; auth and dashboard moved under an `(app)` group so public pages don't load the auth client.
 - **Day 13:** `/dashboard/queues` opens the job dashboard: it trades the in-memory login for the API's 15-minute admin cookie (only for `ADMIN_EMAILS`) and navigates to Bull Board on the API.
 - **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.
+- **Day 18:** My Tickets page (`/tickets`) with browser-drawn QR codes and a Download PDF button that fetches a fresh pre-signed link; links to it from checkout and the booking header.

@@ -9,7 +9,7 @@
 ![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
 
 <details>
-<summary>More screenshots: public event page, checkout, event editor, team, job queues</summary>
+<summary>More screenshots: public event page, checkout, my tickets, event editor, team, job queues</summary>
 
 ![Public event page: server-rendered with the banner, times in IST and ticket tiers](.github/screenshots/public-event.png)
 
@@ -18,6 +18,8 @@
 ![Team page: add a member by email, change roles, remove](.github/screenshots/organizer-members.png)
 
 ![Checkout: the held tickets, the total and a countdown to the end of the hold](.github/screenshots/checkout.png)
+
+![My Tickets: each ticket's QR drawn in the browser, its code, and a Download PDF button per order](.github/screenshots/my-tickets.png)
 
 ![Bull Board: an expire-order job, keyed by the order ID, completed with released: true](.github/screenshots/bull-board.png)
 
@@ -40,7 +42,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Oversell-proof booking engine (Postgres + Redis gate) | Done (API): Postgres booking with idempotent retries (Day 11), Redis gate with compensation, fallback and reconciliation (Day 12) |
 | Automatic hold expiry and rate limiting | Done: hold expiry, cancel and a job dashboard (Day 13); token-bucket rate limiting on login, register, booking and uploads (Day 14) |
 | Razorpay payments with idempotent webhooks | Done: checkout in test mode (Day 15); signed, idempotent webhooks with late-payment re-reserve or refund (Day 16) |
-| Ed25519-signed QR tickets, PDF + email delivery | Signed QR tickets issued exactly once per paid order (Day 17); PDF and email planned (Day 18) |
+| Ed25519-signed QR tickets, PDF + email delivery | Done: signed QR tickets issued exactly once (Day 17); PDF tickets in private storage, emails sent once through SendGrid templates (or the console in development), and a My Tickets page (Day 18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Planned (Days 19–20) |
 | Live availability and check-in dashboards | Planned (Day 21) |
 | Virtual waiting room for flash sales | Planned (Day 22) |
@@ -84,7 +86,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Done (Days 15–16); tested with signed simulated webhooks until test keys are set |
-| 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | QR tickets done (Day 17); PDF and email planned (Day 18) |
+| 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Done (Days 17–18) |
 | 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
 | 8. Measure | Booth scans feed sponsor dashboards (totals only, never names), organizers get live and post-event analytics, and an AI copilot answers questions using permission-checked tools. | Scan events are stored with the fields analytics needs, so dashboards are single aggregation queries. | Planned (Days 21–27) |
 
@@ -402,6 +404,14 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 
 **Tested by:** see [Testing](#testing) (`qr.test.ts`, worker `tickets.test.ts`, API `tickets.test.ts`). Live: the worker picked up an `issue-tickets` job waiting since Day 16 for a paid order, issued 2 tickets, and both QR strings from `GET /me/tickets` verified with the public key from `.env`.
 
+### Ticket delivery: private PDFs and emails sent once (Day 18)
+
+- **Private PDFs, public banners:** both live in one bucket, but only `orgs/*/events/*/banner/*` is publicly readable. A banner is meant to be seen by anyone, cached by a CDN and linked from a public page. A ticket PDF carries the buyer's name and QR codes that get someone through the gate; a public URL is permanent and can be guessed, forwarded or indexed. So PDFs sit under `orgs/{org}/events/{event}/tickets/{order}.pdf`, and every link to one is a pre-signed GET: 24 hours in the email, 5 minutes for **Download PDF** (a new one on every click). Unsigned requests get `403`.
+- **The PDF** (`apps/worker/src/pdf.ts`, pdfkit + qrcode): one A5 page per ticket with the event, time in IST, venue, attendee name, tier, the signed QR and the readable code.
+- **Sent once:** `email_log(order_id, template)` is unique. A job first claims the row (`UPDATE ... SET claimed_at = now() WHERE sent_at IS NULL AND (claimed_at IS NULL OR claimed_at < now() - 5 min)`), so a second run at the same time can't claim it; then builds and sends; then sets `sent_at`. A retry finds `sent_at` and stops; a failed send drops the claim so the retry can try again. Exactly-once delivery isn't possible over a network (a crash after SendGrid accepted the email but before `sent_at` is written would resend once); this makes that window as small as it can be.
+- **`EmailProvider`:** jobs say *which* template and *what data*; `SendGridProvider` (dynamic templates) or `ConsoleProvider` (logs + HTML preview) decides *how*. Tests use a fake, so no test needs SendGrid or a network.
+- **Follow-ups from state:** issuing tickets (order `TICKETED`), an expired hold and a finished refund each queue their email with `jobId = <job>-<orderId>`, whenever the order is in that state, so a run that died after changing the order but before queuing is covered by the next run.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
@@ -513,6 +523,19 @@ Seed accounts (`organizer@`, `scanner@`, `sponsor@` and `attendee@festpass.dev`)
 
 Check it: open http://localhost:3000 to see the published seed events, open one (`/e/mait-alumni-meet-2026`), then register (or log in with a seed account), create a club and reload the page: you stay logged in. Then click **New event**, add tiers and a banner, and publish it from the event page. `curl http://localhost:4000/api/v1/health/ready` should return `{"status":"ok","checks":{"postgres":"up","redis":"up","mongo":"up"}}`.
 
+#### Email setup
+
+The worker sends three emails, each at most once per order (`email_log`), through an `EmailProvider`:
+
+- **Development (default):** `EMAIL_PROVIDER=console`. Nothing is sent; each email is logged and written as an HTML file (with its QR images) to `.email-previews/` in the repo root, which is git-ignored. Open the file to see it.
+- **SendGrid:** set `EMAIL_PROVIDER=sendgrid`, `SENDGRID_API_KEY`, a verified `EMAIL_FROM`, and create three **dynamic templates** in SendGrid (Email API → Dynamic Templates), putting their IDs in the env vars below. The worker sends only the template ID and these fields (Handlebars, e.g. `{{eventTitle}}`, `{{#each tickets}}`):
+
+| Template (env var) | Sent when | Fields |
+|---|---|---|
+| Ticket confirmation (`SENDGRID_TEMPLATE_TICKET_CONFIRMATION`) | Tickets are issued for a paid order | `name`, `eventTitle`, `eventDate` (IST), `venue`, `tickets[]` with `code`, `tier`, `qrCid` (show the QR with `<img src="cid:{{qrCid}}">`), `downloadUrl` (the PDF, valid 24 h), `downloadExpiresAt`, `ticketsUrl` |
+| Order expired (`SENDGRID_TEMPLATE_ORDER_EXPIRED`) | A hold ran out unpaid (not if a late payment re-reserved it) | `name`, `eventTitle`, `bookAgainUrl` |
+| Refund issued (`SENDGRID_TEMPLATE_REFUND_ISSUED`) | The refund job has returned a payment | `name`, `eventTitle`, `amount` (e.g. `₹598.00`), `reason` |
+
 #### Testing webhooks locally
 
 - **Without Razorpay:** set `RAZORPAY_WEBHOOK_SECRET` in `.env` to any long random string, start `pnpm dev`, hold tickets in the browser, then run `pnpm webhook:simulate <orderId>` (the order ID is the last part of the checkout URL). It signs a `payment.captured` body the way Razorpay does and posts it; the checkout page shows "Payment confirmed". Run it again with the printed payment ID to see a duplicate answered `"outcome":"duplicate"`.
@@ -553,15 +576,20 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `RAZORPAY_KEY_ID` | api, worker | Razorpay **test** key ID from the dashboard in Test Mode. Must start with `rzp_test_`: a live key stops the API and worker at startup. The worker uses the keys for refunds. Sent to the browser for Checkout (it is public) |
 | `RAZORPAY_WEBHOOK_SECRET` | api, `webhook:simulate` | A long random string you choose (`openssl rand -hex 32`) and paste into Razorpay's webhook settings; every webhook is checked against it. Without it, `POST /webhooks/razorpay` answers `503` |
 | `RAZORPAY_KEY_SECRET` | api, worker | Its secret, never sent anywhere. Set both or neither; without them `POST /orders/:id/pay` answers `503 PAYMENTS_NOT_CONFIGURED` |
-| `TICKET_SIGNING_PRIVATE_KEY` | api (worker from Day 18) | Ed25519 private key that signs ticket QR codes (PKCS#8, base64url). Create a pair with `pnpm keys:generate`. Checked at startup; never sent to the browser or committed. Changing it invalidates every QR already issued |
+| `TICKET_SIGNING_PRIVATE_KEY` | api, worker | Ed25519 private key that signs ticket QR codes (PKCS#8, base64url). Create a pair with `pnpm keys:generate`. Checked at startup; never sent to the browser or committed. Changing it invalidates every QR already issued |
 | `NEXT_PUBLIC_TICKET_PUBLIC_KEY` | web (scanner, Day 20) | The matching public key (32 raw bytes, base64url) from `pnpm keys:generate`. Public by design: it can only verify |
+| `EMAIL_PROVIDER` | worker | `console` (default: nothing is sent; each email is logged and saved as HTML in `.email-previews/`) or `sendgrid` |
+| `EMAIL_FROM` | worker | Sender, e.g. `FestPass <tickets@festpass.dev>`; with SendGrid it must be a verified sender |
+| `SENDGRID_API_KEY` | worker | SendGrid API key (`SG.…`), required when `EMAIL_PROVIDER=sendgrid`; never logged |
+| `SENDGRID_TEMPLATE_TICKET_CONFIRMATION`, `SENDGRID_TEMPLATE_ORDER_EXPIRED`, `SENDGRID_TEMPLATE_REFUND_ISSUED` | worker | Dynamic template IDs (`d-…`), required with SendGrid; fields under [Email setup](#email-setup) |
+| `PUBLIC_WEB_URL` | worker | The web app's address, for links inside emails (default `http://localhost:3000`) |
 | `ADMIN_EMAILS` | api | Comma-separated emails allowed to open the job dashboard (Bull Board) at `/admin/queues`. Empty means nobody. Local `.env` lists the seed organizer |
 | `S3_PORT` | docker compose | Host port for the local SeaweedFS S3 API (default 9000) |
-| `S3_ENDPOINT` | api | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
-| `S3_REGION` | api | Signing region (default `us-east-1`; `auto` for R2) |
-| `S3_BUCKET` | api | Bucket for uploads (`festpass`) |
-| `S3_ACCESS_KEY_ID` | api, docker compose | Storage access key; docker compose also uses it as the local SeaweedFS admin key |
-| `S3_SECRET_ACCESS_KEY` | api, docker compose | Storage secret key (never logged) |
+| `S3_ENDPOINT` | api, worker | S3-compatible endpoint: `http://localhost:9000` locally, `https://<account>.r2.cloudflarestorage.com` for R2 |
+| `S3_REGION` | api, worker | Signing region (default `us-east-1`; `auto` for R2) |
+| `S3_BUCKET` | api, worker | Bucket for banners (public prefix) and ticket PDFs (private prefix) (`festpass`) |
+| `S3_ACCESS_KEY_ID` | api, worker, docker compose | Storage access key; docker compose also uses it as the local SeaweedFS admin key |
+| `S3_SECRET_ACCESS_KEY` | api, worker, docker compose | Storage secret key (never logged) |
 | `S3_PUBLIC_URL` | api, web | Base URL public objects are served from, used to build `bannerUrl` (api) and as the only allowed `next/image` source (web): `http://localhost:9000/festpass` locally, the R2 public domain in production |
 
 ## Scripts
@@ -594,7 +622,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED` (409), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED`, `PDF_NOT_READY` (409), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie. Allowed request headers: `Content-Type`, `Authorization`, `X-Request-Id`, `Idempotency-Key`; readable response headers: `X-Request-Id`, `Idempotent-Replayed`, `Retry-After`, `RateLimit-*`.
@@ -630,6 +658,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
 | GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
 | GET | `/api/v1/me/tickets` | Bearer | `200 { tickets: [{ id, code, seq, qrVersion, qr, checkedInAt, orderId, tier, event }] }`, soonest event first. `qr` is the signed `FP1.…` string to show at the gate |
+| GET | `/api/v1/orders/:orderId/tickets-pdf` | Bearer (the order's owner) | `200 { pdf: { url, expiresAt } }`: a fresh 5-minute pre-signed link to the order's private PDF tickets. `404` for someone else's order, `409 PDF_NOT_READY` until the worker has built it |
 | GET | `/api/v1/tickets/:ticketId` | Bearer (the ticket's owner) | `200 { ticket }`; `404` for someone else's ticket |
 | POST | `/api/v1/tickets/:ticketId/reissue` | Bearer (owner) | New QR for a leaked code: bumps `qrVersion`, so every earlier QR of the ticket is outdated at the gate. `200 { ticket }`; `409 TICKET_USED` once checked in |
 | POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` (HMAC-SHA256 of the raw body) | Razorpay calls this. Checked against the raw body before anything is parsed: `400 INVALID_SIGNATURE` changes nothing. `payment.captured` and `order.paid` record the payment once (by its ID) and move the order on; other events and unknown orders get `200 { handled: false }`. `200 { handled: true, outcome: "paid" \| "duplicate" \| "refund" }` |
@@ -661,6 +690,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
+- `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
 - `packages/shared/test/qr.test.ts`: a QR signed with Node's crypto verifies with `@noble/ed25519`; its payload has only `t`, `e`, `v`, `iat`; a changed payload, another key, a wrong prefix, a missing part, a truncated signature or non-base64url characters all fail; a validly signed payload that isn't a ticket fails. `apps/worker/test/tickets.test.ts`: a paid order gets one ticket per unit numbered 1..n and becomes `TICKETED`; running the job twice, or twice at once, creates them once; an unpaid order gets none. `apps/api/test/tickets.test.ts`: `/me/tickets` returns QR strings that verify with the public key, the same string on every read, owner-only `/tickets/:id`, and reissue moving the QR to `v=2` (not for used tickets).
 - `apps/api/test/webhooks.test.ts`: see [Payment idempotency](#payment-idempotency-and-the-order-state-machine-day-16). `packages/db/test/order-state.test.ts`: the table allows exactly the listed transitions and `transition()` throws for any other before touching the database. `apps/worker/test/refund.test.ts` (Razorpay faked): a refund marks the payment refunded and the expired order `REFUNDED`, running it twice refunds once, and a Razorpay failure changes nothing so the retry can finish.
 - `apps/api/test/payments.test.ts` (Razorpay replaced by a fake): pay creates one Razorpay order for the amount with our order ID, and repeated or parallel pay calls all get the one stored; someone else's order is 404; an expired hold (even before the sweeper), a paid and a cancelled order are 409; a Razorpay failure is a 502 that stores nothing. `GET /orders/:id` shows the owner the order and its event, and 404s for anyone else.
@@ -726,7 +756,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 15 (Fri 13 Nov): Razorpay checkout (test mode)
 - [x] Day 16 (Sat 14 Nov): Webhooks and the order state machine
 - [x] Day 17 (Sun 15 Nov): Signed QR tickets
-- [ ] Day 18 (Mon 16 Nov): PDF tickets and email delivery
+- [x] Day 18 (Mon 16 Nov): PDF tickets and email delivery
 - [ ] Day 19 (Tue 17 Nov): Check-in API and scan events
 - [ ] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
 - [ ] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
@@ -927,6 +957,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** an asymmetric signature (Ed25519) instead of an HMAC: a scanner needs only the public key, which can verify but never create tickets, so a phone lost at the gate can't be used to mint them.
 **Verify:** `pnpm test`; with the API and worker running, pay for a hold (`pnpm webhook:simulate <orderId>`), then `GET /api/v1/me/tickets` as that buyer returns QR strings that `verifyTicket()` accepts with `NEXT_PUBLIC_TICKET_PUBLIC_KEY`.
 **Next:** Day 18 builds a PDF per order with the QR codes and emails it, with a private pre-signed download link.
+
+### Day 18: PDF tickets and email delivery (2026-11-16)
+**Built:**
+- An `EmailProvider` interface with a SendGrid dynamic-template provider and a console provider (logs + HTML preview in `.email-previews/`), and three templates: ticket confirmation, order expired and refund issued (wired into the refund job).
+- The `send-tickets` job: a PDF per order (pdfkit + qrcode), stored under a private prefix, emailed as a 24-hour pre-signed link plus each QR inline; `email_log` with `unique(order_id, template)`, `sent_at` and a claim lease so retries never double-send.
+- `GET /orders/:id/tickets-pdf` (owner only, 5-minute pre-signed link) and a My Tickets page with QR codes drawn in the browser and a Download PDF button.
+
+**Key decision:** ticket PDFs stay private and are reached only through short-lived pre-signed links, unlike public banners, because a PDF holds a name and gate-opening QR codes and a public URL would never stop working.
+**Verify:** `pnpm test`; with `pnpm dev` running, buy a ticket (hold in the browser, then `pnpm webhook:simulate <orderId>`), open the newest file in `.email-previews/`, then **My tickets** → **Download PDF**.
+**Next:** Day 19 builds the check-in API: one guarded `UPDATE` decides entry, and every scan is recorded in MongoDB.
 
 <!-- BUILD-LOG:END -->
 
