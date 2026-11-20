@@ -181,6 +181,7 @@ model Order {
   items    OrderItem[]
   payments Payment[]
   tickets  Ticket[]
+  emails   EmailLog[]
 
   @@index([userId, status])
   // The hold-expiry sweep looks for PENDING orders whose expires_at has passed.
@@ -299,4 +300,21 @@ model IdempotencyKey {
 
   @@unique([userId, key])
   @@map("idempotency_keys")
+}
+
+// One row per email an order should get (ticket confirmation, hold expired, refund issued). The unique
+// (order_id, template) pair and sent_at make sending idempotent: a retried job finds the email already
+// sent. claimed_at is a short lease, so two runs at the same moment don't both send.
+model EmailLog {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String    @map("order_id") @db.Uuid
+  template  String
+  claimedAt DateTime? @map("claimed_at") @db.Timestamptz
+  sentAt    DateTime? @map("sent_at") @db.Timestamptz
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, template])
+  @@map("email_log")
 }

@@ -38,6 +38,11 @@
       "development": "./src/tickets.ts",
       "types": "./dist/tickets.d.ts",
       "default": "./dist/tickets.js"
+    },
+    "./emails": {
+      "development": "./src/emails.ts",
+      "types": "./dist/emails.d.ts",
+      "default": "./dist/emails.js"
     }
   },
   "scripts": {

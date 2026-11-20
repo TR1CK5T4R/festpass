@@ -1,4 +1,4 @@
-import type { Prisma } from './index.js';
+import { prisma, type Prisma } from './index.js';
 
 // The order state machine. Every order status change goes through transition(), never through a plain
 // UPDATE elsewhere, so the allowed moves live in one table and every move is guarded the same way.
@@ -38,4 +38,10 @@ export async function transition(
     UPDATE orders SET status = ${to}::order_status, updated_at = now()
     WHERE id = ${orderId}::uuid AND status = ${from}::order_status`;
   return changed === 1;
+}
+
+/** An order's current status, or null if there is no such order. Read-only. */
+export async function orderStatus(orderId: string): Promise<OrderStatus | null> {
+  const order = await prisma.order.findUnique({ where: { id: orderId }, select: { status: true } });
+  return order?.status ?? null;
 }
