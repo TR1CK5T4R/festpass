@@ -30,6 +30,19 @@ const payloadSchema = z
   })
   .strict();
 
+/** The payload for a ticket as stored: the API, the PDF and the email all build it this one way. */
+export const ticketQrPayload = (ticket: {
+  id: string;
+  eventId: string;
+  qrVersion: number;
+  createdAt: Date;
+}): TicketQrPayload => ({
+  t: ticket.id,
+  e: ticket.eventId,
+  v: ticket.qrVersion,
+  iat: Math.floor(ticket.createdAt.getTime() / 1000),
+});
+
 export function base64urlEncode(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);

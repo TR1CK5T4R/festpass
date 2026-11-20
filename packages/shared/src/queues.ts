@@ -8,6 +8,7 @@ export const QUEUES = {
   orders: 'orders',
   payments: 'payments',
   tickets: 'tickets',
+  emails: 'emails',
 } as const;
 
 export const JOBS = {
@@ -16,7 +17,14 @@ export const JOBS = {
   sweepExpiredOrders: 'sweep-expired-orders',
   refundPayment: 'refund-payment',
   issueTickets: 'issue-tickets',
+  sendTickets: 'send-tickets',
+  sendOrderExpired: 'send-order-expired',
+  sendRefundIssued: 'send-refund-issued',
 } as const;
+
+/** The emails an order can get; each is sent at most once per order (email_log). */
+export const EMAIL_TEMPLATES = ['ticket-confirmation', 'order-expired', 'refund-issued'] as const;
+export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
 
 export const expireOrderJobSchema = z.object({
   orderId: z.uuid(),
@@ -37,3 +45,10 @@ export const issueTicketsJobSchema = z.object({
   requestId: z.string().optional(),
 });
 export type IssueTicketsJob = z.infer<typeof issueTicketsJobSchema>;
+
+/** Every email job: the order it is about, and the request that led to it (for tracing in logs). */
+export const orderEmailJobSchema = z.object({
+  orderId: z.uuid(),
+  requestId: z.string().optional(),
+});
+export type OrderEmailJob = z.infer<typeof orderEmailJobSchema>;
