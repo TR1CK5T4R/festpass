@@ -68,7 +68,7 @@ describe('issue-tickets', () => {
   it('a paid order gets one ticket per unit, numbered 1..n, and becomes TICKETED', async () => {
     const { id } = await order('PAID');
 
-    expect(await issueOrderTickets({ orderId: id }, log)).toEqual({
+    expect(await issueOrderTickets({ orderId: id }, { log })).toEqual({
       issued: 3,
       status: 'TICKETED',
     });
@@ -85,10 +85,10 @@ describe('issue-tickets', () => {
     const { id } = await order('PAID');
 
     await Promise.all([
-      issueOrderTickets({ orderId: id }, log),
-      issueOrderTickets({ orderId: id }, log),
+      issueOrderTickets({ orderId: id }, { log }),
+      issueOrderTickets({ orderId: id }, { log }),
     ]);
-    const again = await issueOrderTickets({ orderId: id }, log);
+    const again = await issueOrderTickets({ orderId: id }, { log });
 
     expect(again).toEqual({ issued: 0, status: 'TICKETED' });
     expect(await tickets(id)).toHaveLength(3);
@@ -96,7 +96,10 @@ describe('issue-tickets', () => {
 
   it('an order that is not paid gets no tickets', async () => {
     const { id } = await order('PENDING');
-    expect(await issueOrderTickets({ orderId: id }, log)).toEqual({ issued: 0, status: 'PENDING' });
+    expect(await issueOrderTickets({ orderId: id }, { log })).toEqual({
+      issued: 0,
+      status: 'PENDING',
+    });
     expect(await tickets(id)).toEqual([]);
   });
 });

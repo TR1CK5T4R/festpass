@@ -67,7 +67,9 @@ describe('refund-payment', () => {
     const { orderId, paymentId } = await paymentToRefund();
     const razorpay = fakeRazorpay();
 
-    expect(await refundPayment({ paymentId }, razorpay, log)).toEqual({ refunded: true });
+    expect(await refundPayment({ paymentId }, { log, refunds: razorpay })).toEqual({
+      refunded: true,
+    });
 
     expect(razorpay.refund).toHaveBeenCalledOnce();
     expect(await state(orderId, paymentId)).toEqual({ order: 'REFUNDED', payment: 'refunded' });
@@ -77,8 +79,10 @@ describe('refund-payment', () => {
     const { paymentId } = await paymentToRefund();
     const razorpay = fakeRazorpay();
 
-    await refundPayment({ paymentId }, razorpay, log);
-    expect(await refundPayment({ paymentId }, razorpay, log)).toEqual({ refunded: false });
+    await refundPayment({ paymentId }, { log, refunds: razorpay });
+    expect(await refundPayment({ paymentId }, { log, refunds: razorpay })).toEqual({
+      refunded: false,
+    });
     expect(razorpay.refund).toHaveBeenCalledOnce();
   });
 
@@ -87,13 +91,15 @@ describe('refund-payment', () => {
     const razorpay = fakeRazorpay();
     razorpay.refund.mockRejectedValueOnce(new Error('ETIMEDOUT'));
 
-    await expect(refundPayment({ paymentId }, razorpay, log)).rejects.toThrow('ETIMEDOUT');
+    await expect(refundPayment({ paymentId }, { log, refunds: razorpay })).rejects.toThrow(
+      'ETIMEDOUT',
+    );
     expect(await state(orderId, paymentId)).toEqual({
       order: 'EXPIRED',
       payment: 'refund_pending',
     });
 
-    await refundPayment({ paymentId }, razorpay, log); // the retry
+    await refundPayment({ paymentId }, { log, refunds: razorpay }); // the retry
     expect(await state(orderId, paymentId)).toEqual({ order: 'REFUNDED', payment: 'refunded' });
   });
 });

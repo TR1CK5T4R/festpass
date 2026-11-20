@@ -12,6 +12,7 @@ import { expireOrder, processJob, sweepExpiredOrders } from '../src/processors.j
 
 const redis = new Redis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });
 const log = pino({ level: 'silent' });
+const deps = { redis, log };
 
 let eventId: string;
 let tierId: string;
@@ -78,7 +79,7 @@ const state = async (orderId: string) => ({
 describe('hold expiry', () => {
   it('a 2-second hold expires through its delayed job and the tickets go back on sale', async () => {
     const queue = createQueue(QUEUES.orders, redis);
-    const worker = new Worker(QUEUES.orders, (job) => processJob(job, redis, log), {
+    const worker = new Worker(QUEUES.orders, (job) => processJob(job, deps), {
       connection: redis,
     });
     try {
@@ -109,8 +110,8 @@ describe('hold expiry', () => {
     const { order } = await hold(0); // already due
     await hold(600); // someone else's hold keeps 1 ticket sold
 
-    const first = await expireOrder({ orderId: order.id }, redis, log);
-    const second = await expireOrder({ orderId: order.id }, redis, log);
+    const first = await expireOrder({ orderId: order.id }, deps);
+    const second = await expireOrder({ orderId: order.id }, deps);
 
     expect([first, second]).toEqual([{ released: true }, { released: false }]);
     expect(await state(order.id)).toEqual({ status: 'EXPIRED', sold: 1, redisStock: '9' });
@@ -120,9 +121,9 @@ describe('hold expiry', () => {
     const { order } = await hold(0, 2);
 
     await Promise.all([
-      expireOrder({ orderId: order.id }, redis, log),
-      sweepExpiredOrders(redis, log),
-      expireOrder({ orderId: order.id }, redis, log),
+      expireOrder({ orderId: order.id }, deps),
+      sweepExpiredOrders(deps),
+      expireOrder({ orderId: order.id }, deps),
     ]);
 
     expect(await state(order.id)).toEqual({ status: 'EXPIRED', sold: 0, redisStock: '10' });
@@ -130,7 +131,7 @@ describe('hold expiry', () => {
 
   it('a job that fires early leaves the hold alone', async () => {
     const { order } = await hold(600);
-    expect(await expireOrder({ orderId: order.id }, redis, log)).toEqual({ released: false });
+    expect(await expireOrder({ orderId: order.id }, deps)).toEqual({ released: false });
     expect((await state(order.id)).status).toBe('PENDING');
   });
 
@@ -138,14 +139,14 @@ describe('hold expiry', () => {
     const overdue = [await hold(0), await hold(0)];
     const current = await hold(600);
 
-    expect(await sweepExpiredOrders(redis, log)).toEqual({ expired: 2 });
-    expect(await sweepExpiredOrders(redis, log)).toEqual({ expired: 0 });
+    expect(await sweepExpiredOrders(deps)).toEqual({ expired: 2 });
+    expect(await sweepExpiredOrders(deps)).toEqual({ expired: 0 });
 
     for (const { order } of overdue) expect((await state(order.id)).status).toBe('EXPIRED');
     expect(await state(current.order.id)).toEqual({ status: 'PENDING', sold: 1, redisStock: '9' });
   });
 
   it('rejects a malformed job payload instead of guessing', async () => {
-    await expect(expireOrder({ orderId: 'not-a-uuid' }, redis, log)).rejects.toThrow();
+    await expect(expireOrder({ orderId: 'not-a-uuid' }, deps)).rejects.toThrow();
   });
 });

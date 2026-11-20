@@ -4,7 +4,8 @@ import { issueTickets } from '@festpass/db/tickets';
 import { truncateAll } from '@festpass/db/testing';
 import { verifyTicket } from '@festpass/shared';
 import request from 'supertest';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { s3 } from '../src/lib/storage.js';
 import { gateRedis } from '../src/lib/redis.js';
 import {
   app,
@@ -23,6 +24,7 @@ beforeEach(async () => {
   if (gateRedis.options.db !== 15) throw new Error('tests must use redis database 15');
   await gateRedis.flushdb();
 });
+afterEach(() => vi.restoreAllMocks());
 afterAll(() => prisma.$disconnect());
 
 /** A buyer with a paid, ticketed order for 3 tickets: what the webhook and the worker leave behind. */
@@ -116,5 +118,50 @@ describe('tickets', () => {
 
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('TICKET_USED');
+  });
+});
+
+describe('GET /orders/:orderId/tickets-pdf', () => {
+  const pdfLink = (user: TestUser, orderId: string) =>
+    request(app).get(`/api/v1/orders/${orderId}/tickets-pdf`).set(user.auth);
+  // HeadObject is the only storage call; signing the link is local.
+  const pdfStored = (exists: boolean) =>
+    vi.spyOn(s3, 'send').mockImplementation((async () => {
+      if (exists) return { ContentType: 'application/pdf', ContentLength: 12_345 };
+      throw Object.assign(new Error('NotFound'), { $metadata: { httpStatusCode: 404 } });
+    }) as never);
+
+  it('gives the owner a 5-minute pre-signed link to the private PDF', async () => {
+    const { buyer, orderId } = await ticketedOrder();
+    pdfStored(true);
+
+    const res = await pdfLink(buyer, orderId);
+
+    expect(res.status).toBe(200);
+    const url = new URL(res.body.pdf.url);
+    expect(url.pathname).toMatch(new RegExp(`/tickets/${orderId}\\.pdf$`));
+    expect(url.searchParams.get('X-Amz-Expires')).toBe('300');
+    expect(url.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/);
+    expect(url.searchParams.get('response-content-disposition')).toMatch(
+      /^attachment; filename="festpass-/,
+    );
+  });
+
+  it("is owner-only: someone else's order is a 404", async () => {
+    const { orderId } = await ticketedOrder();
+    const [stranger] = await makeUsers(1);
+    pdfStored(true);
+
+    expect((await pdfLink(stranger!, orderId)).status).toBe(404);
+  });
+
+  it('before the worker has stored the PDF, it says so (409 PDF_NOT_READY)', async () => {
+    const { buyer, orderId } = await ticketedOrder();
+    pdfStored(false);
+
+    const res = await pdfLink(buyer, orderId);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('PDF_NOT_READY');
   });
 });
