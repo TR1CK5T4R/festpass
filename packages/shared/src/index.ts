@@ -28,3 +28,4 @@ export * from './orders.ts';
 export * from './redis-keys.ts';
 export * from './queues.ts';
 export * from './qr.ts';
+export * from './checkins.ts';

@@ -1,4 +1,4 @@
-import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
+import { createPrivateKey, createPublicKey, sign, type KeyObject } from 'node:crypto';
 import { Queue, type ConnectionOptions } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { signedPart, type TicketQrPayload } from './qr.ts';
@@ -62,6 +62,10 @@ export function loadTicketPrivateKey(base64url: string): KeyObject {
     throw new Error('TICKET_SIGNING_PRIVATE_KEY is not an Ed25519 key');
   return key;
 }
+
+/** The matching public key (32 raw bytes, base64url): what verifyTicket() checks a QR against. */
+export const ticketPublicKey = (privateKey: KeyObject): string =>
+  createPublicKey(privateKey).export({ format: 'jwk' }).x!;
 
 /**
  * Signs a ticket QR code with Node's crypto (server only: this module never reaches the browser, and
