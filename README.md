@@ -43,7 +43,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Automatic hold expiry and rate limiting | Done: hold expiry, cancel and a job dashboard (Day 13); token-bucket rate limiting on login, register, booking and uploads (Day 14) |
 | Razorpay payments with idempotent webhooks | Done: checkout in test mode (Day 15); signed, idempotent webhooks with late-payment re-reserve or refund (Day 16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Done: signed QR tickets issued exactly once (Day 17); PDF tickets in private storage, emails sent once through SendGrid templates (or the console in development), and a My Tickets page (Day 18) |
-| Exactly-once check-in and an offline-capable scanner PWA | Planned (Days 19–20) |
+| Exactly-once check-in and an offline-capable scanner PWA | Check-in API with exactly-once entry, offline batch sync and scan history in MongoDB done (Day 19); scanner PWA planned (Day 20) |
 | Live availability and check-in dashboards | Planned (Day 21) |
 | Virtual waiting room for flash sales | Planned (Day 22) |
 | Caching and load-tested performance | Planned (Days 23–24) |
@@ -87,7 +87,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Done (Days 15–16); tested with signed simulated webhooks until test keys are set |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Done (Days 17–18) |
-| 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | Planned (Days 19–20) |
+| 7. Enter | A volunteer scans the QR at the gate. The ticket is accepted exactly once, even if two phones scan it at the same moment, and the scanner keeps working offline. | One guarded `UPDATE ... WHERE checked_in_at IS NULL` decides entry; offline scans sync later and conflicts are flagged. | API done (Day 19); scanner app planned (Day 20) |
 | 8. Measure | Booth scans feed sponsor dashboards (totals only, never names), organizers get live and post-event analytics, and an AI copilot answers questions using permission-checked tools. | Scan events are stored with the fields analytics needs, so dashboards are single aggregation queries. | Planned (Days 21–27) |
 
 ## Project structure
@@ -412,11 +412,45 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 - **`EmailProvider`:** jobs say *which* template and *what data*; `SendGridProvider` (dynamic templates) or `ConsoleProvider` (logs + HTML preview) decides *how*. Tests use a fake, so no test needs SendGrid or a network.
 - **Follow-ups from state:** issuing tickets (order `TICKETED`), an expired hold and a finished refund each queue their email with `jobId = <job>-<orderId>`, whenever the order is in that state, so a run that died after changing the order but before queuing is covered by the next run.
 
+### Exactly-once entry (Day 19)
+
+**Problem:** the same ticket can be scanned on two phones at the same moment, by a friend with a screenshot or by a volunteer double-tapping. Exactly one must get in, and the answer must come back fast, whatever else is down.
+
+**Approach** (`apps/api/src/modules/checkins/service.ts`, `packages/db/src/tickets.ts`):
+1. **Signature:** `verifyTicket()` with the public key. A tampered or foreign code is `400 INVALID_QR`, and nothing inside it is trusted or recorded.
+2. **Event:** the signed event ID must be this event (`409 WRONG_EVENT`).
+3. **Version:** the signed `v` must equal `tickets.qr_version` (`409 QR_REVOKED`), which is what makes a reissue revoke older codes.
+4. **One statement decides:**
+   ```sql
+   UPDATE tickets SET checked_in_at = now(), checked_in_by = $scanner
+   WHERE id = $ticket AND qr_version = $version AND checked_in_at IS NULL
+   RETURNING checked_in_at;
+   ```
+   The row lock makes parallel scans take turns, and a scan that waited re-checks the `WHERE` against the winner's commit, so only one gets a row back. The others re-read the ticket and answer `409 ALREADY_CHECKED_IN` with when and by whom it was first scanned.
+- **Permission:** `requireEventPermission('checkin:scan')` finds the club from the event: non-members get `404`.
+- **Offline sync:** `POST /events/:id/checkins/batch` runs scans one at a time in the phones' timestamp order, so the earliest scan of a ticket wins, and returns one result per scan in that order, each with its `clientScanId`. The phone's clock is used only for ordering and the scan's history time, and a future time becomes now.
+
+**Alternatives:** read `checked_in_at` and then update (the same race as overselling: two phones both read "not used"); a Redis lock (Redis isn't the source of truth, and a gate should keep working when it is down); a unique "check-ins" table (works, but one guarded `UPDATE` on the ticket says the same in less).
+
+**Tested by:** `apps/api/test/checkins.test.ts`: one scan accepted and a second `409` with details; ten parallel scans give exactly one `ACCEPTED` and nine `ALREADY_CHECKED_IN` (and with `AND checked_in_at IS NULL` removed by hand, all ten were accepted, so the test does catch it); wrong event, an old QR after a reissue, a tampered QR, plain text and a QR signed with another key are rejected; a batch sent out of order is processed and answered in client-time order; 200 scans fit the request limit.
+
+### Why scans live in MongoDB (Day 19)
+
+**Problem:** entry is one row per ticket, but history is many rows per ticket: every scan, including duplicates and invalid codes, at every gate and later every sponsor booth. It is written constantly during an event and only ever read as aggregates ("per gate, per minute", "by college").
+
+**Approach** (`packages/mongo/src/scan-event.ts`):
+- **Postgres decides, MongoDB remembers.** A `ScanEvent` goes to a **time-series collection** (`timeField: ts`, `metaField: { eventId, type, gateOrBoothId }`): MongoDB groups documents with the same meta into compressed, time-ordered buckets, built for many small appends read by time range.
+- **Attendee fields are copied at write time** (college, branch, graduation year, tier name), so an analytics query is a single aggregation with no join across databases, and it keeps what was true on the day.
+- **Written after the Postgres commit, and not awaited:** the volunteer never waits for analytics. If the write fails, a `write-scan-event` job retries it from the worker (10 attempts with exponential backoff from 5 s, kept in Bull Board if they run out). **The check-in is never undone:** a person at the gate matters more than a row in a chart.
+
+**Alternatives:** a Postgres table (works at first, but heavy append traffic and analytics scans would compete with the database that decides money and capacity); writing to MongoDB first (a Mongo outage would stop the gate); writing inside the Postgres transaction (a network call inside a transaction, and two databases can't commit together anyway).
+
+**Tested by:** `checkins.test.ts` checks the collection is really `timeseries`, the copied fields, and that a failing write leaves the check-in in place with a retry job queued; `apps/worker/test/scan-events.test.ts` checks the retry writes the event at its original time. Live against the dev stack: with the MongoDB container stopped, a scan was accepted in 25 ms; after restarting it, the worker wrote the missed event, 16 s after the scan.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
 - Offline scanning (Day 20)
-- Exactly-once entry (Day 19)
 - Real-time updates (Day 21)
 - Virtual waiting room (Day 22)
 - Sponsor analytics and privacy (Day 26)
@@ -565,7 +599,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `DATABASE_URL` | api, db (Prisma CLI, seed) | Postgres connection string |
 | `DATABASE_URL_TEST` | tests (`packages/db`, `apps/api`) | Separate Postgres database for tests; must end in `_test`, because tests truncate every table |
 | `MONGO_PORT` | docker compose | Host port for MongoDB (default 27018) |
-| `MONGODB_URI` | api | MongoDB connection string |
+| `MONGODB_URI` | api, worker | MongoDB connection string (scan history). Tests use the `festpass_test` database on the same server |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api, worker | Redis connection string (booking gate, BullMQ queues). Tests use database 15 of the same server |
 | `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid: minutes, up to 60, default 10. Fractions are allowed (`0.5` = 30 s, handy for watching an expiry) |
@@ -622,7 +656,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED`, `PDF_NOT_READY` (409), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED`, `PDF_NOT_READY`, `ALREADY_CHECKED_IN`, `WRONG_EVENT`, `QR_REVOKED` (409), `INVALID_QR` (400), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie. Allowed request headers: `Content-Type`, `Authorization`, `X-Request-Id`, `Idempotency-Key`; readable response headers: `X-Request-Id`, `Idempotent-Replayed`, `Retry-After`, `RateLimit-*`.
@@ -657,6 +691,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
 | GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
+| POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` in the event's club | Body `{ qr, deviceId, gateId? }` (`gateId` defaults to `main`). `200 { result: "ACCEPTED", ticket: { id, code, tierName, attendeeName, checkedInAt } }`. `409 ALREADY_CHECKED_IN` with `details: { ticketId, firstScannedAt, firstScannedBy }`, `409 WRONG_EVENT`, `409 QR_REVOKED`, `400 INVALID_QR`; `404` for non-members |
+| POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync. Body `{ deviceId, gateId?, scans: [{ clientScanId, qr, scannedAt }] }` (1–200). `200 { results: [...] }`, one per scan in client-time order, each with `clientScanId` and `result` (`ACCEPTED`, `DUPLICATE`, `INVALID`, `REVOKED`) plus the same details as above |
 | GET | `/api/v1/me/tickets` | Bearer | `200 { tickets: [{ id, code, seq, qrVersion, qr, checkedInAt, orderId, tier, event }] }`, soonest event first. `qr` is the signed `FP1.…` string to show at the gate |
 | GET | `/api/v1/orders/:orderId/tickets-pdf` | Bearer (the order's owner) | `200 { pdf: { url, expiresAt } }`: a fresh 5-minute pre-signed link to the order's private PDF tickets. `404` for someone else's order, `409 PDF_NOT_READY` until the worker has built it |
 | GET | `/api/v1/tickets/:ticketId` | Bearer (the ticket's owner) | `200 { ticket }`; `404` for someone else's ticket |
@@ -690,6 +726,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `packages/shared/test/money.test.ts`: rupee↔paise conversion, including ₹99.99 (`9999`, where a float multiply gives `9998.999…`), ₹0.29 and ₹1.1; amounts with 3 decimals, signs, commas or symbols are rejected; every amount up to ₹1,000.00 round-trips.
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
+- `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
 - `packages/shared/test/qr.test.ts`: a QR signed with Node's crypto verifies with `@noble/ed25519`; its payload has only `t`, `e`, `v`, `iat`; a changed payload, another key, a wrong prefix, a missing part, a truncated signature or non-base64url characters all fail; a validly signed payload that isn't a ticket fails. `apps/worker/test/tickets.test.ts`: a paid order gets one ticket per unit numbered 1..n and becomes `TICKETED`; running the job twice, or twice at once, creates them once; an unpaid order gets none. `apps/api/test/tickets.test.ts`: `/me/tickets` returns QR strings that verify with the public key, the same string on every read, owner-only `/tickets/:id`, and reissue moving the QR to `v=2` (not for used tickets).
 - `apps/api/test/webhooks.test.ts`: see [Payment idempotency](#payment-idempotency-and-the-order-state-machine-day-16). `packages/db/test/order-state.test.ts`: the table allows exactly the listed transitions and `transition()` throws for any other before touching the database. `apps/worker/test/refund.test.ts` (Razorpay faked): a refund marks the payment refunded and the expired order `REFUNDED`, running it twice refunds once, and a Razorpay failure changes nothing so the retry can finish.
@@ -757,7 +794,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 16 (Sat 14 Nov): Webhooks and the order state machine
 - [x] Day 17 (Sun 15 Nov): Signed QR tickets
 - [x] Day 18 (Mon 16 Nov): PDF tickets and email delivery
-- [ ] Day 19 (Tue 17 Nov): Check-in API and scan events
+- [x] Day 19 (Tue 17 Nov): Check-in API and scan events
 - [ ] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
 - [ ] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
 - [ ] Day 22 (Fri 20 Nov): Virtual waiting room
@@ -967,6 +1004,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** ticket PDFs stay private and are reached only through short-lived pre-signed links, unlike public banners, because a PDF holds a name and gate-opening QR codes and a public URL would never stop working.
 **Verify:** `pnpm test`; with `pnpm dev` running, buy a ticket (hold in the browser, then `pnpm webhook:simulate <orderId>`), open the newest file in `.email-previews/`, then **My tickets** → **Download PDF**.
 **Next:** Day 19 builds the check-in API: one guarded `UPDATE` decides entry, and every scan is recorded in MongoDB.
+
+### Day 19: Check-in API and scan events (2026-11-17)
+**Built:**
+- `POST /events/:eventId/checkins` (`checkin:scan`): verifies the QR signature, event and version, then one guarded `UPDATE` decides entry; a duplicate is a `409` with when and by whom it was first scanned.
+- A `ScanEvent` model on a MongoDB time-series collection, with attendee fields copied at write time, written after the Postgres commit; if that fails, a `write-scan-event` job retries it and the check-in stands.
+- `POST /events/:eventId/checkins/batch` for offline sync: scans processed in client-time order with a result per scan.
+
+**Key decision:** Postgres decides entry and MongoDB only records history, so a single conditional `UPDATE` makes entry exactly-once and a MongoDB outage can't stop the gate.
+**Verify:** `pnpm test`; with `pnpm dev` running, log in as `scanner@festpass.dev`, POST a ticket's `qr` from `GET /me/tickets` to `/events/:eventId/checkins` twice, then in `mongosh` run `db.scan_events.find()`.
+**Next:** Day 20 builds the scanner PWA: camera scanning, offline verification with the public key, and sync through the batch endpoint.
 
 <!-- BUILD-LOG:END -->
 

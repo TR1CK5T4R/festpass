@@ -28,7 +28,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Hold expiry jobs, rate limiting | `apps/worker`, `apps/api` | Planned (Days 13–14) |
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
-| Check-in and scan events | `apps/api`, `packages/mongo` | Planned (Day 19) |
+| Check-in and scan events | `apps/api`, `packages/mongo`, `packages/db`, `apps/worker` | Done (Day 19) |
 | Socket.IO live updates, waiting room | `apps/api`, `apps/worker` | Planned (Days 21–22) |
 | Caching, load tests, analytics, sponsor reports | all | Planned (Days 23–26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
@@ -41,7 +41,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 | Process | Started by | Job |
 |---|---|---|
 | **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
-| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16), ticket issuing (`issue-tickets`, Day 17) and ticket, expiry and refund emails with PDF tickets (Day 18). Later: issuing tickets, building PDFs, sending email, refunds, reports. |
+| **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16), ticket issuing (`issue-tickets`, Day 17), ticket, expiry and refund emails with PDF tickets (Day 18) and scan event retries (`write-scan-event`, Day 19). An outage of MongoDB only delays those retries. Later: issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
 
@@ -76,12 +76,14 @@ apps/api/
   src/middleware/error-handler.ts   notFound + the single error handler (standard error shape)
   src/middleware/cors.ts            CORS for WEB_ORIGINS only, with credentials (hand-written, no library)
   src/middleware/require-auth.ts    Verifies the Bearer access token and sets req.user = { id }
+  src/middleware/require-event-permission.ts  Same check as below, for routes that name an event: the org comes from the event
   src/middleware/require-org-permission.ts  Loads the caller's membership of :orgId and checks the matrix (404 / 403)
   src/modules/auth/                 routes, controller (cookie handling), service (passwords, tokens, rotation), repository
   src/modules/health/               routes, controller, service (parallel checks, 1 s timeout), repository (pings)
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
+  src/modules/checkins/             routes (POST /events/:eventId/checkins, /batch), controller, service (verify, decide, persist the scan)
   src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue, GET /orders/:id/tickets-pdf), service (QR signed on read, owner checks, PDF link), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
   src/modules/payments/             gateway.ts (Razorpay SDK, the only file that calls it), service (startPayment), repository, routes (POST /orders/:orderId/pay)
@@ -101,11 +103,12 @@ apps/worker/
                          every 60 s) and one worker per queue; closes workers, queues, Prisma and Redis on SIGTERM/SIGINT
   src/env.ts             Zod env check for the worker (keys, storage, email provider and templates)
   src/processors.ts      expireOrder(), sweepExpiredOrders(), refundPayment(), issueOrderTickets(), sendTickets(), sendOrderExpired(),
-                         sendRefundIssued(), reconcile(); processJob() routing by name, with every dependency passed in (WorkerDeps)
+                         sendRefundIssued(), writeScanEvent(), reconcile(); processJob() routing by name, with every dependency passed in (WorkerDeps)
   src/email/             provider.ts (EmailProvider interface), sendgrid.ts (dynamic templates), console.ts (log + HTML preview)
   src/pdf.ts             buildTicketsPdf() (pdfkit, one A5 page per ticket) and qrPng() (qrcode)
   src/storage.ts         TicketStorage: put() and signedDownloadUrl() on S3
   src/refunds.ts         Razorpay refunds (the worker's only Razorpay code); "already fully refunded" counts as done
+  test/scan-events.test.ts  write-scan-event writes the scan at its original time; malformed payloads are rejected
   test/expiry.test.ts    real BullMQ worker with a 2-second hold, double runs, job vs sweeper race, early job, sweeper
   test/emails.test.ts    PDF, send-tickets once (retry, race, failure), follow-up emails, console preview (fakes for email and storage)
 packages/db/
@@ -115,7 +118,8 @@ packages/db/
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
   src/emails.ts          @festpass/db/emails: claimEmail() (email_log row + 5-minute lease), markEmailSent(), releaseEmailClaim(), findOrderForEmail()
-  src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion()
+  src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion(),
+                         findTicketForGate(), checkInTicket() (the guarded UPDATE that decides entry)
   src/payments.ts        @festpass/db/payments: recordCapturedPayment() (insert once, lock, transition, re-reserve or refund_pending),
                          markPaymentRefunded(), findPayment(), findPendingRefunds()
   src/order-state.ts     @festpass/db/order-state: ORDER_TRANSITIONS, canTransition(), guarded transition()
@@ -134,7 +138,8 @@ packages/shared/
   src/events.ts          event and tier schemas, eventWindowIssues/tierWindowIssues, public list query, EventView, EventSummary, TierView
   src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
   src/redis-keys.ts      redisKeys.inventory / userHeld (shared by API and worker)
-  src/queues.ts          QUEUES and JOBS names, expireOrderJobSchema (the worker validates job payloads)
+  src/queues.ts          QUEUES and JOBS names, job payload schemas (the worker validates them)
+  src/checkins.ts        checkinSchema, batchCheckinSchema, SCAN_RESULTS and the check-in response types
   src/server.ts          @festpass/shared/server (Node only): createQueue() with retry/backoff defaults, releaseRedisStock(),
                          loadTicketPrivateKey(), encodeTicket() / createTicketSigner() (Node crypto Ed25519)
   src/qr.ts              QR format FP1.<payload>.<signature>, verifyTicket() (@noble/ed25519, Node and browser), base64url helpers
@@ -142,7 +147,8 @@ packages/shared/
   src/uploads.ts         BANNER_CONTENT_TYPES, BANNER_MAX_BYTES (2 MB), presignUploadSchema, PresignedUpload
   test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
 packages/mongo/
-  src/index.ts           connectMongo(), pingMongo(), disconnectMongo() (models arrive with Day 19)
+  src/index.ts           connectMongo() (also creates the time-series collection), pingMongo(), disconnectMongo()
+  src/scan-event.ts      ScanEvent model on a time-series collection, recordScanEvent()
 ```
 
 **How packages are imported:** each package's `exports` has a `development` condition pointing at `src/index.ts`. The API's dev server (`tsx --conditions=development`), Vitest and TypeScript (`customConditions` in `tsconfig.base.json`) all use it, so a change in `packages/db` is picked up without a build step. `pnpm build` and `node dist/server.js` ignore it and use each package's compiled `dist/`.
@@ -274,11 +280,12 @@ stateDiagram-v2
 
 ### Entry at the gate
 
-_Planned (Days 17–19)._
+Done (Days 17 and 19).
 
-- Each ticket's QR code holds `{ ticketId, eventId, qrVersion, issuedAt }` signed with Ed25519. There's no personal data in it, and it can't be forged without the private key, which never leaves the server.
-- Check-in runs `UPDATE tickets SET checked_in_at = now() WHERE id = $1 AND checked_in_at IS NULL`. If ten phones scan the same ticket at once, exactly one gets a row back.
-- Every scan is then written to MongoDB for analytics. If that write fails it is retried, but the check-in is never undone.
+- Each ticket's QR code holds `{ t, e, v, iat }` (ticket, event, QR version, issue time) signed with Ed25519. There's no personal data in it, and it can't be forged without the private key, which never leaves the server.
+- `POST /events/:eventId/checkins` (`modules/checkins/`, behind `requireEventPermission('checkin:scan')`): `verifyTicket()` with the public key derived from the signing key (`400 INVALID_QR`), the signed event must match (`409 WRONG_EVENT`), the signed version must equal `qr_version` (`409 QR_REVOKED`), then `checkInTicket()` runs `UPDATE tickets SET checked_in_at = now(), checked_in_by = $2 WHERE id = $1 AND qr_version = $3 AND checked_in_at IS NULL RETURNING checked_in_at`. If ten phones scan the same ticket at once, exactly one gets a row back; the rest re-read it and get `409 ALREADY_CHECKED_IN` with when and by whom.
+- `POST /events/:eventId/checkins/batch` runs up to 200 offline scans one at a time in client-timestamp order and returns a result per scan, in that order, with its `clientScanId`. A timestamp in the future becomes now. A batch re-sent after a lost response currently reports its scans as `DUPLICATE`.
+- Every scan, whatever the result, is then written to MongoDB (`ScanEvent`, a time-series collection in `packages/mongo`), not awaited, so the gate doesn't wait. The attendee's college, branch, year and tier are copied in. If the write fails, a `write-scan-event` job (10 attempts, exponential backoff from 5 s) retries it from the worker; the check-in is never undone.
 
 ## Engineering rules
 
@@ -316,6 +323,8 @@ _Planned (Days 17–19)._
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
 | POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | Verified on the raw body; `200 { handled, outcome }`; `400 INVALID_SIGNATURE` / `INVALID_PAYLOAD`; `503 WEBHOOKS_NOT_CONFIGURED` |
+| POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` | `200 { result: "ACCEPTED", ticket }`; `409 ALREADY_CHECKED_IN` / `WRONG_EVENT` / `QR_REVOKED`; `400 INVALID_QR` |
+| POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync: `200 { results }`, one per scan in client-time order |
 | GET | `/api/v1/me/tickets` | Bearer | The caller's tickets with signed QR strings |
 | GET | `/api/v1/orders/:orderId/tickets-pdf` | Bearer (owner) | `200 { pdf: { url, expiresAt } }`, a 5-minute pre-signed GET; `404` for others; `409 PDF_NOT_READY` |
 | GET | `/api/v1/tickets/:ticketId` | Bearer (owner) | One ticket; `404` for others |
@@ -350,7 +359,7 @@ pnpm --filter @festpass/worker dev     # only the worker
 pnpm --filter @festpass/api test       # API tests
 ```
 
-Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/webhooks.test.ts` signs bodies with the test secret and covers bad signatures, 5 deliveries (sequential and parallel), a failed enqueue, late payments and refunds. `test/payments.test.ts` replaces `paymentGateway.createOrder` with a fake and covers ownership, expiry, status, reuse of the Razorpay order (sequential and parallel) and provider errors. `test/rate-limit.test.ts` builds apps with tiny limits (`createApp({ rateLimits })`) and checks bursts, refill, headers, parallel requests, keys and fail-open against real Redis; every other suite runs with limits too high to hit. `test/admin.test.ts` covers who gets the admin cookie and what Bull Board accepts. `apps/worker/test/expiry.test.ts` runs a real BullMQ worker against the test database. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
+Tests use Vitest and Supertest against `createApp()`, without opening a port. `test/events.test.ts` covers the organizer flow, every tier rule, the price and capacity lock after a sale, publish rules and transitions, draft visibility and cursor pagination (every event exactly once, even with an insert between pages). `test/orgs.test.ts` drives every role × action through the real permission middleware, checks 404 for non-members, the member endpoints and the last-owner rule (including a concurrent race on the repository). `test/auth.test.ts` runs the full auth flow against the test database (truncated before each test): register, duplicate email, generic login error, `/me` with missing/expired/forged tokens, rotation, reuse revoking the family, and logout. `test/errors.test.ts` covers validation (400 with field details and the request ID), the 404 shape, invalid JSON, `AppError` rendering, hidden 500 details and request-ID reuse. `test/health.test.ts` injects fake checks to prove readiness returns 503 when a dependency fails or hangs. `test/uploads.test.ts` spies on the S3 client's `send` (no storage server needed): the presigned policy holds the size range and content type, bad types are 400, non-members 404, scanners 403, and a PATCH with a missing, oversized, non-image or foreign key is rejected. `test/orders.test.ts` runs every booking test with Redis working, failing and hanging (mocked on `gateRedis`), and checks compensation, missing keys and reconciliation against real Redis (database 15, flushed before each test). `test/checkins.test.ts` connects to the `festpass_test` MongoDB database and covers one-and-a-duplicate, ten parallel scans, rejected QRs, the time-series collection and copied fields, a failing Mongo write, and batch ordering. `test/webhooks.test.ts` signs bodies with the test secret and covers bad signatures, 5 deliveries (sequential and parallel), a failed enqueue, late payments and refunds. `test/payments.test.ts` replaces `paymentGateway.createOrder` with a fake and covers ownership, expiry, status, reuse of the Razorpay order (sequential and parallel) and provider errors. `test/rate-limit.test.ts` builds apps with tiny limits (`createApp({ rateLimits })`) and checks bursts, refill, headers, parallel requests, keys and fail-open against real Redis; every other suite runs with limits too high to hit. `test/admin.test.ts` covers who gets the admin cookie and what Bull Board accepts. `apps/worker/test/expiry.test.ts` runs a real BullMQ worker against the test database. `test/env.test.ts` covers env parsing. Database tests run against `DATABASE_URL_TEST`, which Vitest migrates automatically. `packages/db/test/constraints.test.ts` proves Postgres rejects an oversold tier even through raw SQL, and `packages/db/test/seed.test.ts` proves the seed is idempotent; both read `DATABASE_URL` from the root `.env`.
 
 ## Environment variables
 
@@ -376,3 +385,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 16:** Razorpay webhooks (`express.raw`, HMAC with `timingSafeEqual`, `payment.captured` and `order.paid`); `@festpass/db/payments` (insert-once payments, late-payment re-reserve or `refund_pending`); state machine extended to exactly the listed transitions; `issue-tickets` and `refund-payment` jobs queued from stored state; worker refund job; `pnpm webhook:simulate`; `RAZORPAY_WEBHOOK_SECRET`.
 - **Day 17:** Ed25519 QR tickets: `pnpm keys:generate`, `FP1.<payload>.<signature>` signed with Node crypto (`@festpass/shared/server`) and verified with `@noble/ed25519` (`@festpass/shared`); `issueTickets()` and the worker's `issue-tickets` job (the `tickets` queue is now worked); `GET /me/tickets`, `GET /tickets/:id`, `POST /tickets/:id/reissue`; `TICKET_SIGNING_PRIVATE_KEY` checked at startup.
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
+- **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
