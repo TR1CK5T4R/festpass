@@ -15,6 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@festpass/shared": "workspace:*",
     "mongoose": "^9.11.4"
   }
 }

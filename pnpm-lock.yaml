@@ -324,6 +324,9 @@ importers:
       '@festpass/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@festpass/mongo':
+        specifier: workspace:*
+        version: link:../../packages/mongo
       '@festpass/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -395,6 +398,9 @@ importers:
 
   packages/mongo:
     dependencies:
+      '@festpass/shared':
+        specifier: workspace:*
+        version: link:../shared
       mongoose:
         specifier: ^9.11.4
         version: 9.11.4
