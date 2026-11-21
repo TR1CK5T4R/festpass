@@ -47,9 +47,11 @@ describe('job dashboard (Bull Board) access', () => {
     expect(page.status).toBe(200);
     expect(page.headers['content-type']).toMatch(/text\/html/);
     expect(queues.body.queues.map((q: { name: string }) => q.name).sort()).toEqual([
+      'emails',
       'inventory',
       'orders',
       'payments',
+      'scans',
       'tickets',
     ]);
   });

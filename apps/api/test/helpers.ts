@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { prisma } from '@festpass/db';
+import { recordCapturedPayment } from '@festpass/db/payments';
+import { issueTickets } from '@festpass/db/tickets';
 import type { OrgRole } from '@festpass/shared';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
@@ -100,3 +102,22 @@ export const book = (
     .set(user.auth)
     .set('Idempotency-Key', key)
     .send({ items });
+
+/** A buyer with a paid, ticketed order for `qty` tickets: what the webhook and the worker leave behind. */
+export async function ticketedOrder(qty = 3) {
+  const owner = await makeUser('Organizer');
+  const orgId = await makeOrg(owner, `Club ${randomUUID().slice(0, 8)}`);
+  const { eventId, tierIds } = await createSaleEvent(owner, orgId, [
+    { name: 'Regular', capacity: 10 },
+  ]);
+  const buyer = await makeUser('Buyer');
+  const booked = await book(buyer, eventId, [{ tierId: tierIds[0]!, qty }]);
+  const orderId = booked.body.order.id as string;
+  await recordCapturedPayment({
+    orderId,
+    razorpayPaymentId: `pay_${orderId.slice(0, 8)}`,
+    rawPayload: {},
+  });
+  await issueTickets(orderId);
+  return { owner, orgId, buyer, orderId, eventId };
+}

@@ -1,21 +1,11 @@
 import { prisma } from '@festpass/db';
-import { recordCapturedPayment } from '@festpass/db/payments';
-import { issueTickets } from '@festpass/db/tickets';
 import { truncateAll } from '@festpass/db/testing';
 import { verifyTicket } from '@festpass/shared';
 import request from 'supertest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { s3 } from '../src/lib/storage.js';
 import { gateRedis } from '../src/lib/redis.js';
-import {
-  app,
-  book,
-  createSaleEvent,
-  makeOrg,
-  makeUser,
-  makeUsers,
-  type TestUser,
-} from './helpers.js';
+import { app, makeUsers, ticketedOrder, type TestUser } from './helpers.js';
 
 const PUBLIC_KEY = process.env.TICKET_PUBLIC_KEY_FOR_TESTS!;
 
@@ -26,25 +16,6 @@ beforeEach(async () => {
 });
 afterEach(() => vi.restoreAllMocks());
 afterAll(() => prisma.$disconnect());
-
-/** A buyer with a paid, ticketed order for 3 tickets: what the webhook and the worker leave behind. */
-async function ticketedOrder() {
-  const owner = await makeUser('Organizer');
-  const orgId = await makeOrg(owner);
-  const { eventId, tierIds } = await createSaleEvent(owner, orgId, [
-    { name: 'Regular', capacity: 10 },
-  ]);
-  const buyer = await makeUser('Buyer');
-  const booked = await book(buyer, eventId, [{ tierId: tierIds[0]!, qty: 3 }]);
-  const orderId = booked.body.order.id as string;
-  await recordCapturedPayment({
-    orderId,
-    razorpayPaymentId: `pay_${orderId.slice(0, 8)}`,
-    rawPayload: {},
-  });
-  await issueTickets(orderId);
-  return { buyer, orderId, eventId };
-}
 
 const myTickets = (user: TestUser) => request(app).get('/api/v1/me/tickets').set(user.auth);
 

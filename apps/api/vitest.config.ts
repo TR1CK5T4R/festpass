@@ -15,6 +15,10 @@ process.env.LOG_LEVEL = 'silent';
 process.env.DATABASE_URL = process.env.DATABASE_URL_TEST;
 // Redis database 15 for tests, so flushing it between tests never touches dev data in database 0.
 process.env.REDIS_URL = new URL('/15', process.env.REDIS_URL ?? 'redis://localhost:6380').href;
+process.env.MONGODB_URI = new URL(
+  '/festpass_test',
+  process.env.MONGODB_URI ?? 'mongodb://localhost:27018',
+).href;
 process.env.ADMIN_EMAILS = 'admin@festpass.test';
 // Fake test-mode keys: tests replace paymentGateway.createOrder, so Razorpay is never called.
 process.env.RAZORPAY_KEY_ID = 'rzp_test_festpassTests';
