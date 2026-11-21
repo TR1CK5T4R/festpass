@@ -55,3 +55,38 @@ export async function bumpQrVersion(ticketId: string): Promise<number | null> {
     RETURNING qr_version`;
   return row?.qr_version ?? null;
 }
+
+/** What the gate needs to judge a ticket, and the attendee fields copied into the scan event. */
+export function findTicketForGate(ticketId: string) {
+  return prisma.ticket.findUnique({
+    where: { id: ticketId },
+    select: {
+      id: true,
+      code: true,
+      qrVersion: true,
+      checkedInAt: true,
+      checkedInUser: { select: { id: true, name: true } },
+      tier: { select: { name: true } },
+      order: { select: { eventId: true } },
+      owner: { select: { name: true, college: true, branch: true, graduationYear: true } },
+    },
+  });
+}
+
+/**
+ * The decision at the gate, in one statement. The row lock serialises parallel scans, and a scan that
+ * waited re-checks the WHERE clause against the winner's commit, so exactly one gets a row back, however
+ * many phones scan the same ticket. qr_version is in the WHERE too, so a reissue racing a scan can't let
+ * the old code in. Returns when it was accepted, or null if this scan didn't win.
+ */
+export async function checkInTicket(
+  ticketId: string,
+  qrVersion: number,
+  scannerUserId: string,
+): Promise<Date | null> {
+  const [row] = await prisma.$queryRaw<{ checked_in_at: Date }[]>`
+    UPDATE tickets SET checked_in_at = now(), checked_in_by = ${scannerUserId}::uuid
+    WHERE id = ${ticketId}::uuid AND qr_version = ${qrVersion} AND checked_in_at IS NULL
+    RETURNING checked_in_at`;
+  return row?.checked_in_at ?? null;
+}
