@@ -1,4 +1,5 @@
 import { prisma } from '@festpass/db';
+import { connectMongo, disconnectMongo } from '@festpass/mongo';
 import { JOBS, QUEUES } from '@festpass/shared';
 import { createQueue, createTicketSigner } from '@festpass/shared/server';
 import { Worker } from 'bullmq';
@@ -22,6 +23,16 @@ const logger = pino({ level: env.LOG_LEVEL, base: { process: 'worker' } });
 // instead of failing after a few retries.
 const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
 connection.on('error', (err) => logger.warn({ err: err.message }, 'redis connection error'));
+
+// Only the scan event retries need MongoDB, so an outage must not stop hold expiry or tickets: keep
+// trying in the background instead of exiting. Scan jobs fail and back off until it is back.
+function connectMongoInBackground() {
+  connectMongo(env.MONGODB_URI).catch((err: Error) => {
+    logger.warn({ err: err.message }, 'mongo unavailable, retrying in 30 s');
+    setTimeout(connectMongoInBackground, 30_000).unref();
+  });
+}
+connectMongoInBackground();
 
 const queues = Object.fromEntries(
   Object.values(QUEUES).map((name) => [name, createQueue(name, connection)]),
@@ -79,7 +90,7 @@ async function shutdown(signal: NodeJS.Signals) {
   // close() waits for the job in progress to finish, so nothing is cut in half.
   await Promise.all(workers.map((w) => w.close()));
   await Promise.all(Object.values(queues).map((q) => q.close()));
-  await Promise.allSettled([prisma.$disconnect(), connection.quit()]);
+  await Promise.allSettled([prisma.$disconnect(), connection.quit(), disconnectMongo()]);
   process.exit(0);
 }
 

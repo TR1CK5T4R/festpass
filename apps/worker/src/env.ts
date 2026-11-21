@@ -11,6 +11,7 @@ const schema = z
   .object({
     DATABASE_URL: z.url(),
     REDIS_URL: z.url(),
+    MONGODB_URI: z.url(),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),

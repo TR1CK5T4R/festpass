@@ -10,6 +10,7 @@ import { reconcileInventory } from '@festpass/db/inventory';
 import { orderStatus } from '@festpass/db/order-state';
 import { findPayment, markPaymentRefunded } from '@festpass/db/payments';
 import { issueTickets } from '@festpass/db/tickets';
+import { recordScanEvent } from '@festpass/mongo';
 import {
   expireOrderJobSchema,
   formatPaise,
@@ -17,6 +18,7 @@ import {
   JOBS,
   orderEmailJobSchema,
   refundPaymentJobSchema,
+  scanEventJobSchema,
   storageKeys,
   ticketQrPayload,
   type EmailTemplate,
@@ -152,6 +154,20 @@ export async function issueOrderTickets(data: unknown, deps: WorkerDeps) {
   else deps.log.debug({ orderId, status: result.status }, 'no tickets to issue');
   if (result.status === 'TICKETED') await queueEmail(deps, JOBS.sendTickets, orderId, requestId);
   return result;
+}
+
+/**
+ * write-scan-event: a scan the API couldn't write to MongoDB. The check-in itself already stands in
+ * Postgres; this only catches up the history. Throwing retries it with the job's long backoff.
+ */
+export async function writeScanEvent(data: unknown, deps: WorkerDeps) {
+  const event = scanEventJobSchema.parse(data);
+  await recordScanEvent(event);
+  deps.log.info(
+    { ticketId: event.ticketId, result: event.result },
+    'scan event written after a retry',
+  );
+  return { written: true };
 }
 
 export async function reconcile(deps: WorkerDeps) {
@@ -317,6 +333,8 @@ export function processJob(job: Job, deps: WorkerDeps) {
       return issueOrderTickets(job.data, jobDeps);
     case JOBS.refundPayment:
       return refundPayment(job.data, jobDeps);
+    case JOBS.writeScanEvent:
+      return writeScanEvent(job.data, jobDeps);
     case JOBS.sendTickets:
       return sendTickets(job.data, jobDeps);
     case JOBS.sendOrderExpired:

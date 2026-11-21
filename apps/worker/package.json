@@ -20,6 +20,7 @@
     "@aws-sdk/client-s3": "^3.1161.0",
     "@aws-sdk/s3-request-presigner": "^3.1161.0",
     "@festpass/db": "workspace:*",
+    "@festpass/mongo": "workspace:*",
     "@festpass/shared": "workspace:*",
     "@sendgrid/mail": "^8.1.6",
     "bullmq": "^6.5.4",
