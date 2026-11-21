@@ -9,3 +9,5 @@ export const ordersQueue = createQueue(QUEUES.orders, gateRedis);
 export const inventoryQueue = createQueue(QUEUES.inventory, gateRedis);
 export const paymentsQueue = createQueue(QUEUES.payments, gateRedis);
 export const ticketsQueue = createQueue(QUEUES.tickets, gateRedis);
+export const emailsQueue = createQueue(QUEUES.emails, gateRedis);
+export const scansQueue = createQueue(QUEUES.scans, gateRedis);
