@@ -54,6 +54,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
 const tabs = [
   { href: '/dashboard', label: 'Events' },
   { href: '/dashboard/members', label: 'Members' },
+  { href: '/scan', label: 'Scanner' },
 ];
 
 function Nav() {
