@@ -254,6 +254,37 @@ describe('POST /events/:eventId/checkins/batch', () => {
     expect(byTicket(tickets[1]!.id).ts.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
+  it('a batch sent again after a lost response gets the same answer, not a false conflict', async () => {
+    const { eventId, scanner, tickets } = await gate();
+    const scans = [{ clientScanId: 'scan-1', qr: tickets[0]!.qr, scannedAt: at(2) }];
+
+    const first = await batch(scanner, eventId, scans);
+    const resent = await batch(scanner, eventId, scans);
+    const otherPhone = await batch(scanner, eventId, [{ ...scans[0]!, clientScanId: 'scan-2' }]);
+
+    expect(first.body.results[0].result).toBe('ACCEPTED');
+    expect(resent.body.results).toEqual(first.body.results);
+    expect(otherPhone.body.results[0].result).toBe('DUPLICATE');
+    await waitForScanEvents(eventId, 2); // the re-send added no history row
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await scanEvents(eventId)).toHaveLength(2);
+  });
+
+  it('a scan whose online answer was lost is recognised when the batch sends it', async () => {
+    const { eventId, scanner, tickets } = await gate();
+    const qr = tickets[0]!.qr;
+    const online = await request(app)
+      .post(`/api/v1/events/${eventId}/checkins`)
+      .set(scanner.auth)
+      .send({ qr, deviceId: 'phone-1', clientScanId: 'scan-9' });
+    expect(online.status).toBe(200);
+
+    const synced = await batch(scanner, eventId, [
+      { clientScanId: 'scan-9', qr, scannedAt: at(2) },
+    ]);
+    expect(synced.body.results[0].result).toBe('ACCEPTED');
+  });
+
   it('validates the batch and refuses non-members', async () => {
     const { eventId, scanner, tickets } = await gate();
     const stranger = await makeUser('Eve');
@@ -278,4 +309,32 @@ describe('POST /events/:eventId/checkins/batch', () => {
     expect(res.body.results).toHaveLength(200);
     await waitForScanEvents(eventId, 200);
   }, 30_000);
+});
+
+describe('GET /events/:eventId/checkins/manifest', () => {
+  it('lists IDs, current versions and used flags, and nothing personal', async () => {
+    const { eventId, scanner, buyer, tickets } = await gate();
+    await request(app).post(`/api/v1/tickets/${tickets[0]!.id}/reissue`).set(buyer.auth);
+    await scan(scanner, eventId, tickets[1]!.qr);
+
+    const res = await request(app)
+      .get(`/api/v1/events/${eventId}/checkins/manifest`)
+      .set(scanner.auth);
+
+    expect(res.status).toBe(200);
+    expect(res.body.manifest.eventId).toBe(eventId);
+    const byId = new Map(res.body.manifest.tickets.map((t: { id: string }) => [t.id, t] as const));
+    expect(byId.get(tickets[0]!.id)).toEqual({ id: tickets[0]!.id, v: 2, used: false });
+    expect(byId.get(tickets[1]!.id)).toEqual({ id: tickets[1]!.id, v: 1, used: true });
+    expect(byId.get(tickets[2]!.id)).toEqual({ id: tickets[2]!.id, v: 1, used: false });
+  });
+
+  it('is only for people who can scan at this event', async () => {
+    const { eventId } = await gate();
+    const stranger = await makeUser('Eve');
+    const res = await request(app)
+      .get(`/api/v1/events/${eventId}/checkins/manifest`)
+      .set(stranger.auth);
+    expect(res.status).toBe(404);
+  });
 });

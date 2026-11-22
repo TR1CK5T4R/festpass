@@ -1,4 +1,4 @@
-import { checkInTicket, findTicketForGate } from '@festpass/db/tickets';
+import { checkInTicket, findTicketForGate, listTicketsForGate } from '@festpass/db/tickets';
 import { recordScanEvent, type ScanEventData } from '@festpass/mongo';
 import {
   JOBS,
@@ -8,6 +8,7 @@ import {
   type CheckedInTicket,
   type CheckinInput,
   type FirstScan,
+  type GateManifest,
 } from '@festpass/shared';
 import { ticketPublicKey } from '@festpass/shared/server';
 import { env } from '../../config/env.js';
@@ -17,7 +18,7 @@ import { scansQueue } from '../../lib/queues.js';
 const publicKey = ticketPublicKey(env.TICKET_SIGNING_PRIVATE_KEY);
 
 export type ScanOutcome =
-  | { result: 'ACCEPTED'; ticket: CheckedInTicket }
+  | { result: 'ACCEPTED'; ticket: CheckedInTicket; replayed?: boolean }
   | ({ result: 'DUPLICATE'; ticketId: string } & FirstScan)
   | { result: 'INVALID' | 'REVOKED'; code: string; message: string };
 
@@ -29,6 +30,8 @@ interface ScanContext {
   offline: boolean;
   /** When the scan happened: now, or the phone's time for an offline scan. */
   ts: Date;
+  /** The phone's ID for this scan; recognises it when it is sent again after a lost answer. */
+  clientScanId: string | null;
 }
 
 const rejected = (result: 'INVALID' | 'REVOKED', code: string, message: string): ScanOutcome => ({
@@ -60,7 +63,9 @@ async function scan(qr: string, context: ScanContext): Promise<ScanOutcome> {
     graduationYear: null,
     tierName: null,
   };
-  const outcome = await decide(qr, context.eventId, context.scannerUserId, fields);
+  const outcome = await decide(qr, context, fields);
+  // A batch re-sent after a lost response: same answer as the first time, and history already has it.
+  if (outcome.result === 'ACCEPTED' && outcome.replayed) return outcome;
   // Not awaited: the volunteer at the gate must not wait for analytics, and the decision is already
   // committed. shortcut: a write in flight when the process stops is lost; drain them on shutdown if
   // scan counts ever need to be exact across deploys.
@@ -78,8 +83,7 @@ async function scan(qr: string, context: ScanContext): Promise<ScanOutcome> {
 
 async function decide(
   qr: string,
-  eventId: string,
-  scannerUserId: string,
+  { eventId, scannerUserId, clientScanId }: ScanContext,
   fields: Partial<ScanEventData>,
 ): Promise<ScanOutcome> {
   const verified = await verifyTicket(qr, publicKey);
@@ -104,24 +108,27 @@ async function decide(
     rejected('REVOKED', 'QR_REVOKED', 'This QR was replaced by a newer one; ask for the latest');
   if (qrVersion !== ticket.qrVersion) return revoked();
 
-  const checkedInAt = await checkInTicket(ticketId, qrVersion, scannerUserId);
-  if (checkedInAt) {
-    return {
-      result: 'ACCEPTED',
-      ticket: {
-        id: ticket.id,
-        code: ticket.code,
-        tierName: ticket.tier.name,
-        attendeeName: ticket.owner.name,
-        checkedInAt: checkedInAt.toISOString(),
-      },
-    };
-  }
+  const accepted = (checkedInAt: Date, replayed = false): ScanOutcome => ({
+    result: 'ACCEPTED',
+    replayed,
+    ticket: {
+      id: ticket.id,
+      code: ticket.code,
+      tierName: ticket.tier.name,
+      attendeeName: ticket.owner.name,
+      checkedInAt: checkedInAt.toISOString(),
+    },
+  });
+  const checkedInAt = await checkInTicket(ticketId, qrVersion, scannerUserId, clientScanId);
+  if (checkedInAt) return accepted(checkedInAt);
+
   // Didn't win: read again, because the state may have changed since the read above.
   const current = await findTicketForGate(ticketId);
-  return current?.checkedInAt
-    ? { result: 'DUPLICATE', ticketId, ...firstScan(current) }
-    : revoked();
+  if (!current?.checkedInAt) return revoked();
+  // This very scan got the ticket in earlier, and the phone never heard: not a conflict.
+  if (clientScanId && current.checkedInScanId === clientScanId)
+    return accepted(current.checkedInAt, true);
+  return { result: 'DUPLICATE', ticketId, ...firstScan(current) };
 }
 
 /**
@@ -159,15 +166,16 @@ export function checkIn(eventId: string, scannerUserId: string, input: CheckinIn
     gateId: input.gateId,
     offline: false,
     ts: new Date(),
+    clientScanId: input.clientScanId ?? null,
   });
 }
 
 /**
  * Offline sync. Scans run one at a time in the phones' timestamp order, so the earliest scan of a ticket
  * in the batch is the one accepted. The clock in the phone is not trusted for anything but ordering and
- * the event's time, and a time in the future becomes now.
- * shortcut: a batch re-sent after a lost response reports its scans as DUPLICATE and logs them again;
- * recognise a re-sent clientScanId if that skews reports.
+ * the event's time, and a time in the future becomes now. Sending a batch again is safe: a scan that
+ * already got its ticket in answers ACCEPTED again. shortcut: a re-sent scan that was refused logs a
+ * second history row; drop those too if it ever skews reports.
  */
 export async function checkInBatch(
   eventId: string,
@@ -185,8 +193,21 @@ export async function checkInBatch(
       gateId: input.gateId,
       offline: true,
       ts: scannedAt > now ? now : scannedAt,
+      clientScanId,
     });
-    results.push({ clientScanId, ...outcome });
+    if (outcome.result === 'ACCEPTED') {
+      results.push({ clientScanId, result: 'ACCEPTED', ticket: outcome.ticket });
+    } else {
+      results.push({ clientScanId, ...outcome });
+    }
   }
   return results;
+}
+
+export async function gateManifest(eventId: string): Promise<GateManifest> {
+  return {
+    eventId,
+    generatedAt: new Date().toISOString(),
+    tickets: await listTicketsForGate(eventId),
+  };
 }

@@ -13,6 +13,7 @@ export function checkinRoutes(): Router {
     validate({ params: eventIdParamsSchema }),
     requireEventPermission('checkin:scan'),
   );
+  router.get('/manifest', controller.manifest);
   router.post('/', validate({ body: checkinSchema }), controller.checkIn);
   router.post('/batch', validate({ body: batchCheckinSchema }), controller.batch);
   return router;

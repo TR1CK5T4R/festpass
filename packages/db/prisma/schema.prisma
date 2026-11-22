@@ -232,6 +232,8 @@ model Ticket {
   qrVersion   Int       @default(1) @map("qr_version")
   checkedInAt DateTime? @map("checked_in_at") @db.Timestamptz
   checkedInBy String?   @map("checked_in_by") @db.Uuid
+  // The offline scan that checked this ticket in, so a batch re-sent after a lost response is recognised.
+  checkedInScanId String? @map("checked_in_scan_id")
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
 
   order         Order      @relation(fields: [orderId], references: [id])

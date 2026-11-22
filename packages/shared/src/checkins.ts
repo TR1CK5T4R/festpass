@@ -6,8 +6,15 @@ export type ScanResult = (typeof SCAN_RESULTS)[number];
 const qr = z.string().min(1).max(1000);
 const deviceId = z.string().trim().min(1).max(100);
 const gateId = z.string().trim().min(1).max(100).default('main');
+/** Chosen by the phone. Sent again if the answer was lost, so the same scan is never a false conflict. */
+const clientScanId = z.string().min(1).max(100);
 
-export const checkinSchema = z.object({ qr, deviceId, gateId });
+export const checkinSchema = z.object({
+  qr,
+  deviceId,
+  gateId,
+  clientScanId: clientScanId.optional(),
+});
 export type CheckinInput = z.infer<typeof checkinSchema>;
 
 // 200 scans of about 350 bytes each stay well under the API's 100 kB body limit; a phone with a longer
@@ -18,8 +25,7 @@ export const batchCheckinSchema = z.object({
   scans: z
     .array(
       z.object({
-        /** Chosen by the phone, so it can match each result to the scan in its queue. */
-        clientScanId: z.string().min(1).max(100),
+        clientScanId,
         qr,
         /** When the phone scanned it (the phone's clock). */
         scannedAt: z.iso.datetime({ offset: true }).transform((s) => new Date(s)),
@@ -51,3 +57,13 @@ export type BatchScanResult = { clientScanId: string } & (
   | ({ result: 'DUPLICATE'; ticketId: string } & FirstScan)
   | { result: 'INVALID' | 'REVOKED'; code: string; message: string }
 );
+
+/**
+ * What a scanner downloads at gate open: enough to catch revoked and already-used tickets offline, with
+ * no personal data, so a lost phone gives nothing away.
+ */
+export interface GateManifest {
+  eventId: string;
+  generatedAt: string;
+  tickets: { id: string; v: number; used: boolean }[];
+}

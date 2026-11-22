@@ -65,6 +65,7 @@ export function findTicketForGate(ticketId: string) {
       code: true,
       qrVersion: true,
       checkedInAt: true,
+      checkedInScanId: true,
       checkedInUser: { select: { id: true, name: true } },
       tier: { select: { name: true } },
       order: { select: { eventId: true } },
@@ -83,10 +84,21 @@ export async function checkInTicket(
   ticketId: string,
   qrVersion: number,
   scannerUserId: string,
+  clientScanId: string | null = null,
 ): Promise<Date | null> {
   const [row] = await prisma.$queryRaw<{ checked_in_at: Date }[]>`
-    UPDATE tickets SET checked_in_at = now(), checked_in_by = ${scannerUserId}::uuid
+    UPDATE tickets
+    SET checked_in_at = now(), checked_in_by = ${scannerUserId}::uuid, checked_in_scan_id = ${clientScanId}
     WHERE id = ${ticketId}::uuid AND qr_version = ${qrVersion} AND checked_in_at IS NULL
     RETURNING checked_in_at`;
   return row?.checked_in_at ?? null;
+}
+
+/** Every ticket of an event, for a scanner to keep offline: IDs and numbers only, no personal data. */
+export async function listTicketsForGate(eventId: string) {
+  const tickets = await prisma.ticket.findMany({
+    where: { order: { eventId } },
+    select: { id: true, qrVersion: true, checkedInAt: true },
+  });
+  return tickets.map((t) => ({ id: t.id, v: t.qrVersion, used: t.checkedInAt !== null }));
 }

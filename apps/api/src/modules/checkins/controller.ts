@@ -11,7 +11,7 @@ export const checkIn: RequestHandler = async (req, res) => {
   );
   switch (outcome.result) {
     case 'ACCEPTED':
-      res.json(outcome);
+      res.json({ result: outcome.result, ticket: outcome.ticket });
       return;
     case 'DUPLICATE':
       throw new ConflictError('ALREADY_CHECKED_IN', 'This ticket has already been scanned', {
@@ -34,4 +34,8 @@ export const batch: RequestHandler = async (req, res) => {
     req.body as BatchCheckinInput,
   );
   res.json({ results });
+};
+
+export const manifest: RequestHandler = async (req, res) => {
+  res.json({ manifest: await checkins.gateManifest(String(req.params.eventId)) });
 };
