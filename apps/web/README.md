@@ -15,7 +15,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | Public event list and event pages (SSR + ISR, on-demand revalidation) | attendees | `/`, `/e/[slug]` | Done (Day 10); Book button wired up on Days 11 and 15 |
 | Booking and checkout with a hold countdown and Razorpay (test mode) | attendees | `/book/[slug]`, `/checkout/[orderId]` | Done (Day 15); payment confirmation by webhook on Day 16 |
 | My Tickets with QR codes and PDF download | attendees | `/tickets` | Done (Day 18) |
-| Scanner PWA with offline mode | volunteers | `/scan` | Planned (Day 20) |
+| Scanner PWA with offline mode | volunteers | `/scan` | Done (Day 20) |
 | Live availability and check-in counter | attendees, organizers | event page, dashboard | Planned (Day 21) |
 | Virtual waiting room | attendees | `/e/[slug]/queue` | Planned (Day 22) |
 | Analytics charts | organizers | dashboard | Planned (Day 25) |
@@ -49,6 +49,7 @@ apps/web/
     (app)/(buyer)/layout.tsx        Login guard for booking and checkout (sends logged-out visitors to /login?next=...)
     (app)/(buyer)/book/[slug]/page.tsx       Choose a quantity of one tier and hold it (POST /events/:id/orders with an Idempotency-Key)
     (app)/(buyer)/tickets/page.tsx  My Tickets: QR codes drawn in the browser (qrcode), grouped by order, Download PDF
+    (app)/scan/layout.tsx, page.tsx  `/scan`: manifest link and theme colour; opens the saved gate or asks for one
     (app)/(buyer)/checkout/[orderId]/page.tsx  Summary, countdown, Razorpay Checkout, "Confirming payment…" polling, expiry
     (app)/layout.tsx                Wraps login, register and the dashboard in <Providers>
     (app)/(auth)/layout.tsx         Centered card layout
@@ -62,6 +63,8 @@ apps/web/
     (app)/(dashboard)/dashboard/orgs/new/page.tsx  Create-club form
     (app)/(dashboard)/dashboard/queues/page.tsx    For admins: gets the API's admin cookie, then opens Bull Board (/admin/queues on the API)
   src/components/ui/                Button, Input/Textarea/Select/Checkbox, Card, Badge, Toast, EmptyState, ConfirmDialog
+  src/components/scan/              GateSetup, GateView (result panel, queue count, Needs a look list), Camera
+  public/                           manifest.webmanifest, sw.js (the scanner's service worker), icons/
   src/components/events/            EventForm, TierEditor, BannerUploader, EventActions (publish/close), StatusBadge
   src/lib/
     api.ts                          API client: in-memory token, refresh-once-and-retry, ApiError
@@ -78,6 +81,7 @@ apps/web/
     next-path.ts (+ .test.ts)       safeNextPath(): where to go after login, same-site paths only
     form-helpers.test.ts            Resolver and date conversion tests
     public-api.ts                   Server-side reads for public pages, cached with `next: { revalidate: 60 }`
+    scan/offline.ts, store.ts, use-gate.ts, register-worker.ts  The scanner: offline rules and sync, IndexedDB, gate state, service worker
     tier-state.ts (+ .test.ts)      On sale / opens at / ended / sold out / closed, for a tier at a given time
   next.config.ts                    Loads the root .env, transpiles @festpass/shared
   tsconfig.json                     Extends the root config, switches to bundler module resolution
@@ -143,12 +147,14 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 
 ## The scanner app
 
-_Planned (Day 20)._
+Usage is in the [project README](../../README.md#scanner-app). How it works:
 
-- Runs on a volunteer's phone as a PWA and reads QR codes with the camera.
-- **Online:** sends each scan to the check-in API, which decides entry.
-- **Offline:** checks the QR signature locally with the public key, rejects tickets already scanned on that phone (IndexedDB), queues the scan and syncs it later.
-- **What offline mode can't guarantee:** two phones that are both offline can each accept the same ticket. After sync, the server keeps the first scan and flags the other as a conflict.
+- **Page** (`src/app/(app)/scan/page.tsx`): a saved gate opens straight away, whatever the auth state, because with no network the session can't be refreshed. Choosing a gate is what needs a login (`components/scan/gate-setup.tsx`). `api.onSessionChange` now reports whether "no session" means logged out or just unreachable, and `useAuth()` carries that as `unreachable`.
+- **Gate logic** (`src/lib/scan/use-gate.ts`): a scan is checked against this phone's history first, because a queued scan is something the server hasn't heard about. Then, if the API is reachable, `POST /checkins` with a 4-second limit; no answer falls back to the offline path with the same `clientScanId`. An accepted scan is also recorded locally, so the phone still refuses it if the network dies a minute later. A timer syncs every 30 s (on reconnect too) and re-downloads the ticket list every 5 minutes.
+- **Offline rules** (`src/lib/scan/offline.ts`): `scanOffline()` and `syncQueue()`, free of React and IndexedDB behind a small `ScanStore` interface, so they are tested with plain objects. `src/lib/scan/store.ts` is the IndexedDB implementation (`idb`, database `festpass-scanner`): manifests, scans, and settings (saved gate, device ID).
+- **Camera** (`components/scan/camera.tsx`): `BrowserQRCodeReader` from `@zxing/browser`, using the rear camera. The same code counts again only after being out of frame for 3 s. If the camera isn't available, a message and the paste field take over. The result panel always says its answer in words as well as colour, and clears after 5 s, so a green panel can't be mistaken for the next person's.
+- **Service worker** (`public/sw.js`, hand-written, registered in `src/lib/scan/register-worker.ts`, production builds only): scope `/scan`. Pages are network-first with the cached `/scan` as fallback; `/_next/static/*`, the manifest and icons are cache-first. It never touches API calls. The first visit loads before the worker is in control, so the page sends the worker the URLs it already loaded.
+- **What offline mode can't guarantee:** two offline phones can each accept the same ticket, and nothing that changed after the last ticket list download is known. After sync, the first scan to reach the server wins and the other phone lists its scan under "Needs a look". The screen says this too.
 
 ## Conventions
 
@@ -180,6 +186,7 @@ Read from the root `.env` (loaded in `next.config.ts`).
 | `NEXT_PUBLIC_API_URL` | Base URL of the API, e.g. `http://localhost:4000/api/v1` (the default). Used by the browser and by Server Components. `NEXT_PUBLIC_` values are inlined into the browser bundle at build time, so they must never be secrets |
 | `REVALIDATE_SECRET` | Shared with the API; `/api/revalidate` only accepts `Authorization: Bearer <this>`. At least 32 characters. Server-only |
 | `S3_PUBLIC_URL` | Where banners are served from; becomes the only `next/image` remote pattern |
+| `NEXT_PUBLIC_TICKET_PUBLIC_KEY` | Verifies ticket signatures in the scanner when offline. From `pnpm keys:generate`. Public by design: it can only verify, and the private key never reaches this app |
 
 `next.config.ts` validates these with Zod whenever `next dev`, `next build` or `next start` loads it, and stops with a list of problems if any is missing or malformed.
 
@@ -194,3 +201,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 13:** `/dashboard/queues` opens the job dashboard: it trades the in-memory login for the API's 15-minute admin cookie (only for `ADMIN_EMAILS`) and navigates to Bull Board on the API.
 - **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.
 - **Day 18:** My Tickets page (`/tickets`) with browser-drawn QR codes and a Download PDF button that fetches a fresh pre-signed link; links to it from checkout and the booking header.
+- **Day 20:** scanner PWA at `/scan`: gate setup, camera scanning with `@zxing/browser` and a paste fallback, online check-in with an offline fallback (signature, event, version and on-this-phone checks; IndexedDB queue via `idb`), ticket list download, sync with a "Needs a look" list, web app manifest and hand-written service worker; the API client tells "unreachable" from "logged out"; Scanner link in the dashboard.

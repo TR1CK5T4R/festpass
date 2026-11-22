@@ -23,6 +23,12 @@
 
 ![Bull Board: an expire-order job, keyed by the order ID, completed with released: true](.github/screenshots/bull-board.png)
 
+<p>
+  <img src=".github/screenshots/scanner-accepted.png" width="260" alt="Scanner: the camera has read a ticket's QR and a green panel says Accepted, with the attendee's name and tier">
+  <img src=".github/screenshots/scanner-offline.png" width="260" alt="Scanner with no network: a green panel says Accepted (offline), an Offline badge shows, and a note says what offline mode can't promise">
+  <img src=".github/screenshots/scanner-conflict.png" width="260" alt="Scanner after syncing: a list named Needs a look shows a ticket that was scanned elsewhere first, by whom and when">
+</p>
+
 </details>
 
 **Deeper docs:** [Frontend README](apps/web/README.md) · [Backend README](apps/api/README.md)
@@ -43,7 +49,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Automatic hold expiry and rate limiting | Done: hold expiry, cancel and a job dashboard (Day 13); token-bucket rate limiting on login, register, booking and uploads (Day 14) |
 | Razorpay payments with idempotent webhooks | Done: checkout in test mode (Day 15); signed, idempotent webhooks with late-payment re-reserve or refund (Day 16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Done: signed QR tickets issued exactly once (Day 17); PDF tickets in private storage, emails sent once through SendGrid templates (or the console in development), and a My Tickets page (Day 18) |
-| Exactly-once check-in and an offline-capable scanner PWA | Check-in API with exactly-once entry, offline batch sync and scan history in MongoDB done (Day 19); scanner PWA planned (Day 20) |
+| Exactly-once check-in and an offline-capable scanner PWA | Done (check-in API on Day 19, scanner PWA on Day 20): see [Scanner app](#scanner-app) |
 | Live availability and check-in dashboards | Planned (Day 21) |
 | Virtual waiting room for flash sales | Planned (Day 22) |
 | Caching and load-tested performance | Planned (Days 23–24) |
@@ -394,7 +400,7 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 - **Verifying anywhere:** `verifyTicket()` uses `@noble/ed25519` (strict RFC 8032, no Node APIs), so the same code runs in the API and on a phone with only the public key. The payload is parsed only after the signature checks out.
 - **No personal data in the QR:** QR codes are signed, not encrypted; anyone with a scanner app can read them. So the payload holds IDs and numbers only, and the gate looks the person up (or, offline, shows the ticket ID).
 - **Issued exactly once:** the `issue-tickets` job locks the order and, only if it is `PAID`, inserts one ticket per unit (`seq` 1..n, a readable random code like `K7QM-X9PA`, `qr_version` 1) with `ON CONFLICT (order_id, seq) DO NOTHING`, then moves `PAID → TICKETED`, all in one transaction.
-- **Revocation:** `POST /tickets/:id/reissue` bumps `qr_version`. The old QR still carries a genuine signature, but its `v` no longer matches the database, which the gate checks online (Day 19). A scanner that is offline can't know about the bump until it syncs: that is the limit of offline revocation.
+- **Revocation:** `POST /tickets/:id/reissue` bumps `qr_version`. The old QR still carries a genuine signature, but its `v` no longer matches the database, which the gate checks online (Day 19). An offline scanner catches it from its downloaded ticket list, so it can only miss a bump made after the last download: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
 
 | | HMAC (shared secret) | Ed25519 (key pair, chosen) |
 |---|---|---|
@@ -428,11 +434,33 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
    ```
    The row lock makes parallel scans take turns, and a scan that waited re-checks the `WHERE` against the winner's commit, so only one gets a row back. The others re-read the ticket and answer `409 ALREADY_CHECKED_IN` with when and by whom it was first scanned.
 - **Permission:** `requireEventPermission('checkin:scan')` finds the club from the event: non-members get `404`.
-- **Offline sync:** `POST /events/:id/checkins/batch` runs scans one at a time in the phones' timestamp order, so the earliest scan of a ticket wins, and returns one result per scan in that order, each with its `clientScanId`. The phone's clock is used only for ordering and the scan's history time, and a future time becomes now.
+- **Offline sync:** `POST /events/:id/checkins/batch` runs scans one at a time in the phone's timestamp order and returns one result per scan in that order, each with its `clientScanId`. The phone's clock is used only for ordering within a batch and the scan's history time, and a future time becomes now. Between phones, the first scan to reach the server wins.
+- **Sending again is safe:** the winning `clientScanId` is stored on the ticket (`checked_in_scan_id`), so a batch re-sent after a lost response gets `ACCEPTED` again, not a false conflict, and adds no history row. The single scan endpoint accepts the same ID: a scan that timed out online and falls back to the queue is recognised at sync.
 
 **Alternatives:** read `checked_in_at` and then update (the same race as overselling: two phones both read "not used"); a Redis lock (Redis isn't the source of truth, and a gate should keep working when it is down); a unique "check-ins" table (works, but one guarded `UPDATE` on the ticket says the same in less).
 
 **Tested by:** `apps/api/test/checkins.test.ts`: one scan accepted and a second `409` with details; ten parallel scans give exactly one `ACCEPTED` and nine `ALREADY_CHECKED_IN` (and with `AND checked_in_at IS NULL` removed by hand, all ten were accepted, so the test does catch it); wrong event, an old QR after a reissue, a tampered QR, plain text and a QR signed with another key are rejected; a batch sent out of order is processed and answered in client-time order; 200 scans fit the request limit.
+
+### Offline scanning and its limits (Day 20)
+
+**Problem:** venue networks fail exactly when a crowd arrives. The gate must keep moving with no server, but a phone alone can't know everything the server knows, so the app has to be honest about the difference.
+
+**Approach** (`apps/web/src/lib/scan/`, extending [the QR design](#forgery-proof-qr-tickets-day-17)):
+- **Same checks, local data:** `scanOffline()` verifies the Ed25519 signature with the public key, checks the event, compares the version with the downloaded ticket list, then refuses a ticket this phone has already scanned (IndexedDB). A pass is queued and shown as "Accepted (offline)".
+- **Ticket list:** at gate open and every 5 minutes, `GET /events/:id/checkins/manifest` downloads `{ id, v, used }` per ticket, with no personal data, so a lost phone gives nothing away. A QR older than the list is revoked. A QR newer than the list, or a ticket not on it, has a valid signature and arrived after the download, so it is let in and the server decides at sync.
+- **Sync:** every 30 seconds and on reconnect, `syncQueue()` sends the queue oldest first in batches of up to 200, saving each answer as it arrives. If a request fails, the rest stay queued.
+- **Conflicts:** two offline phones can each accept one ticket. The guarded `UPDATE` lets the first scan to reach the server win, and the other is listed on that phone under "Needs a look", with when and by whom the ticket was first scanned. Nobody is removed automatically: the person is already inside, so a volunteer follows up.
+- **Staying up:** a hand-written service worker (`public/sw.js`) caches the page and its files but never touches API calls, so they fail honestly. A saved gate opens without waiting for auth: a failed refresh from no network is reported separately from "logged out", and an expired session only stops syncing, not scanning.
+
+| Offline mode can promise | It cannot promise |
+|---|---|
+| The ticket is genuine and for this event | That another offline phone hasn't let the same ticket in |
+| This phone hasn't scanned it | Anything that changed after the last ticket list download (a new reissue, a scan at another gate) |
+| It wasn't replaced or used as of the last download | That the phone's clock is right (scan times come from it) |
+
+**Alternatives:** refusing to scan offline (the gate stops when it is needed most, or volunteers wave people through unchecked); putting the private key or an HMAC secret on phones (a lost phone could mint tickets); phones syncing with each other over Bluetooth or local Wi-Fi (closes the two-phones gap, but is far more to build and fails in new ways); earliest timestamp wins across phones (phone clocks can't be trusted, and the first ticket holder's entry would be undone after the fact).
+
+**Tested by:** `apps/web/src/lib/scan/offline.test.ts` with QR strings signed once by a throwaway key: local checks (forged, tampered, wrong event, older and newer than the list, used, unknown, repeat on this phone) and the queue (oldest first, conflicts and rejections recorded, a failed network keeps scans queued, a 450-scan queue splits into batches and keeps what was answered). `apps/api/test/checkins.test.ts`: a re-sent batch gets the same answer and no extra history row, and the manifest holds no personal fields. Live: see [Scanner app](#scanner-app).
 
 ### Why scans live in MongoDB (Day 19)
 
@@ -450,7 +478,6 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Offline scanning (Day 20)
 - Real-time updates (Day 21)
 - Virtual waiting room (Day 22)
 - Sponsor analytics and privacy (Day 26)
@@ -520,6 +547,7 @@ erDiagram
     text code UK
     int qr_version
     timestamptz checked_in_at
+    text checked_in_scan_id
   }
   payments {
     uuid id PK
@@ -546,6 +574,7 @@ erDiagram
 ```bash
 pnpm install
 cp .env.example .env
+pnpm keys:generate  # prints the ticket signing keys: paste both lines into .env
 pnpm infra:up   # starts the four services and waits until all are healthy
 pnpm db:migrate  # creates the tables and CHECK constraints
 pnpm db:seed     # demo org, users, a published event with three tiers, a sponsor
@@ -581,6 +610,24 @@ Local S3 storage is [SeaweedFS](https://github.com/seaweedfs/seaweedfs), because
 
 The containers use host ports 5433, 27018 and 6380 instead of the defaults, so they don't clash with a Postgres, MongoDB or Redis already installed on your machine; storage is on 9000. Change them in `.env` if needed.
 
+## Scanner app
+
+The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan` (`scanner@festpass.dev` in the seed).
+
+1. Open `/scan` and log in. The dashboard has a Scanner link too.
+2. Pick the event and name your gate, then choose **Open gate**. The phone downloads the event's ticket list; the choice is remembered.
+3. Point the camera at a ticket. Green means accepted, amber already scanned, red invalid or revoked, and the phone vibrates where supported. If the camera can't read a code, paste it into the field below.
+4. Use the browser's **Install** or **Add to Home Screen** to get an app icon.
+
+**With no network** the badge says Offline and scanning continues: each scan is checked on the phone and shown as "Accepted (offline)". Scans sync by themselves when the network returns. Anything the server disagrees with appears under **Needs a look**. **What can offline mode promise?** on the same screen, and [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20), say exactly what it can and can't guarantee.
+
+**Set up and connect once before the gate opens.** Choosing a gate needs the network, and the ticket list is only as fresh as the last download.
+
+**Trying it:**
+- The service worker registers only in production builds, because in development a cached page would hide every code change: run `pnpm build`, then `pnpm --filter @festpass/web start` with the API and worker running. Without it, offline scanning still works, but reloading the page offline doesn't.
+- On a phone, camera access needs HTTPS (or `localhost`), so test through an HTTPS tunnel to the web and API ports, with `NEXT_PUBLIC_API_URL` and `WEB_ORIGINS` set to those URLs.
+- Tested in headless Chrome: two isolated browser profiles as two phones, real tickets, network off and the web server stopped, an offline reload from the service worker, then reconnecting one at a time (one ticket ended accepted on the first phone and flagged on the second). The camera path was tested with a generated video of a real ticket's QR fed in as Chrome's fake camera. **Not yet tried on a real phone.**
+
 ## Environment variables
 
 | Variable | Used by | Description |
@@ -611,7 +658,7 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | `RAZORPAY_WEBHOOK_SECRET` | api, `webhook:simulate` | A long random string you choose (`openssl rand -hex 32`) and paste into Razorpay's webhook settings; every webhook is checked against it. Without it, `POST /webhooks/razorpay` answers `503` |
 | `RAZORPAY_KEY_SECRET` | api, worker | Its secret, never sent anywhere. Set both or neither; without them `POST /orders/:id/pay` answers `503 PAYMENTS_NOT_CONFIGURED` |
 | `TICKET_SIGNING_PRIVATE_KEY` | api, worker | Ed25519 private key that signs ticket QR codes (PKCS#8, base64url). Create a pair with `pnpm keys:generate`. Checked at startup; never sent to the browser or committed. Changing it invalidates every QR already issued |
-| `NEXT_PUBLIC_TICKET_PUBLIC_KEY` | web (scanner, Day 20) | The matching public key (32 raw bytes, base64url) from `pnpm keys:generate`. Public by design: it can only verify |
+| `NEXT_PUBLIC_TICKET_PUBLIC_KEY` | web (scanner) | The matching public key (32 raw bytes, base64url) from `pnpm keys:generate`. Required: the scanner verifies signatures with it when offline. Public by design: it can only verify |
 | `EMAIL_PROVIDER` | worker | `console` (default: nothing is sent; each email is logged and saved as HTML in `.email-previews/`) or `sendgrid` |
 | `EMAIL_FROM` | worker | Sender, e.g. `FestPass <tickets@festpass.dev>`; with SendGrid it must be a verified sender |
 | `SENDGRID_API_KEY` | worker | SendGrid API key (`SG.…`), required when `EMAIL_PROVIDER=sendgrid`; never logged |
@@ -691,7 +738,8 @@ The containers use host ports 5433, 27018 and 6380 instead of the defaults, so t
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
 | GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
-| POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` in the event's club | Body `{ qr, deviceId, gateId? }` (`gateId` defaults to `main`). `200 { result: "ACCEPTED", ticket: { id, code, tierName, attendeeName, checkedInAt } }`. `409 ALREADY_CHECKED_IN` with `details: { ticketId, firstScannedAt, firstScannedBy }`, `409 WRONG_EVENT`, `409 QR_REVOKED`, `400 INVALID_QR`; `404` for non-members |
+| GET | `/api/v1/events/:eventId/checkins/manifest` | Bearer, `checkin:scan` | For offline scanners: `200 { manifest: { eventId, generatedAt, tickets: [{ id, v, used }] } }`, with no personal data |
+| POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` in the event's club | Body `{ qr, deviceId, gateId?, clientScanId? }` (`gateId` defaults to `main`; `clientScanId` recognises this scan if it is sent again). `200 { result: "ACCEPTED", ticket: { id, code, tierName, attendeeName, checkedInAt } }`. `409 ALREADY_CHECKED_IN` with `details: { ticketId, firstScannedAt, firstScannedBy }`, `409 WRONG_EVENT`, `409 QR_REVOKED`, `400 INVALID_QR`; `404` for non-members |
 | POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync. Body `{ deviceId, gateId?, scans: [{ clientScanId, qr, scannedAt }] }` (1–200). `200 { results: [...] }`, one per scan in client-time order, each with `clientScanId` and `result` (`ACCEPTED`, `DUPLICATE`, `INVALID`, `REVOKED`) plus the same details as above |
 | GET | `/api/v1/me/tickets` | Bearer | `200 { tickets: [{ id, code, seq, qrVersion, qr, checkedInAt, orderId, tier, event }] }`, soonest event first. `qr` is the signed `FP1.…` string to show at the gate |
 | GET | `/api/v1/orders/:orderId/tickets-pdf` | Bearer (the order's owner) | `200 { pdf: { url, expiresAt } }`: a fresh 5-minute pre-signed link to the order's private PDF tickets. `404` for someone else's order, `409 PDF_NOT_READY` until the worker has built it |
@@ -727,6 +775,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/web/src/lib/form-helpers.test.ts`: `sharedSchemaResolver` returns exactly what the API accepts and puts the shared schema's messages on the typed-in fields (`pricePaise` -> `price`); `datetime-local` values round-trip through UTC.
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
+- `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
 - `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
 - `packages/shared/test/qr.test.ts`: a QR signed with Node's crypto verifies with `@noble/ed25519`; its payload has only `t`, `e`, `v`, `iat`; a changed payload, another key, a wrong prefix, a missing part, a truncated signature or non-base64url characters all fail; a validly signed payload that isn't a ticket fails. `apps/worker/test/tickets.test.ts`: a paid order gets one ticket per unit numbered 1..n and becomes `TICKETED`; running the job twice, or twice at once, creates them once; an unpaid order gets none. `apps/api/test/tickets.test.ts`: `/me/tickets` returns QR strings that verify with the public key, the same string on every read, owner-only `/tickets/:id`, and reissue moving the QR to `v=2` (not for used tickets).
 - `apps/api/test/webhooks.test.ts`: see [Payment idempotency](#payment-idempotency-and-the-order-state-machine-day-16). `packages/db/test/order-state.test.ts`: the table allows exactly the listed transitions and `transition()` throws for any other before touching the database. `apps/worker/test/refund.test.ts` (Razorpay faked): a refund marks the payment refunded and the expired order `REFUNDED`, running it twice refunds once, and a Razorpay failure changes nothing so the retry can finish.
@@ -795,7 +844,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 17 (Sun 15 Nov): Signed QR tickets
 - [x] Day 18 (Mon 16 Nov): PDF tickets and email delivery
 - [x] Day 19 (Tue 17 Nov): Check-in API and scan events
-- [ ] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
+- [x] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
 - [ ] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
 - [ ] Day 22 (Fri 20 Nov): Virtual waiting room
 - [ ] Day 23 (Sat 21 Nov): Caching and query performance
@@ -1014,6 +1063,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** Postgres decides entry and MongoDB only records history, so a single conditional `UPDATE` makes entry exactly-once and a MongoDB outage can't stop the gate.
 **Verify:** `pnpm test`; with `pnpm dev` running, log in as `scanner@festpass.dev`, POST a ticket's `qr` from `GET /me/tickets` to `/events/:eventId/checkins` twice, then in `mongosh` run `db.scan_events.find()`.
 **Next:** Day 20 builds the scanner PWA: camera scanning, offline verification with the public key, and sync through the batch endpoint.
+
+### Day 20: Scanner PWA with offline mode (2026-11-18)
+**Built:**
+- `/scan`: pick an event and gate, scan with the camera (`@zxing/browser`) or paste a code, with green, amber and red results plus vibration; a web app manifest and a hand-written service worker so it reopens with no network.
+- Offline mode: local signature, event and version checks, a queue and scan history in IndexedDB (`idb`), and `GET /events/:eventId/checkins/manifest` downloading ticket IDs and versions with no personal data, refreshed every 5 minutes.
+- Sync through the batch endpoint every 30 s and on reconnect, with a "Needs a look" list for conflicts. `tickets.checked_in_scan_id` makes re-sending a scan safe.
+
+**Key decision:** between phones, the first scan to reach the server wins and the other is flagged for a person, rather than the earliest timestamp winning, because phone clocks can't be trusted and the first person is already inside.
+**Verify:** `pnpm test`; `pnpm build`, then run the API, worker and `pnpm --filter @festpass/web start`, open `/scan` in two browser profiles, and follow [Scanner app](#scanner-app) with DevTools set to offline.
+**Next:** Day 21 adds real-time updates with Socket.IO: live availability on event pages and a live check-in counter for organizers.
 
 <!-- BUILD-LOG:END -->
 
