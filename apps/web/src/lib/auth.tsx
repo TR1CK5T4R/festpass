@@ -6,7 +6,8 @@ import { api } from './api';
 
 export type AuthState =
   | { status: 'loading'; user: null }
-  | { status: 'anonymous'; user: null }
+  // unreachable: the API couldn't answer, so we don't actually know. Only the gate scanner cares.
+  | { status: 'anonymous'; user: null; unreachable: boolean }
   | { status: 'authenticated'; user: PublicUser };
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -21,11 +22,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>({ status: 'loading', user: null });
 
   useEffect(() => {
-    const unsubscribe = api.onSessionChange((session) =>
+    const unsubscribe = api.onSessionChange((session, unreachable) =>
       setState(
         session
           ? { status: 'authenticated', user: session.user }
-          : { status: 'anonymous', user: null },
+          : { status: 'anonymous', user: null, unreachable },
       ),
     );
     void api.refresh();

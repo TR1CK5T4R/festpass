@@ -74,6 +74,21 @@ describe('api client', () => {
     expect(sessions).toEqual([null]);
   });
 
+  it('tells "the API is unreachable" apart from "logged out"', async () => {
+    const fetch = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    const client = createApiClient({
+      baseUrl: 'http://api.test',
+      fetch: fetch as typeof globalThis.fetch,
+    });
+    const seen: unknown[][] = [];
+    client.onSessionChange((...args) => seen.push(args));
+
+    await expect(client.refresh()).resolves.toBe(false);
+    expect(seen).toEqual([[null, true]]);
+  });
+
   it('shares one refresh between requests that fail at the same time', async () => {
     // Both endpoints reject requests without a token, so both start a refresh at once.
     const needsToken = (init: RequestInit) =>

@@ -37,11 +37,12 @@ export interface ApiClientOptions {
 export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: ApiClientOptions) {
   let accessToken: string | null = null;
   let refreshing: Promise<boolean> | null = null;
-  const listeners = new Set<(session: Session) => void>();
+  const listeners = new Set<(session: Session, unreachable: boolean) => void>();
 
-  function setSession(session: Session) {
+  /** `unreachable`: no session because the API couldn't answer, which doesn't mean logged out. */
+  function setSession(session: Session, unreachable = false) {
     accessToken = session?.accessToken ?? null;
-    for (const listener of listeners) listener(session);
+    for (const listener of listeners) listener(session, unreachable);
   }
 
   function send(path: string, method: string, body: unknown, headers: Record<string, string> = {}) {
@@ -81,10 +82,10 @@ export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: 
     refreshing ??= (async () => {
       try {
         const res = await send('/auth/refresh', 'POST', undefined);
-        setSession(res.ok ? ((await res.json()) as AuthResponse) : null);
+        setSession(res.ok ? ((await res.json()) as AuthResponse) : null, res.status >= 500);
         return res.ok;
       } catch {
-        setSession(null);
+        setSession(null, true);
         return false;
       } finally {
         refreshing = null;
@@ -126,7 +127,7 @@ export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: 
       }
     },
     /** Called with the new session (or null) whenever login, refresh or logout changes it. */
-    onSessionChange(listener: (session: Session) => void) {
+    onSessionChange(listener: (session: Session, unreachable: boolean) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
