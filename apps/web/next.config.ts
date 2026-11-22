@@ -15,6 +15,8 @@ const parsed = z
     NEXT_PUBLIC_API_URL: z.url().default('http://localhost:4000/api/v1'),
     REVALIDATE_SECRET: z.string().min(32),
     S3_PUBLIC_URL: z.url(),
+    // The gate scanner checks ticket signatures with this when offline. From `pnpm keys:generate`.
+    NEXT_PUBLIC_TICKET_PUBLIC_KEY: z.string().length(43),
   })
   .safeParse(process.env);
 if (!parsed.success) {
