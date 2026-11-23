@@ -1,12 +1,11 @@
-import { formatPaise, type PublicEventView, type TierView } from '@festpass/shared';
+import type { PublicEventView } from '@festpass/shared';
 import type { Metadata } from 'next';
 import Image from 'next/image';
-import Link from 'next/link';
 import { notFound } from 'next/navigation';
+import { LiveTiers } from '@/components/events/live-tiers';
 import { Badge } from '@/components/ui/badge';
 import { formatEventTime } from '@/lib/dates';
 import { getPublicEvent } from '@/lib/public-api';
-import { tierState } from '@/lib/tier-state';
 
 export const revalidate = 60;
 
@@ -40,7 +39,6 @@ export default async function EventPage({ params }: Props) {
   const event = await getPublicEvent((await params).slug);
   if (!event) notFound(); // unknown slug or a draft: the API answers 404 for both
 
-  const now = new Date();
   return (
     <article className="flex flex-col gap-8">
       <div className="relative aspect-[3/1] overflow-hidden rounded-card bg-gradient-to-br from-brand-600 to-brand-700">
@@ -89,56 +87,8 @@ export default async function EventPage({ params }: Props) {
         <h2 id="tickets" className="mb-4 text-xl font-semibold">
           Tickets
         </h2>
-        <ul className="grid gap-4 sm:grid-cols-2">
-          {event.tiers.map((tier) => (
-            <li key={tier.id}>
-              <TierCard tier={tier} event={event} now={now} />
-            </li>
-          ))}
-        </ul>
-        {/* The design rule for cached pages: availability here is a hint, never a promise. */}
-        <p className="mt-4 text-xs text-muted">
-          Availability on this page is refreshed at least once a minute. Every booking is checked
-          against live stock, so you are never sold a ticket that is already gone.
-        </p>
+        <LiveTiers event={event} renderedAt={new Date().toISOString()} />
       </section>
     </article>
-  );
-}
-
-function TierCard({ tier, event, now }: { tier: TierView; event: PublicEventView; now: Date }) {
-  const state = tierState(tier, event, now);
-  const note = {
-    'on-sale': `${tier.available} left · up to ${tier.perUserLimit} per person`,
-    'not-yet': `On sale from ${state.kind === 'not-yet' ? formatEventTime(state.opensAt) : ''}`,
-    ended: 'Sales for this ticket have ended',
-    'sold-out': 'Sold out',
-    closed: 'Booking is closed',
-  }[state.kind];
-
-  return (
-    <div className="flex h-full flex-col gap-3 rounded-card border border-line bg-surface p-5">
-      <div className="flex items-baseline justify-between gap-3">
-        <h3 className="font-semibold">{tier.name}</h3>
-        <p className="text-lg font-semibold">
-          {tier.pricePaise === 0 ? 'Free' : formatPaise(tier.pricePaise)}
-        </p>
-      </div>
-      <p className="text-sm text-muted">{note}</p>
-      {state.kind === 'on-sale' ? (
-        // A plain link: the public page stays server-rendered with no auth code; logging in (if
-        // needed) and holding the tickets happen on the booking page.
-        <Link
-          href={`/book/${event.slug}?tier=${tier.id}`}
-          className="mt-auto rounded-control bg-brand-600 px-4 py-2 text-center text-sm font-medium text-white hover:bg-brand-700"
-        >
-          Book
-        </Link>
-      ) : (
-        <span className="mt-auto rounded-control bg-brand-600/50 px-4 py-2 text-center text-sm font-medium text-white">
-          {state.kind === 'sold-out' ? 'Sold out' : 'Unavailable'}
-        </span>
-      )}
-    </div>
   );
 }
