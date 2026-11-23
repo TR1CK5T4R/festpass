@@ -117,6 +117,8 @@ export function createApiClient({ baseUrl, fetch: fetchFn = globalThis.fetch }: 
   return {
     request,
     refresh,
+    /** For the WebSocket handshake, which can't go through request(). */
+    accessToken: () => accessToken,
     login: (input: LoginInput) => startSession('/auth/login', input),
     register: (input: RegisterInput) => startSession('/auth/register', input),
     async logout() {

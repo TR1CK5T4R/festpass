@@ -7,6 +7,7 @@ import { useEffect } from 'react';
 import { BannerUploader } from '@/components/events/banner-uploader';
 import { EventActions } from '@/components/events/event-actions';
 import { EventForm } from '@/components/events/event-form';
+import { LiveCheckins } from '@/components/events/live-checkins';
 import { StatusBadge } from '@/components/events/status-badge';
 import { TierEditor } from '@/components/events/tier-editor';
 import { Card } from '@/components/ui/card';
@@ -75,6 +76,7 @@ export default function EventPage() {
         </p>
       )}
 
+      {event.status !== 'DRAFT' && <LiveCheckins eventId={event.id} />}
       <BannerUploader event={event} canEdit={canEdit} onChange={setEvent} />
       <TierEditor event={event} canEdit={canEdit} onChanged={reload} />
       <Card>
