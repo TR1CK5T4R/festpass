@@ -16,7 +16,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | Booking and checkout with a hold countdown and Razorpay (test mode) | attendees | `/book/[slug]`, `/checkout/[orderId]` | Done (Day 15); payment confirmation by webhook on Day 16 |
 | My Tickets with QR codes and PDF download | attendees | `/tickets` | Done (Day 18) |
 | Scanner PWA with offline mode | volunteers | `/scan` | Done (Day 20) |
-| Live availability and check-in counter | attendees, organizers | event page, dashboard | Planned (Day 21) |
+| Live availability and check-in counter | attendees, organizers | event page, dashboard | Done (Day 21) |
 | Virtual waiting room | attendees | `/e/[slug]/queue` | Planned (Day 22) |
 | Analytics charts | organizers | dashboard | Planned (Day 25) |
 | Sponsor dashboard and booth-mode scanning | sponsors, volunteers | `/sponsor`, `/scan` | Planned (Day 26) |
@@ -63,6 +63,7 @@ apps/web/
     (app)/(dashboard)/dashboard/orgs/new/page.tsx  Create-club form
     (app)/(dashboard)/dashboard/queues/page.tsx    For admins: gets the API's admin cookie, then opens Bull Board (/admin/queues on the API)
   src/components/ui/                Button, Input/Textarea/Select/Checkbox, Card, Badge, Toast, EmptyState, ConfirmDialog
+  src/components/events/live-tiers.tsx, live-checkins.tsx  Tier cards that update live; the organizer's counter and scan feed
   src/components/scan/              GateSetup, GateView (result panel, queue count, Needs a look list), Camera
   public/                           manifest.webmanifest, sw.js (the scanner's service worker), icons/
   src/components/events/            EventForm, TierEditor, BannerUploader, EventActions (publish/close), StatusBadge
@@ -75,6 +76,7 @@ apps/web/
     form-resolver.ts                sharedSchemaResolver: convert form values, validate with a shared schema
     dates.ts                        datetime-local <-> UTC ISO, date formatting
     upload.ts                       Banner upload: presign, XHR POST to storage with progress, PATCH bannerKey
+    use-event-socket.ts             useEventSocket(): joins an event's room, rejoins after a reconnect, refreshes an expired token
     use-api-data.ts                 useApiData(path): load, reload and replace one API resource
     booking.ts (+ .test.ts)         bookingKey(): one Idempotency-Key per booking attempt, kept in sessionStorage for retries
     razorpay.ts                     Loads checkout.js once and opens Razorpay Checkout
@@ -125,6 +127,13 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 - **Banner uploader:** checks type and size first (fast feedback; storage enforces both anyway), shows the chosen image immediately from an object URL, uploads with `XMLHttpRequest` (fetch has no upload progress) and shows a progress bar, then "Checking the file…" while the API runs HeadObject. Storage errors are read from S3's XML.
 - **Publish and close** use `ConfirmDialog`, built on the native `<dialog>` (`showModal()` traps focus and handles Escape). If the API refuses (`NO_TIERS`, `EVENT_IN_PAST`), its message is shown in the dialog.
 - **Members** (`/dashboard/members`): add by email with a role (`addMemberSchema`; an unknown email shows the API's message under the field), change roles inline, remove with confirmation. Demoting the last owner shows the API's `LAST_OWNER` message and the select goes back. Controls are hidden without `member:manage` (from the shared permission matrix), but the API checks every call.
+
+## Live updates (Day 21)
+
+- **The hook** (`src/lib/use-event-socket.ts`): `useEventSocket({ eventId, room, session, onAvailability, onScan, onJoined })` returns `connecting`, `live`, `reconnecting` or `denied`. It uses WebSocket only and loads `socket.io-client` on demand, so the event page's first paint doesn't pay for it. Rooms belong to a connection, so it joins again on every connect.
+- **Staying signed in:** the staff room passes a `session` with the current token and a refresh function. Socket.IO doesn't retry after the server refuses a token or ends a connection whose token expired, so the hook refreshes the token and connects again. If the refresh fails, the status is `denied`. Public pages pass no session, so they never load the auth client.
+- **Event page** (`components/events/live-tiers.tsx`): a client component that starts from the server-rendered tiers and overlays live numbers, so without JavaScript or a connection the page still works. Joining sends the current numbers at once, which replaces a cached page's up-to-a-minute-old ones. The note under the tiers says whether the numbers are live.
+- **Organizer dashboard** (`components/events/live-checkins.tsx`): loads `GET /events/:id/checkins/summary`, then raises the counter on each `ACCEPTED` scan and adds each scan to the feed. It loads the summary again after a reconnect, because scans sent while disconnected never arrive.
 
 ## Rendering strategy
 
@@ -202,3 +211,4 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.
 - **Day 18:** My Tickets page (`/tickets`) with browser-drawn QR codes and a Download PDF button that fetches a fresh pre-signed link; links to it from checkout and the booking header.
 - **Day 20:** scanner PWA at `/scan`: gate setup, camera scanning with `@zxing/browser` and a paste fallback, online check-in with an offline fallback (signature, event, version and on-this-phone checks; IndexedDB queue via `idb`), ticket list download, sync with a "Needs a look" list, web app manifest and hand-written service worker; the API client tells "unreachable" from "logged out"; Scanner link in the dashboard.
+- **Day 21:** live updates: `useEventSocket`, tier cards on `/e/[slug]` that update live (moved into the `LiveTiers` client component), a check-in counter and scan feed on the organizer's event page, `api.accessToken()` for the WebSocket handshake.

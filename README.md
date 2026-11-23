@@ -21,6 +21,8 @@
 
 ![My Tickets: each ticket's QR drawn in the browser, its code, and a Download PDF button per order](.github/screenshots/my-tickets.png)
 
+![Organizer dashboard: a live check-in counter and a feed of recent scans with result, tier, gate and time](.github/screenshots/live-checkins.png)
+
 ![Bull Board: an expire-order job, keyed by the order ID, completed with released: true](.github/screenshots/bull-board.png)
 
 <p>
@@ -50,7 +52,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Razorpay payments with idempotent webhooks | Done: checkout in test mode (Day 15); signed, idempotent webhooks with late-payment re-reserve or refund (Day 16) |
 | Ed25519-signed QR tickets, PDF + email delivery | Done: signed QR tickets issued exactly once (Day 17); PDF tickets in private storage, emails sent once through SendGrid templates (or the console in development), and a My Tickets page (Day 18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Done (check-in API on Day 19, scanner PWA on Day 20): see [Scanner app](#scanner-app) |
-| Live availability and check-in dashboards | Planned (Day 21) |
+| Live availability and check-in dashboards | Done (Day 21): tiers update live on event pages, and organizers get a live counter and scan feed |
 | Virtual waiting room for flash sales | Planned (Day 22) |
 | Caching and load-tested performance | Planned (Days 23–24) |
 | Organizer analytics, sponsor booth analytics and reports | Planned (Days 25–26) |
@@ -119,7 +121,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | Layer | Technology |
 |---|---|
 | Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3, react-hook-form 7.91 with the shared Zod schemas |
-| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO |
+| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO 4.8 with `@socket.io/redis-adapter` |
 | Jobs | BullMQ worker |
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
 | Storage and email | S3-compatible storage via AWS SDK v3 (SeaweedFS 4.50 locally, Cloudflare R2 in production), SendGrid dynamic templates |
@@ -475,10 +477,35 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 
 **Tested by:** `checkins.test.ts` checks the collection is really `timeseries`, the copied fields, and that a failing write leaves the check-in in place with a retry job queued; `apps/worker/test/scan-events.test.ts` checks the retry writes the event at its original time. Live against the dev stack: with the MongoDB container stopped, a scan was accepted in 25 ms; after restarting it, the worker wrote the missed event, 16 s after the scan.
 
+### Real-time updates (Day 21)
+
+**Problem:** people watching a sale want to see tickets disappear, and organizers want to see the gate. But a flash sale is the worst moment to add load: one message per booking, sent to every open page, would multiply the traffic exactly when the system is busiest.
+
+**Approach** (`apps/api/src/sockets/`):
+- **A change is a signal, not data.** After a booking, cancel or late payment commits (and from the worker, after an expiry), `announceAvailabilityChange()` publishes just the event ID on a Redis channel. The worker has no Socket.IO server, so this is how it reaches the API. A Redis failure here is logged and ignored: a live number must never slow down or fail a booking.
+- **Throttled per event, across all instances.** The first change claims `avail:throttle:{eventId}` with `SET NX PX 500`. Whichever API instance wins waits out the window, then reads the numbers from Postgres and sends one update. So there are at most about 2 updates a second however many instances run, and the update includes every change made during the window, including the last.
+- **Redis adapter.** `io.to(room).emit()` only reaches sockets on the same process. With `@socket.io/redis-adapter` it also goes to the other instances, so a visitor connected to instance 1 hears about a booking made through instance 2.
+- **Rooms.** Anyone may join `event:{id}:public`, which only ever receives `{ eventId, tiers: [{ id, available }] }`. `event:{id}:staff` needs a valid token and membership of the event's club, and carries scans with ticket IDs but no names. Clients ask for "public" or "staff" and the server builds the room name, so nobody can name a room of their choosing.
+- **Authentication.** The access token goes in the WebSocket handshake. No token means anonymous; a bad or expired one is refused, and the client refreshes it and connects again. A connection is ended when its token expires, so the membership check runs again and someone removed from a club loses the feed within 15 minutes.
+- **WebSocket only.** Long polling would need sticky sessions, because all its requests must reach the same instance. If WebSockets are blocked, the page still shows its cached numbers and says so.
+- **Catching up.** Rooms belong to a connection, so the client rejoins on every reconnect. Joining a public room sends the current numbers, shared for a second, so a crowd reconnecting together costs one query per instance per event rather than one each. The dashboard reloads its summary from the API after a reconnect.
+
+| | Polling | Socket.IO (chosen) |
+|---|---|---|
+| Cost when nothing changes | Every open page keeps asking | An idle connection |
+| Freshness | The polling interval | About half a second |
+| Load during a sale | Grows with the crowd, on the same API that takes bookings | One read per window per event, then one broadcast |
+| New moving parts | None | The adapter, and handling for reconnects |
+
+**Limits:** availability on the page is still a hint, and booking checks live stock. If Redis is down, live updates stop and the page keeps its last numbers, while bookings carry on through Postgres. How many connections one instance can hold hasn't been measured yet.
+
+**Alternatives:** debouncing (it waits for a quiet moment, and a flash sale has none, so people would see nothing until the rush ended); a throttle in each process with no shared claim (the limit would grow with every instance); sending the numbers in each signal (messages can arrive out of order, so a late one could overwrite newer numbers; reading at send time can't).
+
+**Tested by:** `apps/api/test/availability-throttle.test.ts` with fake timers: 1,000 changes in a second give at most 2 sends in that second, the last change is never lost, each event has its own limit, and two instances share one. `apps/api/test/realtime.test.ts` with `socket.io-client` against real servers: a stranger or anonymous client can't join the staff room and hears nothing; bad, expired and foreign tokens are refused; a token's expiry ends the connection; public messages hold only numbers; a draft's numbers stay private; a message crosses between two instances (with the adapter removed by hand, that test fails). Live: two browsers and two API instances, where a booking in one browser changed the other without a reload, and so did the worker expiring a hold. With one instance stopped, the page said it was no longer live, then reconnected and caught up on a booking it had missed.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Real-time updates (Day 21)
 - Virtual waiting room (Day 22)
 - Sponsor analytics and privacy (Day 26)
 - AI copilot safety (Day 27)
@@ -738,6 +765,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | GET | `/api/v1/events/:slug` | none | A published or closed event with its org and tiers, each with `available = capacity - soldCount`. Drafts: `404` |
 | POST | `/api/v1/events/:eventId/orders` | Bearer, `Idempotency-Key: <uuid>` | Body `{ items: [{ tierId, qty 1–10 }] }` (1–10 items, each tier once). Holds the tickets and creates a `PENDING` order that expires after `HOLD_MINUTES`: `201 { order: { id, eventId, status, amountPaise, expiresAt, items: [{ tierId, tierName, qty, unitPricePaise }] } }`. `409 SOLD_OUT` (names the tier, nothing is held), `409 PER_USER_LIMIT` (counts the user's pending, paid and ticketed orders), `409 SALE_NOT_STARTED` / `SALE_ENDED` / `EVENT_CLOSED`, `404` for drafts, `400` for a tier of another event, `422 IDEMPOTENCY_KEY_REUSED` |
 | GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
+| GET | `/api/v1/events/:eventId/checkins/summary` | Bearer, `checkin:scan` | For the dashboard: `200 { summary: { checkedIn, totalTickets, recent: [{ ticketId, tierName, gateId, result, offline, ts }] } }`, latest 20 scans |
 | GET | `/api/v1/events/:eventId/checkins/manifest` | Bearer, `checkin:scan` | For offline scanners: `200 { manifest: { eventId, generatedAt, tickets: [{ id, v, used }] } }`, with no personal data |
 | POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` in the event's club | Body `{ qr, deviceId, gateId?, clientScanId? }` (`gateId` defaults to `main`; `clientScanId` recognises this scan if it is sent again). `200 { result: "ACCEPTED", ticket: { id, code, tierName, attendeeName, checkedInAt } }`. `409 ALREADY_CHECKED_IN` with `details: { ticketId, firstScannedAt, firstScannedBy }`, `409 WRONG_EVENT`, `409 QR_REVOKED`, `400 INVALID_QR`; `404` for non-members |
 | POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync. Body `{ deviceId, gateId?, scans: [{ clientScanId, qr, scannedAt }] }` (1–200). `200 { results: [...] }`, one per scan in client-time order, each with `clientScanId` and `result` (`ACCEPTED`, `DUPLICATE`, `INVALID`, `REVOKED`) plus the same details as above |
@@ -776,6 +804,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
+- `apps/api/test/realtime.test.ts` and `apps/api/test/availability-throttle.test.ts`: see [Real-time updates](#real-time-updates-day-21). `apps/worker/test/expiry.test.ts` also checks that an expiry and the sweeper announce the change.
 - `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
 - `packages/shared/test/qr.test.ts`: a QR signed with Node's crypto verifies with `@noble/ed25519`; its payload has only `t`, `e`, `v`, `iat`; a changed payload, another key, a wrong prefix, a missing part, a truncated signature or non-base64url characters all fail; a validly signed payload that isn't a ticket fails. `apps/worker/test/tickets.test.ts`: a paid order gets one ticket per unit numbered 1..n and becomes `TICKETED`; running the job twice, or twice at once, creates them once; an unpaid order gets none. `apps/api/test/tickets.test.ts`: `/me/tickets` returns QR strings that verify with the public key, the same string on every read, owner-only `/tickets/:id`, and reissue moving the QR to `v=2` (not for used tickets).
 - `apps/api/test/webhooks.test.ts`: see [Payment idempotency](#payment-idempotency-and-the-order-state-machine-day-16). `packages/db/test/order-state.test.ts`: the table allows exactly the listed transitions and `transition()` throws for any other before touching the database. `apps/worker/test/refund.test.ts` (Razorpay faked): a refund marks the payment refunded and the expired order `REFUNDED`, running it twice refunds once, and a Razorpay failure changes nothing so the retry can finish.
@@ -845,7 +874,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 18 (Mon 16 Nov): PDF tickets and email delivery
 - [x] Day 19 (Tue 17 Nov): Check-in API and scan events
 - [x] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
-- [ ] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
+- [x] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
 - [ ] Day 22 (Fri 20 Nov): Virtual waiting room
 - [ ] Day 23 (Sat 21 Nov): Caching and query performance
 - [ ] Day 24 (Sun 22 Nov): Load testing with k6
@@ -1073,6 +1102,16 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** between phones, the first scan to reach the server wins and the other is flagged for a person, rather than the earliest timestamp winning, because phone clocks can't be trusted and the first person is already inside.
 **Verify:** `pnpm test`; `pnpm build`, then run the API, worker and `pnpm --filter @festpass/web start`, open `/scan` in two browser profiles, and follow [Scanner app](#scanner-app) with DevTools set to offline.
 **Next:** Day 21 adds real-time updates with Socket.IO: live availability on event pages and a live check-in counter for organizers.
+
+### Day 21: Real-time updates with Socket.IO (2026-11-19)
+**Built:**
+- Socket.IO on the API's HTTP server with the Redis adapter, WebSocket only: anonymous clients may join `event:{id}:public`, and `event:{id}:staff` needs a valid token and club membership.
+- Availability updates after a booking, cancel, late payment or expiry, throttled per event across all instances to about 2 a second, with the numbers read from Postgres at send time.
+- Live tier cards on event pages, a live check-in counter and scan feed on the organizer dashboard, `GET /events/:eventId/checkins/summary`, and a `useEventSocket` hook that rejoins on reconnect and refreshes an expired token.
+
+**Key decision:** a trailing throttle with its claim in Redis, rather than debouncing or a limit per process, because a flash sale never goes quiet and the limit must not grow with the number of API instances.
+**Verify:** `pnpm test`; with `pnpm dev` running, open `/e/mait-alumni-meet-2026` in two browsers and book in one: the other updates without a reload.
+**Next:** Day 22 builds the virtual waiting room: queued visitors are admitted to booking a few at a time, with their place shown live.
 
 <!-- BUILD-LOG:END -->
 

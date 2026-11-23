@@ -29,7 +29,8 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Razorpay orders and webhooks, order state machine | `apps/api`, `apps/worker` | Planned (Days 15–16) |
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
 | Check-in and scan events | `apps/api`, `packages/mongo`, `packages/db`, `apps/worker` | Done (Day 19) |
-| Socket.IO live updates, waiting room | `apps/api`, `apps/worker` | Planned (Days 21–22) |
+| Socket.IO live updates | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 21) |
+| Waiting room | `apps/api`, `apps/worker` | Planned (Day 22) |
 | Caching, load tests, analytics, sponsor reports | all | Planned (Days 23–26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
 | Security pass, metrics, Dockerfiles, CI | all | Planned (Day 28) |
@@ -40,7 +41,7 @@ Only rows marked **Done** exist in the code. The sections below that are marked 
 
 | Process | Started by | Job |
 |---|---|---|
-| **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and, later, Socket.IO connections. Kept fast: anything slow goes to a queue. |
+| **API** (`apps/api`) | `pnpm dev`, port 4000 | Handles HTTP requests under `/api/v1` and Socket.IO connections. Kept fast: anything slow goes to a queue. |
 | **Worker** (`apps/worker`) | `pnpm dev` | Runs background jobs from Redis queues (BullMQ). Today: hold expiry (`expire-order` per order and `sweep-expired-orders` every minute, Day 13), inventory reconciliation every minute (Day 12), refunds (Day 16), ticket issuing (`issue-tickets`, Day 17), ticket, expiry and refund emails with PDF tickets (Day 18) and scan event retries (`write-scan-event`, Day 19). An outage of MongoDB only delays those retries. Later: issuing tickets, building PDFs, sending email, refunds, reports. |
 
 They are separate processes so a slow PDF or a stuck email can never slow down booking, and each can be restarted or scaled on its own. Both shut down cleanly on SIGTERM so deploys don't cut work off halfway.
@@ -83,7 +84,9 @@ apps/api/
   src/modules/orgs/                 routes, controller, service (slugs, member rules), repository (last-owner lock)
   src/modules/events/               routes (org + public), controller, service (rules), repository (keyset list, tier row lock), status.ts (transitions)
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
-  src/modules/checkins/             routes (GET /events/:eventId/checkins/manifest, POST /checkins, /batch), controller, service (verify, decide, persist the scan)
+  src/sockets/index.ts              attachSockets(): Redis adapter, handshake auth, rooms, emitScan()
+  src/sockets/availability.ts       announceChange(), the throttle, the shared read of current numbers
+  src/modules/checkins/             routes (GET /events/:eventId/checkins/manifest, /summary, POST /checkins, /batch), controller, service (verify, decide, persist the scan)
   src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue, GET /orders/:id/tickets-pdf), service (QR signed on read, owner checks, PDF link), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
   src/modules/payments/             gateway.ts (Razorpay SDK, the only file that calls it), service (startPayment), repository, routes (POST /orders/:orderId/pay)
@@ -91,7 +94,7 @@ apps/api/
                                     gate.ts (Lua reserve/release, 50 ms limit), inventory.ts (syncInventory after publish and tier changes), stats.ts (booking counters)
   src/modules/uploads/              routes, controller, service (presignBanner with the permission check, verifyBanner with HeadObject)
   src/app.ts                        Builds the Express app (no listening); readiness checks can be injected
-  src/server.ts                     Connects Mongo, listens on API_PORT, graceful shutdown
+  src/server.ts                     Connects Mongo, listens on API_PORT, attaches sockets, graceful shutdown
   scripts/storage-init.ts           Creates the bucket, public-read policy for banners, CORS for WEB_ORIGINS (idempotent)
   scripts/upload-banner.ts          The whole upload flow from the command line, as the web app will do it
   test/                             auth, orgs, events, orders (concurrency, idempotency), uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
@@ -139,6 +142,7 @@ packages/shared/
   src/money.ts           rupeesToPaise (string parsing, never float maths), paiseToRupees, formatPaise
   src/redis-keys.ts      redisKeys.inventory / userHeld (shared by API and worker)
   src/queues.ts          QUEUES and JOBS names, job payload schemas (the worker validates them)
+  src/realtime.ts        joinEventSchema and the Socket.IO event and payload types
   src/checkins.ts        checkinSchema, batchCheckinSchema, SCAN_RESULTS and the check-in response types
   src/server.ts          @festpass/shared/server (Node only): createQueue() with retry/backoff defaults, releaseRedisStock(),
                          loadTicketPrivateKey(), encodeTicket() / createTicketSigner() (Node crypto Ed25519)
@@ -288,6 +292,14 @@ Done (Days 17 and 19).
 - `GET /events/:eventId/checkins/manifest` (`listTicketsForGate()`) gives scanners `{ id, v, used }` for every ticket of the event, with no personal data, so they can catch revoked and used tickets offline. Offline behaviour and its limits are in the [frontend README](../web/README.md#the-scanner-app).
 - Every scan, whatever the result, is then written to MongoDB (`ScanEvent`, a time-series collection in `packages/mongo`), not awaited, so the gate doesn't wait. The attendee's college, branch, year and tier are copied in. If the write fails, a `write-scan-event` job (10 attempts, exponential backoff from 5 s) retries it from the worker; the check-in is never undone.
 
+### Live updates (`src/sockets/`)
+
+- **Connecting:** Socket.IO shares the API's HTTP server, WebSocket only, because long polling would need sticky sessions. The handshake reads `auth.token`: none means anonymous, and a bad or expired one is refused with `UNAUTHORIZED`. A connection is ended when its token expires, so membership is checked again.
+- **Rooms:** clients send `event:join` with `{ eventId, room: 'public' | 'staff' }` and get `{ ok }` back; the server builds the room name. Staff needs a token and club membership (`NOT_FOUND` otherwise, whether or not the event exists).
+- **Availability:** after a commit, `announceChange()` (or `announceAvailabilityChange()` in the worker) publishes the event ID on `availability-changed`. Each instance receives it and tries `SET avail:throttle:{eventId} NX PX 500`. The winner waits out the window, reads the numbers from Postgres, and broadcasts through the Redis adapter. Joining a public room sends the current numbers, shared for a second per instance, and drafts have none.
+- **Scans:** `emitScan()` sends each scan to the staff room with its ticket ID, tier, gate and result. It isn't throttled, since each scan is a feed entry and the room is only staff. A re-sent scan isn't announced twice.
+- **Shutdown:** `sockets.close()` ends all connections and closes the HTTP server, because open WebSockets would otherwise keep `server.close()` waiting. Clients reconnect to another instance.
+
 ## Engineering rules
 
 - Postgres is the source of truth for capacity and money; Redis is only a fast gate and cache.
@@ -324,6 +336,7 @@ Done (Days 17 and 19).
 | GET | `/api/v1/events` | none | Published, not-yet-ended events; `?cursor=&limit=&orgId=` |
 | GET | `/api/v1/events/:slug` | none | Published or closed event with tiers and `available`; drafts `404` |
 | POST | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | Verified on the raw body; `200 { handled, outcome }`; `400 INVALID_SIGNATURE` / `INVALID_PAYLOAD`; `503 WEBHOOKS_NOT_CONFIGURED` |
+| GET | `/api/v1/events/:eventId/checkins/summary` | Bearer, `checkin:scan` | `200 { summary: { checkedIn, totalTickets, recent } }`; MongoDB being down empties `recent`, not the counts |
 | GET | `/api/v1/events/:eventId/checkins/manifest` | Bearer, `checkin:scan` | `200 { manifest: { eventId, generatedAt, tickets: [{ id, v, used }] } }`, no personal data |
 | POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` | `200 { result: "ACCEPTED", ticket }`; `409 ALREADY_CHECKED_IN` / `WRONG_EVENT` / `QR_REVOKED`; `400 INVALID_QR` |
 | POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync: `200 { results }`, one per scan in client-time order |
@@ -389,3 +402,4 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
 - **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
 - **Day 20:** for the scanner: `GET /events/:eventId/checkins/manifest` and `listTicketsForGate()`; `tickets.checked_in_scan_id` (migration) and an optional `clientScanId` on `POST /checkins`, so a re-sent scan gets its original answer instead of a false conflict.
+- **Day 21:** Socket.IO with `@socket.io/redis-adapter`, handshake auth, public and staff rooms, a per-event throttle with its claim in Redis, availability announced from booking, cancel, late payment and the worker's expiry and sweep; scans sent to the staff room; `GET /events/:eventId/checkins/summary`; shutdown closes sockets first.
