@@ -15,6 +15,6 @@ export function findOrderForPayment(
   if (or.length === 0) return null;
   return prisma.order.findFirst({
     where: { OR: or },
-    select: { id: true, amountPaise: true, status: true },
+    select: { id: true, eventId: true, amountPaise: true, status: true },
   });
 }

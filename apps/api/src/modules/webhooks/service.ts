@@ -5,6 +5,7 @@ import { env } from '../../config/env.js';
 import { AppError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { paymentsQueue, ticketsQueue } from '../../lib/queues.js';
+import { announceChange } from '../../sockets/availability.js';
 import * as repo from './repository.js';
 import { isValidSignature } from './signature.js';
 
@@ -93,6 +94,8 @@ export async function handleRazorpayWebhook(
     { paymentId: payment.id, orderId: order.id, event, outcome },
     'razorpay webhook processed',
   );
+  // A payment after the hold ran out takes its tickets back off sale.
+  if (outcome.kind === 'paid' && outcome.late) announceChange(order.eventId);
 
   // Follow-up jobs come from what is stored now, not from what this delivery did. If queuing failed
   // last time (Redis down), the answer was a 500, Razorpay delivers again, the payment is a

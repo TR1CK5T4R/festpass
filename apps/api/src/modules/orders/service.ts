@@ -21,6 +21,7 @@ import { ordersQueue } from '../../lib/queues.js';
 import { releaseInRedis, reserveInRedis, withTimeout, type GateItem } from './gate.js';
 import { syncInventory } from './inventory.js';
 import * as repo from './repository.js';
+import { announceChange } from '../../sockets/availability.js';
 import { bookingStats } from './stats.js';
 
 const keyReused = () =>
@@ -168,7 +169,10 @@ export async function createOrder(
   if (result === 'key-reused') throw keyReused();
   if (result.outcome === 'booked') {
     bookingStats.booked++;
-    if (result.answer.status === 201) await scheduleExpiry(result.answer.body.order, requestId);
+    if (result.answer.status === 201) {
+      await scheduleExpiry(result.answer.body.order, requestId);
+      announceChange(eventId);
+    }
   }
   if (result.outcome === 'rejected') bookingStats.rejectedAtPostgres++;
   return { answer: result.answer, replayed: result.outcome === 'replayed' };
@@ -196,6 +200,7 @@ export async function cancelOrder(userId: string, orderId: string): Promise<Orde
   }
   // After the commit: the gate gets the stock back too (never throws; reconciliation is the backup).
   await releaseInRedis(released.eventId, released.userId, released.items);
+  announceChange(released.eventId);
   return (await repo.findOrder(orderId))!.view;
 }
 

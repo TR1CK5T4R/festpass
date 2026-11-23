@@ -24,7 +24,7 @@ import {
   type EmailTemplate,
   type TicketQrPayload,
 } from '@festpass/shared';
-import { releaseRedisStock } from '@festpass/shared/server';
+import { announceAvailabilityChange, releaseRedisStock } from '@festpass/shared/server';
 import type { Job, Queue } from 'bullmq';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
@@ -75,7 +75,9 @@ async function queueEmail(deps: WorkerDeps, job: string, orderId: string, reques
  */
 async function releaseInRedis(deps: WorkerDeps, hold: ReleasedHold) {
   try {
-    await releaseRedisStock(need(deps, 'redis'), hold.eventId, hold.userId, hold.items);
+    const redis = need(deps, 'redis');
+    await releaseRedisStock(redis, hold.eventId, hold.userId, hold.items);
+    await announceAvailabilityChange(redis, hold.eventId);
   } catch (err) {
     deps.log.warn(
       { err: (err as Error).message, orderId: hold.orderId },

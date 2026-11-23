@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { prisma } from '@festpass/db';
 import { reserveTickets } from '@festpass/db/booking';
 import { truncateAll } from '@festpass/db/testing';
-import { JOBS, QUEUES, redisKeys } from '@festpass/shared';
+import { AVAILABILITY_CHANNEL, JOBS, QUEUES, redisKeys } from '@festpass/shared';
 import { createQueue } from '@festpass/shared/server';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
@@ -77,6 +77,25 @@ const state = async (orderId: string) => ({
 });
 
 describe('hold expiry', () => {
+  it('tells the API that tickets went back on sale, for expiry and for the sweeper', async () => {
+    const subscriber = redis.duplicate();
+    const announced: string[] = [];
+    subscriber.on('message', (_channel, id) => announced.push(id));
+    await subscriber.subscribe(AVAILABILITY_CHANNEL);
+    try {
+      const expiring = await hold(-1, 1);
+      await expireOrder({ orderId: expiring.order.id }, deps);
+      await vi.waitFor(() => expect(announced).toEqual([eventId]));
+
+      await expireOrder({ orderId: expiring.order.id }, deps); // nothing released, nothing to say
+      await hold(-1, 1);
+      await sweepExpiredOrders(deps);
+      await vi.waitFor(() => expect(announced).toEqual([eventId, eventId]));
+    } finally {
+      subscriber.disconnect();
+    }
+  });
+
   it('a 2-second hold expires through its delayed job and the tickets go back on sale', async () => {
     const queue = createQueue(QUEUES.orders, redis);
     const worker = new Worker(QUEUES.orders, (job) => processJob(job, deps), {
