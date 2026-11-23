@@ -23,6 +23,7 @@
     "@festpass/db": "workspace:*",
     "@festpass/mongo": "workspace:*",
     "@festpass/shared": "workspace:*",
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcrypt": "^6.0.0",
     "bullmq": "^6.5.4",
     "express": "^5.3.0",
@@ -31,6 +32,7 @@
     "pino": "^10.4.0",
     "pino-http": "^11.0.0",
     "razorpay": "^2.9.8",
+    "socket.io": "^4.8.4",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -38,6 +40,7 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/supertest": "^7.2.1",
+    "socket.io-client": "^4.8.4",
     "supertest": "^7.3.1",
     "tsx": "^4.23.15",
     "vitest": "^5.0.5"

@@ -52,16 +52,18 @@ function signAccessToken(userId: string): string {
   });
 }
 
-/** Returns the user ID, or throws 401. Pinning the algorithm stops "alg: none" and algorithm-swap tricks. */
-export function verifyAccessToken(token: string): string {
+/** The token's user and expiry, or throws 401. Pinning the algorithm stops "alg: none" and algorithm-swap tricks. */
+export function verifyAccessTokenClaims(token: string): { userId: string; exp?: number } {
   try {
     const payload = jwt.verify(token, env.JWT_ACCESS_SECRET, { algorithms: ['HS256'] });
     if (typeof payload === 'string' || !payload.sub) throw new Error('missing subject');
-    return payload.sub;
+    return { userId: payload.sub, exp: payload.exp };
   } catch {
     throw new UnauthorizedError('Invalid or expired access token', 'INVALID_ACCESS_TOKEN');
   }
 }
+
+export const verifyAccessToken = (token: string) => verifyAccessTokenClaims(token).userId;
 
 /** 256 random bits for the browser, plus the hash and expiry that go into the database. */
 function newRefreshToken() {
