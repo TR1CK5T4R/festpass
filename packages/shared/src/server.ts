@@ -2,7 +2,7 @@ import { createPrivateKey, createPublicKey, sign, type KeyObject } from 'node:cr
 import { Queue, type ConnectionOptions } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { signedPart, type TicketQrPayload } from './qr.ts';
-import { redisKeys } from './redis-keys.ts';
+import { AVAILABILITY_CHANNEL, redisKeys } from './redis-keys.ts';
 
 // Server-only helpers (BullMQ, ioredis), imported as @festpass/shared/server by the API and the worker.
 // Kept out of the main entry so the web app's bundle never pulls them in.
@@ -49,6 +49,15 @@ export function releaseRedisStock(
     redisKeys.userHeld(eventId, userId, i.tierId),
   ]);
   return redis.eval(RELEASE, keys.length, ...keys, ...items.map((i) => i.qty));
+}
+
+/**
+ * Tells every API instance that an event's numbers changed, after the change has committed. It carries
+ * no numbers: whoever sends the update reads them from Postgres, so it is never out of date. The worker
+ * uses this too, because it has no Socket.IO server of its own.
+ */
+export function announceAvailabilityChange(redis: Redis, eventId: string): Promise<unknown> {
+  return redis.publish(AVAILABILITY_CHANNEL, eventId);
 }
 
 /** Reads the private ticket key (PKCS#8 DER, base64url, from `pnpm keys:generate`). Throws if it isn't Ed25519. */

@@ -7,7 +7,12 @@ export const redisKeys = {
   /** Tickets a user holds in a tier, for the per-user limit. */
   userHeld: (eventId: string, userId: string, tierId: string) =>
     `usr:${eventId}:${userId}:${tierId}`,
+  /** Held for one throttle window by whichever API instance will send the event's next update. */
+  availabilityThrottle: (eventId: string) => `avail:throttle:${eventId}`,
 };
+
+/** Pub/sub channel: "this event's availability changed". The message is just the event ID. */
+export const AVAILABILITY_CHANNEL = 'availability-changed';
 
 /**
  * Object keys in the storage bucket. Only orgs/{org}/events/{event}/banner/... is publicly readable (the bucket
