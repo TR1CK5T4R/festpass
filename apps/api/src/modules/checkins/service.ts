@@ -1,5 +1,10 @@
-import { checkInTicket, findTicketForGate, listTicketsForGate } from '@festpass/db/tickets';
-import { recordScanEvent, type ScanEventData } from '@festpass/mongo';
+import {
+  checkInTicket,
+  countCheckins,
+  findTicketForGate,
+  listTicketsForGate,
+} from '@festpass/db/tickets';
+import { recentScanEvents, recordScanEvent, type ScanEventData } from '@festpass/mongo';
 import {
   JOBS,
   verifyTicket,
@@ -7,13 +12,16 @@ import {
   type BatchScanResult,
   type CheckedInTicket,
   type CheckinInput,
+  type CheckinSummary,
   type FirstScan,
   type GateManifest,
+  type LiveScan,
 } from '@festpass/shared';
 import { ticketPublicKey } from '@festpass/shared/server';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
 import { scansQueue } from '../../lib/queues.js';
+import { emitScan } from '../../sockets/index.js';
 
 const publicKey = ticketPublicKey(env.TICKET_SIGNING_PRIVATE_KEY);
 
@@ -66,6 +74,14 @@ async function scan(qr: string, context: ScanContext): Promise<ScanOutcome> {
   const outcome = await decide(qr, context, fields);
   // A batch re-sent after a lost response: same answer as the first time, and history already has it.
   if (outcome.result === 'ACCEPTED' && outcome.replayed) return outcome;
+  emitScan(context.eventId, {
+    ticketId: fields.ticketId,
+    tierName: fields.tierName,
+    gateId: context.gateId,
+    result: outcome.result,
+    offline: context.offline,
+    ts: context.ts.toISOString(),
+  });
   // Not awaited: the volunteer at the gate must not wait for analytics, and the decision is already
   // committed. shortcut: a write in flight when the process stops is lost; drain them on shutdown if
   // scan counts ever need to be exact across deploys.
@@ -209,5 +225,29 @@ export async function gateManifest(eventId: string): Promise<GateManifest> {
     eventId,
     generatedAt: new Date().toISOString(),
     tickets: await listTicketsForGate(eventId),
+  };
+}
+
+const RECENT_SCANS = 20;
+
+/** For the organizer's dashboard. MongoDB being down costs the feed, not the counter from Postgres. */
+export async function checkinSummary(eventId: string): Promise<CheckinSummary> {
+  const [counts, recent] = await Promise.all([
+    countCheckins(eventId),
+    recentScanEvents(eventId, RECENT_SCANS).catch((err: Error) => {
+      logger.warn({ err: err.message, eventId }, 'could not read recent scans');
+      return [];
+    }),
+  ]);
+  return {
+    ...counts,
+    recent: recent.map((s): LiveScan => ({
+      ticketId: s.ticketId,
+      tierName: s.tierName,
+      gateId: s.meta.gateOrBoothId,
+      result: s.result,
+      offline: s.offline,
+      ts: s.ts.toISOString(),
+    })),
   };
 }

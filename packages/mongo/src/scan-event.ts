@@ -53,3 +53,8 @@ export const ScanEvent = mongoose.model<ScanEventData>('ScanEvent', scanEventSch
 export async function recordScanEvent(event: ScanEventData): Promise<void> {
   await ScanEvent.create(event);
 }
+
+/** The latest scans of an event, newest first. */
+export function recentScanEvents(eventId: string, limit: number) {
+  return ScanEvent.find({ 'meta.eventId': eventId }).sort({ ts: -1 }).limit(limit).lean();
+}

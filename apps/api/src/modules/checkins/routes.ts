@@ -14,6 +14,7 @@ export function checkinRoutes(): Router {
     requireEventPermission('checkin:scan'),
   );
   router.get('/manifest', controller.manifest);
+  router.get('/summary', controller.summary);
   router.post('/', validate({ body: checkinSchema }), controller.checkIn);
   router.post('/batch', validate({ body: batchCheckinSchema }), controller.batch);
   return router;

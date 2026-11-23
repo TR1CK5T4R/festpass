@@ -102,3 +102,13 @@ export async function listTicketsForGate(eventId: string) {
   });
   return tickets.map((t) => ({ id: t.id, v: t.qrVersion, used: t.checkedInAt !== null }));
 }
+
+/** How many of an event's tickets exist and how many have been used, for the live counter. */
+export async function countCheckins(eventId: string) {
+  const where = { order: { eventId } };
+  const [totalTickets, checkedIn] = await Promise.all([
+    prisma.ticket.count({ where }),
+    prisma.ticket.count({ where: { ...where, checkedInAt: { not: null } } }),
+  ]);
+  return { totalTickets, checkedIn };
+}

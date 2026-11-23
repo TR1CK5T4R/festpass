@@ -39,3 +39,7 @@ export const batch: RequestHandler = async (req, res) => {
 export const manifest: RequestHandler = async (req, res) => {
   res.json({ manifest: await checkins.gateManifest(String(req.params.eventId)) });
 };
+
+export const summary: RequestHandler = async (req, res) => {
+  res.json({ summary: await checkins.checkinSummary(String(req.params.eventId)) });
+};
