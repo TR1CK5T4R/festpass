@@ -58,6 +58,14 @@ export function findEventOrg(eventId: string) {
   return prisma.event.findUnique({ where: { id: eventId }, select: { orgId: true } });
 }
 
+/** Live numbers for the event page. Drafts have no public page, so they have no numbers either. */
+export function findTierAvailability(eventId: string) {
+  return prisma.ticketTier.findMany({
+    where: { eventId, event: { status: { not: 'DRAFT' } } },
+    select: { id: true, capacity: true, soldCount: true },
+  });
+}
+
 export function findPublicEventBySlug(slug: string) {
   return prisma.event.findFirst({
     // Drafts never leave the organizer dashboard.
