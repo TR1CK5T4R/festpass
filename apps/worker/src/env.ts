@@ -30,6 +30,8 @@ const schema = z
         return z.NEVER;
       }
     }),
+    // Signs waiting-room admission tokens (same value as the API, which verifies them).
+    ADMISSION_TOKEN_SECRET: z.string().min(32),
     // Storage for ticket PDFs (the same bucket as banners, under a private prefix).
     S3_ENDPOINT: z.url(),
     S3_REGION: z.string().min(1).default('us-east-1'),

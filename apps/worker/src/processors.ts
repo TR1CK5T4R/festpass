@@ -1,4 +1,9 @@
-import { findOverdueHolds, releaseHold, type ReleasedHold } from '@festpass/db/booking';
+import {
+  findOverdueHolds,
+  findWaitingRoomEvent,
+  releaseHold,
+  type ReleasedHold,
+} from '@festpass/db/booking';
 import {
   claimEmail,
   findOrderForEmail,
@@ -24,7 +29,13 @@ import {
   type EmailTemplate,
   type TicketQrPayload,
 } from '@festpass/shared';
-import { announceAvailabilityChange, releaseRedisStock } from '@festpass/shared/server';
+import {
+  activeWaitingRooms,
+  admitNext,
+  announceAvailabilityChange,
+  closeWaitingRoom,
+  releaseRedisStock,
+} from '@festpass/shared/server';
 import type { Job, Queue } from 'bullmq';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
@@ -46,6 +57,7 @@ export interface WorkerDeps {
   /** Where follow-up emails are queued; left out in tests that don't care about them. */
   emailsQueue?: Queue;
   webUrl?: string;
+  admissionSecret?: string;
 }
 
 function need<K extends keyof WorkerDeps>(deps: WorkerDeps, key: K): NonNullable<WorkerDeps[K]> {
@@ -177,6 +189,38 @@ export async function reconcile(deps: WorkerDeps) {
   // Drift means the gate and Postgres disagreed: a failed release, a timed-out script, a restart.
   if (drift.length > 0) deps.log.warn({ drift }, 'fixed inventory drift in redis');
   return { fixed: drift.length };
+}
+
+/**
+ * One second's admissions for one event. The rate is read here on every tick, so a change from the
+ * organizer applies within a second. A line whose sale is over, or whose queue mode was turned off, is
+ * deleted: the people in it find out on their next status check (sale over, or go straight to booking).
+ */
+async function admitOneRoom(eventId: string, redis: Redis, secret: string) {
+  const event = await findWaitingRoomEvent(eventId);
+  const now = new Date();
+  if (!event || !event.queueMode || event.status !== 'PUBLISHED' || now >= event.saleEndsAt) {
+    await closeWaitingRoom(redis, eventId);
+    return 0;
+  }
+  // The organizer moved the sale later: keep everyone's place, because a token now would expire unused.
+  if (now < event.saleStartsAt) return 0;
+  return (await admitNext(redis, eventId, event.admitRatePerSec, secret)).length;
+}
+
+/** admit-waiting-rooms: each second, serves every event with people in line. One failure can't stop the rest. */
+export async function admitWaitingRooms(deps: WorkerDeps) {
+  const redis = need(deps, 'redis');
+  const secret = need(deps, 'admissionSecret');
+  const eventIds = await activeWaitingRooms(redis);
+  const results = await Promise.allSettled(eventIds.map((id) => admitOneRoom(id, redis, secret)));
+  let admitted = 0;
+  results.forEach((result, i) => {
+    if (result.status === 'fulfilled') admitted += result.value;
+    else
+      deps.log.error({ err: String(result.reason), eventId: eventIds[i] }, 'could not admit a room');
+  });
+  return { admitted };
 }
 
 // ---- Emails ----
@@ -343,6 +387,8 @@ export function processJob(job: Job, deps: WorkerDeps) {
       return sendOrderExpired(job.data, jobDeps);
     case JOBS.sendRefundIssued:
       return sendRefundIssued(job.data, jobDeps);
+    case JOBS.admitWaitingRooms:
+      return admitWaitingRooms(jobDeps);
     default:
       throw new Error(`unknown job ${job.name}`);
   }

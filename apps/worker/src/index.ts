@@ -14,7 +14,7 @@ import { s3TicketStorage } from './storage.js';
 
 // Background jobs, in their own process so a slow job can never slow down the API: hold expiry (each
 // order's own delayed job plus a sweeper), refunds, ticket issuing, ticket emails and inventory
-// reconciliation.
+// reconciliation, and admitting people from waiting rooms.
 
 const env = loadEnv();
 const logger = pino({ level: env.LOG_LEVEL, base: { process: 'worker' } });
@@ -58,6 +58,7 @@ const deps: WorkerDeps = {
   signTicket: createTicketSigner(env.TICKET_SIGNING_PRIVATE_KEY),
   emailsQueue: queues.emails,
   webUrl: env.PUBLIC_WEB_URL,
+  admissionSecret: env.ADMISSION_TOKEN_SECRET,
 };
 
 // Repeating jobs. upsertJobScheduler is idempotent: restarting the worker (or running two) keeps one
@@ -71,6 +72,18 @@ await queues.orders.upsertJobScheduler(
   JOBS.sweepExpiredOrders,
   { every: 60_000 },
   { name: JOBS.sweepExpiredOrders },
+);
+
+// One schedule serving every active waiting room each second, rather than one per event: with nothing
+// to start or stop per event, a failed start can never leave a line that nobody is serving. The next tick
+// is the retry, and a job per second would flood the history, so ticks aren't retried or kept.
+await queues[QUEUES.waitingRoom].upsertJobScheduler(
+  JOBS.admitWaitingRooms,
+  { every: 1000 },
+  {
+    name: JOBS.admitWaitingRooms,
+    opts: { attempts: 1, removeOnComplete: true, removeOnFail: { count: 100 } },
+  },
 );
 
 // Each queue gets its own worker so a backlog of one (say, slow emails) can't delay the others.
