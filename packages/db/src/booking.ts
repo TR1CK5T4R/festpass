@@ -267,3 +267,17 @@ function isUniqueViolation(err: unknown): boolean {
     (err.meta as AdapterMeta | undefined)?.driverAdapterError?.cause?.originalCode === '23505'
   );
 }
+
+/** What the waiting room needs to know about an event, read by the API (join) and the worker (admit). */
+export function findWaitingRoomEvent(eventId: string) {
+  return prisma.event.findUnique({
+    where: { id: eventId },
+    select: {
+      status: true,
+      saleStartsAt: true,
+      saleEndsAt: true,
+      queueMode: true,
+      admitRatePerSec: true,
+    },
+  });
+}

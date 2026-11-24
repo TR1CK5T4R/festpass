@@ -9,10 +9,19 @@ export const redisKeys = {
     `usr:${eventId}:${userId}:${tierId}`,
   /** Held for one throttle window by whichever API instance will send the event's next update. */
   availabilityThrottle: (eventId: string) => `avail:throttle:${eventId}`,
+  /** The waiting line: a sorted set of user IDs, scored by when they joined. */
+  waitingRoom: (eventId: string) => `wr:${eventId}`,
+  /** A user's admission token, kept until it expires so a reload or a missed message can't lose it. */
+  admission: (eventId: string, userId: string) => `wr:admitted:${eventId}:${userId}`,
+  /** Events with someone in line, so the worker's tick doesn't have to look at every event. */
+  activeWaitingRooms: 'wr:active',
 };
 
 /** Pub/sub channel: "this event's availability changed". The message is just the event ID. */
 export const AVAILABILITY_CHANNEL = 'availability-changed';
+
+/** Pub/sub channel: "this user was just admitted". The message is JSON { eventId, userId }, no token. */
+export const QUEUE_ADMITTED_CHANNEL = 'queue-admitted';
 
 /**
  * Object keys in the storage bucket. Only orgs/{org}/events/{event}/banner/... is publicly readable (the bucket

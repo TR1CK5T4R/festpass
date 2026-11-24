@@ -40,6 +40,8 @@ export interface CheckinSummary {
 export interface ServerToClientEvents {
   availability: (update: AvailabilityUpdate) => void;
   scan: (scan: LiveScan) => void;
+  /** Sent to one user's own room. No token in it: the page fetches that over HTTP, like after a reload. */
+  'queue:admitted': (message: { eventId: string }) => void;
 }
 
 export interface ClientToServerEvents {

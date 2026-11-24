@@ -11,6 +11,7 @@ export const QUEUES = {
   tickets: 'tickets',
   emails: 'emails',
   scans: 'scans',
+  waitingRoom: 'waiting-room',
 } as const;
 
 export const JOBS = {
@@ -23,6 +24,7 @@ export const JOBS = {
   sendOrderExpired: 'send-order-expired',
   sendRefundIssued: 'send-refund-issued',
   writeScanEvent: 'write-scan-event',
+  admitWaitingRooms: 'admit-waiting-rooms',
 } as const;
 
 /** The emails an order can get; each is sent at most once per order (email_log). */

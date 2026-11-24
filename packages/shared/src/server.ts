@@ -4,6 +4,8 @@ import type { Redis } from 'ioredis';
 import { signedPart, type TicketQrPayload } from './qr.ts';
 import { AVAILABILITY_CHANNEL, redisKeys } from './redis-keys.ts';
 
+export * from './waiting-room-server.ts';
+
 // Server-only helpers (BullMQ, ioredis), imported as @festpass/shared/server by the API and the worker.
 // Kept out of the main entry so the web app's bundle never pulls them in.
 
