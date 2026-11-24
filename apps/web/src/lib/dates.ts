@@ -19,6 +19,9 @@ export function fromLocalInput(local: string): string {
 export const formatDateTime = (iso: string) =>
   new Date(iso).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 
+export const formatTime = (iso: string) =>
+  new Date(iso).toLocaleTimeString('en-IN', { timeStyle: 'short' });
+
 /**
  * For server-rendered pages: "Fri, 4 Dec, 2026, 10:00 am IST". Fixed to India time, because the
  * server's own time zone (often UTC in production) says nothing about where the reader is.

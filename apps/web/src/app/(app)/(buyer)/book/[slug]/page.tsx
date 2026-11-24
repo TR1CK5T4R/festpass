@@ -1,15 +1,21 @@
 'use client';
 
-import { formatPaise, type OrderView, type PublicEventView } from '@festpass/shared';
+import {
+  ADMISSION_HEADER,
+  formatPaise,
+  type OrderView,
+  type PublicEventView,
+  type QueueStatus,
+} from '@festpass/shared';
 import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Select } from '@/components/ui/input';
-import { api } from '@/lib/api';
+import { api, isApiError } from '@/lib/api';
 import { bookingKey } from '@/lib/booking';
-import { formatDateTime } from '@/lib/dates';
+import { formatDateTime, formatTime } from '@/lib/dates';
 import { errorMessage } from '@/lib/form-errors';
 import { useApiData } from '@/lib/use-api-data';
 
@@ -22,9 +28,28 @@ export default function BookPage() {
   const [qty, setQty] = useState(1);
   const [submitting, setSubmitting] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  // Null until a queue-mode event's status is known; events without a queue never need it.
+  const [admission, setAdmission] = useState<QueueStatus | null>(null);
+  const eventId = data?.event.id;
+  const queueMode = data?.event.queueMode;
+  const queuePath = `/queue/${slug}?tier=${tierId}`;
+
+  useEffect(() => {
+    if (!queueMode) return;
+    api.request<QueueStatus>(`/events/${eventId}/queue/status`).then(
+      (status) => {
+        if (status.state === 'admitted' || status.state === 'not_required') setAdmission(status);
+        else router.replace(queuePath);
+      },
+      // Sale ended, API down: let the page show. Booking answers with the real reason.
+      () => setAdmission({ state: 'not_required' }),
+    );
+  }, [queueMode, eventId, queuePath, router]);
 
   if (error) return <p className="text-sm text-danger">{errorMessage(error)}</p>;
-  if (!data) return <p className="text-sm text-muted">Loading…</p>;
+  if (!data || (data.event.queueMode && !admission)) {
+    return <p className="text-sm text-muted">Loading…</p>;
+  }
   const { event } = data;
   const tier = event.tiers.find((t) => t.id === tierId);
   if (!tier) {
@@ -48,11 +73,16 @@ export default function BookPage() {
       const key = bookingKey(slug, tier!.id, qty);
       const { order } = await api.request<{ order: OrderView }>(`/events/${event.id}/orders`, {
         method: 'POST',
-        headers: { 'Idempotency-Key': key },
+        headers: {
+          'Idempotency-Key': key,
+          ...(admission?.state === 'admitted' && { [ADMISSION_HEADER]: admission.token }),
+        },
         body: { items: [{ tierId: tier!.id, qty }] },
       });
       router.replace(`/checkout/${order.id}`);
     } catch (err) {
+      // The token ran out while choosing, or queue mode was just turned on.
+      if (isApiError(err, 'ADMISSION_REQUIRED')) return router.replace(queuePath);
       setFailure(errorMessage(err));
       setSubmitting(false);
     }
@@ -99,6 +129,11 @@ export default function BookPage() {
       <Button onClick={() => void reserve()} loading={submitting} disabled={tier.available === 0}>
         {failure ? 'Try again' : 'Hold my tickets'}
       </Button>
+      {admission?.state === 'admitted' && (
+        <p className="text-sm text-muted">
+          You&apos;re in. Book by {formatTime(admission.expiresAt)} to keep your place.
+        </p>
+      )}
       <p className="text-xs text-muted">
         Your tickets are held for a few minutes while you pay. Unpaid holds are released
         automatically.

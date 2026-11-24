@@ -22,6 +22,8 @@ export interface EventSocketOptions {
   session?: { token: () => string | null; refresh: () => Promise<boolean> };
   onAvailability?: (update: AvailabilityUpdate) => void;
   onScan?: (scan: LiveScan) => void;
+  /** The logged-in user has been let out of this event's waiting room. */
+  onQueueAdmitted?: () => void;
   /** After every successful join, so a page can catch up on what it missed while disconnected. */
   onJoined?: () => void;
 }
@@ -73,6 +75,10 @@ export function useEventSocket(options: EventSocketOptions): SocketStatus {
       });
       socket.on('availability', (update) => latest.current.onAvailability?.(update));
       socket.on('scan', (scan) => latest.current.onScan?.(scan));
+      // A user's room is theirs across all events, so check this message is about this one.
+      socket.on('queue:admitted', (message) => {
+        if (message.eventId === eventId) latest.current.onQueueAdmitted?.();
+      });
       // Rooms belong to a connection, so every reconnect has to join again.
       socket.on('connect', () => {
         socket?.emit('event:join', { eventId, room }, (result) => {
