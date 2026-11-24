@@ -30,7 +30,7 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Signed QR tickets, PDFs, email | `packages/shared`, `apps/worker` | Planned (Days 17–18) |
 | Check-in and scan events | `apps/api`, `packages/mongo`, `packages/db`, `apps/worker` | Done (Day 19) |
 | Socket.IO live updates | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 21) |
-| Waiting room | `apps/api`, `apps/worker` | Planned (Day 22) |
+| Waiting room | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 22) |
 | Caching, load tests, analytics, sponsor reports | all | Planned (Days 23–26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
 | Security pass, metrics, Dockerfiles, CI | all | Planned (Day 28) |
@@ -52,7 +52,7 @@ They are separate processes so a slow PDF or a stuck email can never slow down b
 |---|---|---|
 | **PostgreSQL 16** | Users, orgs, events, tiers, orders, payments, tickets | The source of truth for money and capacity. It has transactions, row locks and CHECK constraints, so overselling is blocked by the database itself. |
 | **MongoDB 7** | Scan events (time-series), copilot conversations | Many small append-only writes, read through aggregations for analytics. |
-| **Redis 7** | Inventory gate (`inv:*`, `usr:*`, `req:*`, Day 12), job queues (BullMQ, Days 12–13), rate-limit buckets (`rl:*`, Day 14); later the waiting room | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking, and every number in it is reset from Postgres. |
+| **Redis 7** | Inventory gate (`inv:*`, `usr:*`, `req:*`, Day 12), job queues (BullMQ, Days 12–13), rate-limit buckets (`rl:*`, Day 14), the waiting room (`wr:*`, Day 22) | Fast, temporary state. Redis can say "no" quickly, but never has the final say on a booking, and every number in it is reset from Postgres. |
 | **S3 storage** (SeaweedFS locally, R2 in production) | Event banners (public prefix), ticket PDFs (private prefix, pre-signed GETs only, Day 18) | S3-compatible object storage. The browser uploads directly with pre-signed URLs, so file bytes never pass through the API. |
 
 Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 6380 and 9000, bound to 127.0.0.1.
@@ -86,6 +86,7 @@ apps/api/
   src/modules/orders/               routes (POST /events/:eventId/orders, GET /orders/:orderId, POST /orders/:orderId/cancel), controller (replays stored answers), service (request hash, on-sale checks, gate, compensation, expiry job, cancel), repository
   src/sockets/index.ts              attachSockets(): Redis adapter, handshake auth, rooms, emitScan()
   src/sockets/availability.ts       announceChange(), the throttle, the shared read of current numbers
+  src/modules/queue/                routes (POST /events/:eventId/queue/join, GET /queue/status), controller, service (sale checks, status)
   src/modules/checkins/             routes (GET /events/:eventId/checkins/manifest, /summary, POST /checkins, /batch), controller, service (verify, decide, persist the scan)
   src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue, GET /orders/:id/tickets-pdf), service (QR signed on read, owner checks, PDF link), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
@@ -300,6 +301,14 @@ Done (Days 17 and 19).
 - **Scans:** `emitScan()` sends each scan to the staff room with its ticket ID, tier, gate and result. It isn't throttled, since each scan is a feed entry and the room is only staff. A re-sent scan isn't announced twice.
 - **Shutdown:** `sockets.close()` ends all connections and closes the HTTP server, because open WebSockets would otherwise keep `server.close()` waiting. Clients reconnect to another instance.
 
+### Waiting room (`src/modules/queue/`, `packages/shared/src/waiting-room-server.ts`)
+
+- **Joining:** `joinWaitingRoom()` runs a Lua script: unless the user already has an admission, `ZADD NX wr:{eventId}` with Redis `TIME` as the score, and `SADD wr:active`, both at once. The API only accepts a join while the sale is open and `queueMode` is on, and uses the fail-fast Redis client with a 500 ms limit (`503 QUEUE_UNAVAILABLE`).
+- **Admitting:** the worker's `admit-waiting-rooms` job (its own queue, every second, no retries because the next tick is the retry) reads each active event's settings from Postgres. If queue mode is off, the event is closed or the sale has ended, `closeWaitingRoom()` deletes the line. If the sale has moved later, it waits. Otherwise `admitNext()` reads the next `admitRatePerSec` users, signs their tokens, removes them and stores the tokens in one Lua step, then publishes on `queue-admitted`.
+- **Notifying:** an authenticated socket joins `user:{id}` on connection. Each API instance subscribes to `queue-admitted` and sends `queue:admitted { eventId }` with `io.local`, because every instance receives the message and going through the adapter would repeat it per instance.
+- **Booking:** `assertOnSale()` in `modules/orders/service.ts` calls `isValidAdmission()` after the sale checks and before the Redis gate, so an unadmitted request never takes stock. It runs after `findStoredAnswer()`, so a retry of a finished booking still gets its order. It only checks the signature, so it needs no Redis.
+- **Reading:** `waitingRoomPlace()` uses `MULTI`, because admission moves a user between keys and two separate reads could miss them. `X-Admission-Token` is redacted in `lib/logger.ts` and allowed in `middleware/cors.ts`.
+
 ## Engineering rules
 
 - Postgres is the source of truth for capacity and money; Redis is only a fast gate and cache.
@@ -378,7 +387,7 @@ Tests use Vitest and Supertest against `createApp()`, without opening a port. `t
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `TICKET_SIGNING_PRIVATE_KEY` (parsed as an Ed25519 key at startup), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN` (`<burst>/<per minute>`), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `TICKET_SIGNING_PRIVATE_KEY` (parsed as an Ed25519 key at startup), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN`, `RATE_LIMIT_QUEUE_JOIN` (`<burst>/<per minute>`), `ADMISSION_TOKEN_SECRET` (32+ characters, different from `JWT_ACCESS_SECRET`, also read by the worker), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -402,4 +411,5 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
 - **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
 - **Day 20:** for the scanner: `GET /events/:eventId/checkins/manifest` and `listTicketsForGate()`; `tickets.checked_in_scan_id` (migration) and an optional `clientScanId` on `POST /checkins`, so a re-sent scan gets its original answer instead of a false conflict.
+- **Day 22:** waiting room: `POST /events/:eventId/queue/join`, `GET /queue/status`, the `admit-waiting-rooms` job, admission tokens checked in `createOrder`, user rooms and `queue:admitted`; `ADMISSION_TOKEN_SECRET` and `RATE_LIMIT_QUEUE_JOIN`; fixed the console email provider crashing on `order-expired` and `refund-issued` previews.
 - **Day 21:** Socket.IO with `@socket.io/redis-adapter`, handshake auth, public and staff rooms, a per-event throttle with its claim in Redis, availability announced from booking, cancel, late payment and the worker's expiry and sweep; scans sent to the staff room; `GET /events/:eventId/checkins/summary`; shutdown closes sockets first.

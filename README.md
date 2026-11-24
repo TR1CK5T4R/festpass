@@ -19,6 +19,8 @@
 
 ![Checkout: the held tickets, the total and a countdown to the end of the hold](.github/screenshots/checkout.png)
 
+![Waiting room: your place in line and the estimated wait](.github/screenshots/waiting-room.png)
+
 ![My Tickets: each ticket's QR drawn in the browser, its code, and a Download PDF button per order](.github/screenshots/my-tickets.png)
 
 ![Organizer dashboard: a live check-in counter and a feed of recent scans with result, tier, gate and time](.github/screenshots/live-checkins.png)
@@ -53,7 +55,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Ed25519-signed QR tickets, PDF + email delivery | Done: signed QR tickets issued exactly once (Day 17); PDF tickets in private storage, emails sent once through SendGrid templates (or the console in development), and a My Tickets page (Day 18) |
 | Exactly-once check-in and an offline-capable scanner PWA | Done (check-in API on Day 19, scanner PWA on Day 20): see [Scanner app](#scanner-app) |
 | Live availability and check-in dashboards | Done (Day 21): tiers update live on event pages, and organizers get a live counter and scan feed |
-| Virtual waiting room for flash sales | Planned (Day 22) |
+| Virtual waiting room for flash sales | Done (Day 22): a fair line with a live position, admission at the organizer's rate, and signed tokens required to book |
 | Caching and load-tested performance | Planned (Days 23–24) |
 | Organizer analytics, sponsor booth analytics and reports | Planned (Days 25–26) |
 | AI organizer copilot with permission-scoped tools | Planned (Day 27) |
@@ -91,7 +93,7 @@ One ticket's journey, end to end. The last column shows what works today; everyt
 |---|---|---|---|
 | 1. Publish | An organizer creates an event with ticket tiers (Early bird, Regular, VIP) and publishes it. | Drafts never show on public pages; prices lock once a ticket sells. | Done (API Day 6, dashboard Day 9) |
 | 2. Browse | Attendees open a server-rendered event page that is cached and revalidated when the organizer edits it. | Fast, shareable and indexable; availability shown there is only a hint. | Done (Day 10) |
-| 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Planned (Day 22) |
+| 3. Queue | For hot sales, attendees join a virtual waiting room and are admitted at a fixed rate. | Turns a stampede into a line so the database isn't flooded. | Done (Day 22) |
 | 4. Hold | Clicking **Book** reserves tickets for 10 minutes. Redis rejects the crowd quickly; Postgres makes the final decision with a single conditional `UPDATE`. | Two layers: Redis is fast, Postgres is correct. A CHECK constraint makes overselling impossible even if code has a bug. | Done in the API (Days 11–12); the Book button is wired up on Day 15 |
 | 5. Pay | The attendee pays through Razorpay (test mode). Only the signed webhook marks the order paid, never the browser. | Webhooks can arrive twice, late or out of order, so every step is idempotent. Unpaid holds expire and return their tickets automatically. | Done (Days 15–16); tested with signed simulated webhooks until test keys are set |
 | 6. Ticket | A background worker issues tickets with Ed25519-signed QR codes, builds a PDF and emails it. | Signed QR codes can't be forged, and a phone can verify them without internet. | Done (Days 17–18) |
@@ -503,10 +505,42 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 
 **Tested by:** `apps/api/test/availability-throttle.test.ts` with fake timers: 1,000 changes in a second give at most 2 sends in that second, the last change is never lost, each event has its own limit, and two instances share one. `apps/api/test/realtime.test.ts` with `socket.io-client` against real servers: a stranger or anonymous client can't join the staff room and hears nothing; bad, expired and foreign tokens are refused; a token's expiry ends the connection; public messages hold only numbers; a draft's numbers stay private; a message crosses between two instances (with the adapter removed by hand, that test fails). Live: two browsers and two API instances, where a booking in one browser changed the other without a reload, and so did the worker expiring a hold. With one instance stopped, the page said it was no longer live, then reconnected and caught up on a booking it had missed.
 
+### Virtual waiting room (Day 22)
+
+**Problem:** when a popular sale opens, thousands of people press Book in the same second. The booking engine stays correct, but everyone arrives at once, so the first seconds are a wall of row-lock contention and refusals, and who gets through is down to luck.
+
+**Approach** (`apps/api/src/modules/queue/`, `packages/shared/src/waiting-room-server.ts`, `admitWaitingRooms` in `apps/worker/src/processors.ts`):
+- **The line is a Redis sorted set**, `wr:{eventId}`, of user IDs scored by Redis's own `TIME`. Every API instance reads the same clock, so they all agree who came first. `ZADD NX` keeps a user's first score, so joining again never moves anyone, and that's the one-entry-per-user rule. `ZRANK` gives a position without walking the line. A join is also limited per user.
+- **The worker lets people in.** A job runs every second and serves every event in `wr:active`, reading each event's `admitRatePerSec` on each tick, so a change applies within a second. If the worker was down, it doesn't catch up with a burst; it carries on at the set rate.
+- **Peek, sign, then remove in one step.** The tick reads the next N users, signs their tokens, then a Lua script removes each user and stores their token together. Only the run that actually removes a user stores a token. With `ZPOPMIN` first, a crash between the pop and the signing would lose those places, and a retry would admit extra people.
+- **Admission tokens** are JWTs with their own secret, a 5-minute life, `sub` = user and an `eventId` claim. `POST /orders` needs one when queue mode is on, in the `X-Admission-Token` header. A copy is kept in Redis with the same expiry only so the page can fetch it; booking never reads that copy.
+- **Finding out:** the worker publishes "this user was admitted" on a Redis channel and each API instance tells its own sockets in `user:{id}`, a room joined automatically from the verified token. The message holds no token: the page fetches it with `GET /queue/status`, which is also what a reload uses. If the socket message is missed, the page's regular status check finds out anyway. People far back in line check less often (every 2 to 30 seconds).
+- **The check runs after the idempotency lookup**, inside `createOrder`, not in middleware. A retry of a booking that already worked gets its order back even if the token has since expired.
+
+| | Redis flag ("user X may book") | Signed token (chosen) |
+|---|---|---|
+| Checking it during a booking | A Redis call on the hottest path | CPU only, no network |
+| Redis down | Nobody can book, or everybody can | People already admitted can still book |
+| Forging it | Needs write access to Redis | Needs the secret |
+| Taking it back early | Delete the key | Not possible; it ends on its own within 5 minutes |
+
+**What it protects:** the admit rate limits how fast people reach booking, which is what Postgres row locks, the connection pool and Razorpay order creation have to absorb. It doesn't guarantee anything about tickets: a token doesn't reserve one, and the Redis gate and Postgres still decide. If the token check were removed, the sale would be a stampede again but could still not oversell.
+
+**Limits:**
+- If Redis is down, nobody can join (`503 QUEUE_UNAVAILABLE`), while people already admitted can still book, and Postgres still protects the tickets.
+- Someone who closes the tab keeps their place, and their turn then uses up one admission. Their token expires unused. A heartbeat would fix this, at the cost of more traffic from everyone in line.
+- Many accounts mean many places in line. The limit is per account, and paid tickets still have the per-user limit.
+- Admission can't be withdrawn early, including when the organizer changes settings: tokens already issued work for up to 5 minutes.
+- Each join and status check reads the event's settings from Postgres, once per request.
+- The best admit rate for a real sale hasn't been measured yet (Day 24).
+
+**Alternatives:** a Redis list (finding a position means walking it, and stopping duplicates needs a second structure); one scheduled job per event (more parts to start and stop, and a failed start would leave a line nobody serves); pushing each person's position every second (one message per waiting person per second, the kind of load this exists to prevent).
+
+**Tested by:** `apps/api/test/waiting-room.test.ts`: positions follow join order and joining again keeps the place; 10 users are admitted in join order; a booking with no token is refused and takes no stock; expired, another user's, another event's and wrongly signed tokens are refused; a token doesn't get past a sold-out tier; a retry whose token has expired still gets its order; join is rate-limited; two overlapping admission runs admit nobody twice; `queue:admitted` reaches only the admitted user, once, across two API instances; admission tokens are redacted from logs. `apps/worker/test/waiting-room.test.ts`: the rate per tick, a new rate on the next tick, each event at its own rate, and the line being deleted when queue mode goes off, the event closes or the sale ends. Removing the token check, the subject check, the ordering or `io.local` by hand each made these tests fail. Live, on one laptop with one API instance and one worker: three browsers at position 1, 2 and 3 with the rate set to 1 in the organizer form, a reload that kept position 3, and arrival at booking 1.6, 2.6 and 3.5 seconds after the worker started, each through to checkout. Turning queue mode off sent a waiting fourth user to booking with no worker running.
+
 **Planned:**
 
 - Load test of the two-layer design (Day 24)
-- Virtual waiting room (Day 22)
 - Sponsor analytics and privacy (Day 26)
 - AI copilot safety (Day 27)
 
@@ -666,6 +700,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `REVALIDATE_SECRET` | api, web | Shared secret for `POST /api/revalidate`, sent as `Authorization: Bearer ...`. At least 32 characters; generate with `openssl rand -base64 48`. Server-only on the web side (no `NEXT_PUBLIC_`) |
 | `NODE_ENV` | api | `development`, `test` or `production` (default `development`). Only `development` shows error messages and stacks in responses |
 | `LOG_LEVEL` | api | pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent` (default `info`) |
+| `ADMISSION_TOKEN_SECRET` | api, worker | Signs waiting-room admission tokens (HS256): the worker signs and the API verifies, so both need the same value. Required, at least 32 characters, and the API refuses to start if it matches `JWT_ACCESS_SECRET`; generate one with `openssl rand -base64 48` |
 | `JWT_ACCESS_SECRET` | api | Secret that signs access tokens (HS256). Required, at least 32 characters; generate one with `openssl rand -base64 48` |
 | `ACCESS_TOKEN_TTL_SECONDS` | api | Access-token lifetime (default 900 = 15 minutes) |
 | `REFRESH_TOKEN_TTL_DAYS` | api | Refresh-token lifetime; each refresh starts a new period (default 7) |
@@ -681,6 +716,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `RATE_LIMIT_REGISTER` | api | Register, per IP (default `20/10`; generous because a campus can share one public IP) |
 | `RATE_LIMIT_ORDERS` | api | Booking, per user (default `10/30`) |
 | `RATE_LIMIT_PRESIGN` | api | Banner upload signing, per user (default `10/10`) |
+| `RATE_LIMIT_QUEUE_JOIN` | api | Joining a waiting room, per user (default `10/30`) |
 | `RAZORPAY_KEY_ID` | api, worker | Razorpay **test** key ID from the dashboard in Test Mode. Must start with `rzp_test_`: a live key stops the API and worker at startup. The worker uses the keys for refunds. Sent to the browser for Checkout (it is public) |
 | `RAZORPAY_WEBHOOK_SECRET` | api, `webhook:simulate` | A long random string you choose (`openssl rand -hex 32`) and paste into Razorpay's webhook settings; every webhook is checked against it. Without it, `POST /webhooks/razorpay` answers `503` |
 | `RAZORPAY_KEY_SECRET` | api, worker | Its secret, never sent anywhere. Set both or neither; without them `POST /orders/:id/pay` answers `503 PAYMENTS_NOT_CONFIGURED` |
@@ -730,7 +766,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
   ```json
   { "error": { "code": "VALIDATION_FAILED", "message": "Request validation failed", "details": { "fields": [{ "location": "body", "path": "email", "message": "Invalid email address" }] }, "requestId": "6f1c..." } }
   ```
-  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED`, `PDF_NOT_READY`, `ALREADY_CHECKED_IN`, `WRONG_EVENT`, `QR_REVOKED` (409), `INVALID_QR` (400), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack.
+  Codes so far: `VALIDATION_FAILED` (400), `INVALID_JSON` (400), `UNAUTHORIZED`, `INVALID_CREDENTIALS`, `INVALID_ACCESS_TOKEN`, `INVALID_REFRESH_TOKEN`, `REFRESH_TOKEN_REUSED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `EMAIL_TAKEN`, `SLUG_TAKEN`, `ALREADY_MEMBER`, `LAST_OWNER`, `INVALID_TRANSITION`, `NO_TIERS`, `EVENT_IN_PAST`, `EVENT_CLOSED`, `TIER_NAME_TAKEN`, `PRICE_LOCKED`, `CAPACITY_LOCKED`, `TIER_HAS_SALES`, `SALE_NOT_STARTED`, `SALE_ENDED`, `PER_USER_LIMIT`, `SOLD_OUT`, `ORDER_NOT_PENDING`, `HOLD_EXPIRED`, `NOTHING_TO_PAY`, `TICKET_USED`, `PDF_NOT_READY`, `ALREADY_CHECKED_IN`, `WRONG_EVENT`, `QR_REVOKED` (409), `INVALID_QR` (400), `INVALID_SIGNATURE`, `INVALID_PAYLOAD` (400, webhooks), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429), `INTERNAL_ERROR` (500), `PAYMENT_PROVIDER_ERROR` (502), `PAYMENTS_NOT_CONFIGURED`, `WEBHOOKS_NOT_CONFIGURED` (503). Outside development, a 500 never includes the internal message or stack. Waiting room: `ADMISSION_REQUIRED` (403), `QUEUE_UNAVAILABLE` (503).
 - **Request IDs:** send `X-Request-Id` (up to 64 letters, digits, `_` or `-`) to reuse your own; otherwise the API generates a UUID. It comes back in the `X-Request-Id` response header, in every error body and in every log line for that request.
 - **Validation:** params, query and body are validated with Zod schemas from `packages/shared`; every invalid field is reported at once.
 - **CORS:** only origins in `WEB_ORIGINS` get CORS headers, with credentials allowed, so only the web app can call the API from a browser with the refresh cookie. Allowed request headers: `Content-Type`, `Authorization`, `X-Request-Id`, `Idempotency-Key`; readable response headers: `X-Request-Id`, `Idempotent-Replayed`, `Retry-After`, `RateLimit-*`.
@@ -767,6 +803,8 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | GET | `/api/v1/orders/:orderId` | Bearer (the order's owner) | `200 { order, event: { id, title, slug, venue, startsAt } }`, polled by checkout; `404` for someone else's order |
 | GET | `/api/v1/events/:eventId/checkins/summary` | Bearer, `checkin:scan` | For the dashboard: `200 { summary: { checkedIn, totalTickets, recent: [{ ticketId, tierName, gateId, result, offline, ts }] } }`, latest 20 scans |
 | GET | `/api/v1/events/:eventId/checkins/manifest` | Bearer, `checkin:scan` | For offline scanners: `200 { manifest: { eventId, generatedAt, tickets: [{ id, v, used }] } }`, with no personal data |
+| POST | `/api/v1/events/:eventId/queue/join` | Bearer, rate-limited per user | Joins the waiting room while the sale is open; joining again keeps the same place. `200` with a status: `{ state: "waiting", position, estimatedWaitSeconds }`, `{ state: "admitted", token, expiresAt }` or `{ state: "not_required" }` when queue mode is off. `404`; `409 SALE_NOT_STARTED`, `SALE_ENDED`, `EVENT_CLOSED`; `429`; `503 QUEUE_UNAVAILABLE` |
+| GET | `/api/v1/events/:eventId/queue/status` | Bearer | The same status without joining, plus `{ state: "not_joined" }`. Same errors except `429` |
 | POST | `/api/v1/events/:eventId/checkins` | Bearer, `checkin:scan` in the event's club | Body `{ qr, deviceId, gateId?, clientScanId? }` (`gateId` defaults to `main`; `clientScanId` recognises this scan if it is sent again). `200 { result: "ACCEPTED", ticket: { id, code, tierName, attendeeName, checkedInAt } }`. `409 ALREADY_CHECKED_IN` with `details: { ticketId, firstScannedAt, firstScannedBy }`, `409 WRONG_EVENT`, `409 QR_REVOKED`, `400 INVALID_QR`; `404` for non-members |
 | POST | `/api/v1/events/:eventId/checkins/batch` | Bearer, `checkin:scan` | Offline sync. Body `{ deviceId, gateId?, scans: [{ clientScanId, qr, scannedAt }] }` (1–200). `200 { results: [...] }`, one per scan in client-time order, each with `clientScanId` and `result` (`ACCEPTED`, `DUPLICATE`, `INVALID`, `REVOKED`) plus the same details as above |
 | GET | `/api/v1/me/tickets` | Bearer | `200 { tickets: [{ id, code, seq, qrVersion, qr, checkedInAt, orderId, tier, event }] }`, soonest event first. `qr` is the signed `FP1.…` string to show at the gate |
@@ -804,6 +842,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
+- `apps/api/test/waiting-room.test.ts` and `apps/worker/test/waiting-room.test.ts` (real Redis and test database), plus `apps/web/src/lib/waiting-room.test.ts` (wait text, check interval): see [Virtual waiting room](#virtual-waiting-room-day-22).
 - `apps/api/test/realtime.test.ts` and `apps/api/test/availability-throttle.test.ts`: see [Real-time updates](#real-time-updates-day-21). `apps/worker/test/expiry.test.ts` also checks that an expiry and the sweeper announce the change.
 - `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
 - `packages/shared/test/qr.test.ts`: a QR signed with Node's crypto verifies with `@noble/ed25519`; its payload has only `t`, `e`, `v`, `iat`; a changed payload, another key, a wrong prefix, a missing part, a truncated signature or non-base64url characters all fail; a validly signed payload that isn't a ticket fails. `apps/worker/test/tickets.test.ts`: a paid order gets one ticket per unit numbered 1..n and becomes `TICKETED`; running the job twice, or twice at once, creates them once; an unpaid order gets none. `apps/api/test/tickets.test.ts`: `/me/tickets` returns QR strings that verify with the public key, the same string on every read, owner-only `/tickets/:id`, and reissue moving the QR to `v=2` (not for used tickets).
@@ -875,7 +914,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 19 (Tue 17 Nov): Check-in API and scan events
 - [x] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
 - [x] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
-- [ ] Day 22 (Fri 20 Nov): Virtual waiting room
+- [x] Day 22 (Fri 20 Nov): Virtual waiting room
 - [ ] Day 23 (Sat 21 Nov): Caching and query performance
 - [ ] Day 24 (Sun 22 Nov): Load testing with k6
 - [ ] Day 25 (Mon 23 Nov): Analytics pipelines and dashboards
@@ -1112,6 +1151,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** a trailing throttle with its claim in Redis, rather than debouncing or a limit per process, because a flash sale never goes quiet and the limit must not grow with the number of API instances.
 **Verify:** `pnpm test`; with `pnpm dev` running, open `/e/mait-alumni-meet-2026` in two browsers and book in one: the other updates without a reload.
 **Next:** Day 22 builds the virtual waiting room: queued visitors are admitted to booking a few at a time, with their place shown live.
+
+### Day 22: Virtual waiting room (2026-11-20)
+**Built:**
+- `POST /events/:eventId/queue/join` and `GET /queue/status`: a FIFO line in a Redis sorted set, one entry per user, with join rate-limited.
+- A worker job every second that admits each event's `admitRatePerSec` users, oldest first, each with a signed 5-minute token, and tells them over their Socket.IO user room.
+- `POST /orders` refuses a queue-mode event without a valid token for that user and event (`403 ADMISSION_REQUIRED`), checked after the idempotency lookup.
+- A `/queue/[slug]` page with position, estimated wait, automatic redirect and a place that survives a reload, using the existing organizer controls for queue mode and rate.
+
+**Key decision:** read the next users, sign, then remove them and store their tokens in one Lua step, rather than `ZPOPMIN` first, so a crash loses nobody's place and a retried job admits nobody extra.
+**Verify:** `pnpm test`; with `pnpm dev` running, set an event's rate to 1 with the waiting room on, open its booking link as three users, and watch them get through one at a time.
+**Next:** Day 23 adds caching and query tuning: Redis cache-aside for public event reads, indexes for the hot queries, and measured before-and-after timings.
 
 <!-- BUILD-LOG:END -->
 

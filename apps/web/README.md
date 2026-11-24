@@ -17,7 +17,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | My Tickets with QR codes and PDF download | attendees | `/tickets` | Done (Day 18) |
 | Scanner PWA with offline mode | volunteers | `/scan` | Done (Day 20) |
 | Live availability and check-in counter | attendees, organizers | event page, dashboard | Done (Day 21) |
-| Virtual waiting room | attendees | `/e/[slug]/queue` | Planned (Day 22) |
+| Virtual waiting room | attendees | `/queue/[slug]` | Done (Day 22) |
 | Analytics charts | organizers | dashboard | Planned (Day 25) |
 | Sponsor dashboard and booth-mode scanning | sponsors, volunteers | `/sponsor`, `/scan` | Planned (Day 26) |
 | AI copilot chat | organizers | dashboard | Planned (Day 27) |
@@ -55,6 +55,7 @@ apps/web/
     (app)/(auth)/layout.tsx         Centered card layout
     (app)/(auth)/login/page.tsx     Login form
     (app)/(auth)/register/page.tsx  Register form
+    (app)/(buyer)/queue/[slug]/page.tsx            Waiting room: place in line, estimated wait, moves on to booking automatically
     (app)/(dashboard)/dashboard/layout.tsx         Login guard, header, org switcher, Events | Members tabs, log out
     (app)/(dashboard)/dashboard/page.tsx           The club's events (status, sold / capacity, load more) or "create your first club"
     (app)/(dashboard)/dashboard/events/new/page.tsx            New event form (creates a draft)
@@ -76,6 +77,7 @@ apps/web/
     form-resolver.ts                sharedSchemaResolver: convert form values, validate with a shared schema
     dates.ts                        datetime-local <-> UTC ISO, date formatting
     upload.ts                       Banner upload: presign, XHR POST to storage with progress, PATCH bannerKey
+    waiting-room.ts                 formatWait(), pollDelayMs() (tested in waiting-room.test.ts)
     use-event-socket.ts             useEventSocket(): joins an event's room, rejoins after a reconnect, refreshes an expired token
     use-api-data.ts                 useApiData(path): load, reload and replace one API resource
     booking.ts (+ .test.ts)         bookingKey(): one Idempotency-Key per booking attempt, kept in sessionStorage for retries
@@ -134,6 +136,14 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 - **Staying signed in:** the staff room passes a `session` with the current token and a refresh function. Socket.IO doesn't retry after the server refuses a token or ends a connection whose token expired, so the hook refreshes the token and connects again. If the refresh fails, the status is `denied`. Public pages pass no session, so they never load the auth client.
 - **Event page** (`components/events/live-tiers.tsx`): a client component that starts from the server-rendered tiers and overlays live numbers, so without JavaScript or a connection the page still works. Joining sends the current numbers at once, which replaces a cached page's up-to-a-minute-old ones. The note under the tiers says whether the numbers are live.
 - **Organizer dashboard** (`components/events/live-checkins.tsx`): loads `GET /events/:id/checkins/summary`, then raises the counter on each `ACCEPTED` scan and adds each scan to the feed. It loads the summary again after a reconnect, because scans sent while disconnected never arrive.
+
+## Waiting room (Day 22)
+
+- **Getting there:** tier cards still link to `/book/[slug]`. That page reads the event from the API; if `queueMode` is on and the user isn't admitted, it sends them to `/queue/[slug]?tier=...`. So a stale cached event page can't skip the line.
+- **The page** (`app/(app)/(buyer)/queue/[slug]/page.tsx`) asks `GET /queue/status` and calls `POST /queue/join` only if the user isn't in line yet, so reloading doesn't use up the join rate limit. Nothing is kept in the browser: position and token live on the server, which is why a reload or a second tab shows the same place. The wait shown comes from the API (position ÷ admit rate).
+- **Moving on:** `useEventSocket` gained `onQueueAdmitted`, which triggers a status check at once. `pollDelayMs()` also checks every 2 to 30 seconds depending on the wait, with up to 20% random spread, in case the message is missed or the organizer turned queue mode off. A sale that ended or an event that closed stops the checks and shows the reason; a busy or unreachable API keeps the last position and tries again.
+- **Booking:** the book page fetches the token from `GET /queue/status`, shows the time to book by, and sends it as `X-Admission-Token`. A `403 ADMISSION_REQUIRED` (token expired, or queue mode just turned on) goes back to the waiting page.
+- **Organizer controls:** the event form's existing "Waiting room for the sale" checkbox and "People admitted per second" field, which take effect within a second.
 
 ## Rendering strategy
 
@@ -211,4 +221,5 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.
 - **Day 18:** My Tickets page (`/tickets`) with browser-drawn QR codes and a Download PDF button that fetches a fresh pre-signed link; links to it from checkout and the booking header.
 - **Day 20:** scanner PWA at `/scan`: gate setup, camera scanning with `@zxing/browser` and a paste fallback, online check-in with an offline fallback (signature, event, version and on-this-phone checks; IndexedDB queue via `idb`), ticket list download, sync with a "Needs a look" list, web app manifest and hand-written service worker; the API client tells "unreachable" from "logged out"; Scanner link in the dashboard.
+- **Day 22:** waiting room at `/queue/[slug]`: place in line, estimated wait, automatic redirect and a place that survives a reload; the book page sends the admission token and redirects when it has none; `onQueueAdmitted` on `useEventSocket`.
 - **Day 21:** live updates: `useEventSocket`, tier cards on `/e/[slug]` that update live (moved into the `LiveTiers` client component), a check-in counter and scan feed on the organizer's event page, `api.accessToken()` for the WebSocket handshake.
