@@ -7,6 +7,7 @@ const valid = {
   MONGODB_URI: 'mongodb://localhost:27018/festpass',
   JWT_ACCESS_SECRET: 'x'.repeat(32),
   REVALIDATE_SECRET: 'y'.repeat(32),
+  ADMISSION_TOKEN_SECRET: 'z'.repeat(32),
   // A real Ed25519 key, generated per run in vitest.config.ts.
   TICKET_SIGNING_PRIVATE_KEY: process.env.TICKET_SIGNING_PRIVATE_KEY,
   S3_ENDPOINT: 'http://localhost:9000',

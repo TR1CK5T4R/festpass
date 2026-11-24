@@ -53,6 +53,7 @@ describe('job dashboard (Bull Board) access', () => {
       'payments',
       'scans',
       'tickets',
+      'waiting-room',
     ]);
   });
 

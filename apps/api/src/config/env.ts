@@ -30,6 +30,9 @@ const envSchema = z
     MONGODB_URI: z.url(),
     // HS256 is only as strong as its secret: 32+ characters, e.g. `openssl rand -base64 48`.
     JWT_ACCESS_SECRET: z.string().min(32),
+    // Verifies waiting-room admission tokens (the worker signs them). Separate from the access token
+    // secret, so neither kind of token can ever be passed off as the other.
+    ADMISSION_TOKEN_SECRET: z.string().min(32),
     ACCESS_TOKEN_TTL_SECONDS: z.coerce
       .number()
       .int()
@@ -51,6 +54,7 @@ const envSchema = z
     RATE_LIMIT_REGISTER: rateLimit('20/10'),
     RATE_LIMIT_ORDERS: rateLimit('10/30'),
     RATE_LIMIT_PRESIGN: rateLimit('10/10'),
+    RATE_LIMIT_QUEUE_JOIN: rateLimit('10/30'),
     // Razorpay, test mode only: a live key (rzp_live_...) is refused at startup. Optional so the app runs
     // without an account; POST /orders/:id/pay answers 503 until both are set.
     RAZORPAY_KEY_ID: z.preprocess(
@@ -99,6 +103,10 @@ const envSchema = z
     S3_SECRET_ACCESS_KEY: z.string().min(1),
     // Base URL that public objects (banners) are read from, without a trailing slash.
     S3_PUBLIC_URL: z.url().transform((u) => u.replace(/\/+$/, '')),
+  })
+  .refine((e) => e.ADMISSION_TOKEN_SECRET !== e.JWT_ACCESS_SECRET, {
+    message: 'Must be different from JWT_ACCESS_SECRET',
+    path: ['ADMISSION_TOKEN_SECRET'],
   })
   .refine((e) => !e.RAZORPAY_KEY_ID === !e.RAZORPAY_KEY_SECRET, {
     message: 'Set both RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET, or neither',

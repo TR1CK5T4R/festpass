@@ -30,8 +30,9 @@ process.env.TICKET_SIGNING_PRIVATE_KEY = ticketKeys.privateKey
   .export({ format: 'der', type: 'pkcs8' })
   .toString('base64url');
 process.env.TICKET_PUBLIC_KEY_FOR_TESTS = ticketKeys.publicKey.export({ format: 'jwk' }).x;
+process.env.ADMISSION_TOKEN_SECRET = 'test-admission-secret-0123456789abcdef';
 // Limits high enough that no other suite is throttled; rate-limit.test.ts builds apps with small ones.
-for (const name of ['LOGIN', 'REGISTER', 'ORDERS', 'PRESIGN']) {
+for (const name of ['LOGIN', 'REGISTER', 'ORDERS', 'PRESIGN', 'QUEUE_JOIN']) {
   process.env[`RATE_LIMIT_${name}`] = '100000/600000';
 }
 // Nothing listens on port 9, so revalidation calls fail at once instead of reaching a running web app.

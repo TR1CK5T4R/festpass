@@ -11,6 +11,7 @@ import { adminApiRoutes, queueDashboard } from './modules/admin/routes.js';
 import { checkinRoutes } from './modules/checkins/routes.js';
 import { orderActionRoutes, orderRoutes } from './modules/orders/routes.js';
 import { paymentRoutes } from './modules/payments/routes.js';
+import { queueRoutes } from './modules/queue/routes.js';
 import { orgRoutes } from './modules/orgs/routes.js';
 import { myTicketRoutes, orderTicketRoutes, ticketRoutes } from './modules/tickets/routes.js';
 import { uploadRoutes } from './modules/uploads/routes.js';
@@ -29,6 +30,7 @@ export interface RateLimits {
   register: Limit;
   orders: Limit;
   presign: Limit;
+  queueJoin: Limit;
 }
 
 // Building the app separately from listening lets tests call it with Supertest
@@ -39,6 +41,7 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
     register: env.RATE_LIMIT_REGISTER,
     orders: env.RATE_LIMIT_ORDERS,
     presign: env.RATE_LIMIT_PRESIGN,
+    queueJoin: env.RATE_LIMIT_QUEUE_JOIN,
     ...rateLimits,
   };
   const app = express();
@@ -56,6 +59,7 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   app.use('/api/v1/orgs/:orgId/events', orgEventRoutes());
   app.use('/api/v1/orgs', orgRoutes());
   app.use('/api/v1/events/:eventId/orders', orderRoutes(limits.orders));
+  app.use('/api/v1/events/:eventId/queue', queueRoutes(limits.queueJoin));
   app.use('/api/v1/events/:eventId/checkins', checkinRoutes());
   app.use('/api/v1/orders', orderActionRoutes());
   app.use('/api/v1/orders', paymentRoutes());

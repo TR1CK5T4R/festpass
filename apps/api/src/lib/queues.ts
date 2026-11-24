@@ -11,3 +11,5 @@ export const paymentsQueue = createQueue(QUEUES.payments, gateRedis);
 export const ticketsQueue = createQueue(QUEUES.tickets, gateRedis);
 export const emailsQueue = createQueue(QUEUES.emails, gateRedis);
 export const scansQueue = createQueue(QUEUES.scans, gateRedis);
+// The API adds nothing here (the worker schedules its own ticks); this puts failed ticks in Bull Board.
+export const waitingRoomQueue = createQueue(QUEUES.waitingRoom, gateRedis);
