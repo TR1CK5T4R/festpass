@@ -3,6 +3,7 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import {
   AVAILABILITY_CHANNEL,
   joinEventSchema,
+  QUEUE_ADMITTED_CHANNEL,
   redisKeys,
   SOCKET_UNAUTHORIZED,
   type ClientToServerEvents,
@@ -33,6 +34,7 @@ type IoSocket = Socket<ClientToServerEvents, ServerToClientEvents, never, Socket
 
 const publicRoom = (eventId: string) => `event:${eventId}:public`;
 const staffRoom = (eventId: string) => `event:${eventId}:staff`;
+const userRoom = (userId: string) => `user:${userId}`;
 
 /**
  * Handshake auth. No token means anonymous, which is fine for public rooms. A token that is present must
@@ -132,6 +134,8 @@ export function attachSockets(httpServer: HttpServer) {
   // shortcut: no limit on connections per IP or rooms per socket; add one if a sale ever draws abuse.
   io.on('connection', (socket) => {
     disconnectWhenTokenExpires(socket);
+    // Never asked for by the client, so nobody can listen in on another user's room.
+    if (socket.data.userId) void socket.join(userRoom(socket.data.userId));
     socket.on('event:join', (raw, ack) => {
       const reply = typeof ack === 'function' ? ack : () => undefined;
       const input = joinEventSchema.safeParse(raw);
@@ -155,15 +159,22 @@ export function attachSockets(httpServer: HttpServer) {
       );
     },
   });
-  changes.on('message', (_channel, eventId) => {
-    changed(eventId).catch((err: Error) =>
-      logger.warn({ err: err.message, eventId }, 'availability throttle failed'),
+  changes.on('message', (channel, message) => {
+    if (channel === QUEUE_ADMITTED_CHANNEL) {
+      const { eventId, userId } = JSON.parse(message) as { eventId: string; userId: string };
+      // local: every instance gets this message, so each tells only its own sockets. Through the
+      // adapter, a user would hear it once per instance.
+      io.local.to(userRoom(userId)).emit('queue:admitted', { eventId });
+      return;
+    }
+    changed(message).catch((err: Error) =>
+      logger.warn({ err: err.message, eventId: message }, 'availability throttle failed'),
     );
   });
   changes
-    .subscribe(AVAILABILITY_CHANNEL)
+    .subscribe(AVAILABILITY_CHANNEL, QUEUE_ADMITTED_CHANNEL)
     .catch((err: Error) =>
-      logger.error({ err: err.message }, 'could not subscribe to availability changes'),
+      logger.error({ err: err.message }, 'could not subscribe to socket channels'),
     );
 
   return {
