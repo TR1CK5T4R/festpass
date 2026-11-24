@@ -24,7 +24,7 @@ export function cors(allowedOrigins: readonly string[]): RequestHandler {
       // Every custom request header the web app sends must be listed, or the browser blocks the request.
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, X-Request-Id, Idempotency-Key',
+        'Content-Type, Authorization, X-Request-Id, Idempotency-Key, X-Admission-Token',
       );
       res.setHeader('Access-Control-Max-Age', '600');
       res.status(204).end();

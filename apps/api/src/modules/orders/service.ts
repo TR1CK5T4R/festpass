@@ -6,6 +6,7 @@ import {
   type BookingAnswer,
 } from '@festpass/db/booking';
 import { prisma } from '@festpass/db';
+import { isValidAdmission } from '@festpass/shared/server';
 import {
   JOBS,
   perUserLimit,
@@ -47,7 +48,13 @@ function hashRequest(eventId: string, items: CreateOrderInput['items']) {
  * Reads without locks: if the event changes a moment later, the transaction's own checks still hold.
  * Returns the requested tiers (name and limit), which the gate needs.
  */
-async function assertOnSale(eventId: string, items: CreateOrderInput['items'], now: Date) {
+async function assertOnSale(
+  eventId: string,
+  items: CreateOrderInput['items'],
+  now: Date,
+  userId: string,
+  admissionToken: string | undefined,
+) {
   const event = await repo.findEventForBooking(eventId);
   if (!event || event.status === 'DRAFT') throw new NotFoundError('Event not found');
   if (event.status === 'CLOSED') {
@@ -75,6 +82,14 @@ async function assertOnSale(eventId: string, items: CreateOrderInput['items'], n
     if (now >= closes) {
       throw new ConflictError('SALE_ENDED', 'Ticket sales have ended', { tierId: tier.id });
     }
+  }
+  // Checks the signature only, no Redis: a line can't let people in during a Redis outage, but anyone
+  // already let in can still book. The token controls arrival; Postgres still decides who gets tickets.
+  if (
+    event.queueMode &&
+    !isValidAdmission(admissionToken, userId, eventId, env.ADMISSION_TOKEN_SECRET)
+  ) {
+    throw new AppError(403, 'ADMISSION_REQUIRED', 'Join the waiting room to book this event');
   }
   return tiers;
 }
@@ -114,6 +129,7 @@ export async function createOrder(
   idempotencyKey: string,
   input: CreateOrderInput,
   requestId?: string,
+  admissionToken?: string,
 ): Promise<OrderResult> {
   const requestHash = hashRequest(eventId, input.items);
 
@@ -122,7 +138,9 @@ export async function createOrder(
   if (stored === 'key-reused') throw keyReused();
   if (stored) return { answer: stored, replayed: true };
 
-  const tiers = await assertOnSale(eventId, input.items, new Date());
+  // After the stored-answer check on purpose: a retry of a booking that worked gets its order back, even
+  // if its admission token has expired in the meantime.
+  const tiers = await assertOnSale(eventId, input.items, new Date(), userId, admissionToken);
   const gateItems: GateItem[] = input.items.map((i) => ({
     ...i,
     perUserLimit: tiers.get(i.tierId)!.perUserLimit,

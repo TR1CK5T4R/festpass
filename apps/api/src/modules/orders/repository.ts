@@ -9,6 +9,7 @@ export function findEventForBooking(eventId: string) {
       status: true,
       saleStartsAt: true,
       saleEndsAt: true,
+      queueMode: true,
       tiers: {
         select: { id: true, name: true, perUserLimit: true, saleStartsAt: true, saleEndsAt: true },
       },

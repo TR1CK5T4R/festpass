@@ -1,3 +1,4 @@
+import { ADMISSION_HEADER } from '@festpass/shared';
 import type { RequestHandler } from 'express';
 import { AppError } from '../../lib/errors.js';
 import * as orders from './service.js';
@@ -9,6 +10,7 @@ export const create: RequestHandler = async (req, res) => {
     String(req.header('idempotency-key')),
     req.body,
     String(req.id),
+    req.header(ADMISSION_HEADER),
   );
   if (replayed) res.setHeader('Idempotent-Replayed', 'true');
   // Stored rejections (SOLD_OUT, PER_USER_LIMIT) go through the error handler like any other error,
