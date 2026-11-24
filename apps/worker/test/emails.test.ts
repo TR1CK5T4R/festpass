@@ -226,4 +226,20 @@ describe('console provider', () => {
     expect(html).toContain('Your tickets for HackMAIT 2026');
     expect(html).toContain('ticket-1.png');
   });
+
+  it.each([
+    ['order-expired', { eventTitle: 'Fest', name: 'Asha', bookAgainUrl: '/e/fest' }, 'ended'],
+    ['refund-issued', { eventTitle: 'Fest', name: 'Asha', amount: '₹299', reason: 'late' }, '₹299'],
+  ] as const)('previews %s, which has no tickets in it', async (template, data, expected) => {
+    const dir = await mkdtemp(join(tmpdir(), 'festpass-email-'));
+
+    await consoleProvider(dir, log).send({
+      to: { email: 'asha@test.dev', name: 'Asha' },
+      template,
+      data,
+    } as EmailMessage);
+
+    const [file] = await readdir(dir);
+    expect(await readFile(join(dir, file!), 'utf8')).toContain(expected);
+  });
 });
