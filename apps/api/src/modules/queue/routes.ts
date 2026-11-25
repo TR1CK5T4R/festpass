@@ -9,7 +9,11 @@ import * as controller from './controller.js';
 export function queueRoutes(joinLimit: Limit): Router {
   const router = Router({ mergeParams: true });
   router.use(requireAuth, validate({ params: eventIdParamsSchema }));
-  router.post('/join', rateLimit({ name: 'queue-join', keyFn: byUser, ...joinLimit }), controller.join);
+  router.post(
+    '/join',
+    rateLimit({ name: 'queue-join', keyFn: byUser, ...joinLimit }),
+    controller.join,
+  );
   router.get('/status', controller.status);
   return router;
 }

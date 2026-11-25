@@ -1,3 +1,4 @@
+import compression from 'compression';
 import express from 'express';
 import { env } from './config/env.js';
 import { cors } from './middleware/cors.js';
@@ -50,6 +51,8 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   // First, so every later log line and error response carries the request ID.
   app.use(requestLogger);
   app.use(cors(env.WEB_ORIGINS));
+  // gzip or brotli for responses over 1 KB when the client accepts it; event lists shrink several times over.
+  app.use(compression());
   // Webhooks first: they need the raw body, which express.json() below would consume.
   app.use('/api/v1/webhooks', webhookRoutes());
   app.use(express.json());

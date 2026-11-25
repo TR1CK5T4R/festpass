@@ -54,10 +54,18 @@ export const deleteTier: RequestHandler = async (req, res) => {
   res.status(204).end();
 };
 
+// Browsers and CDNs may reuse a public answer briefly; availability makes anything longer misleading.
+// Each answer also gets an ETag from Express, so a repeat request with nothing new is a 304 with no body.
+const PUBLIC_CACHE_CONTROL = 'public, max-age=5, stale-while-revalidate=25';
+
 export const listPublic: RequestHandler = async (req, res) => {
+  res.set('Cache-Control', PUBLIC_CACHE_CONTROL);
   res.json(await events.listPublicEvents(req.query as unknown as PublicEventsQuery));
 };
 
 export const getPublic: RequestHandler = async (req, res) => {
-  res.json({ event: await events.getPublicEvent(String(req.params.slug)) });
+  const event = await events.getPublicEvent(String(req.params.slug));
+  // Set only once found: a 404 must not be cached, or a just-published event would look missing.
+  res.set('Cache-Control', PUBLIC_CACHE_CONTROL);
+  res.json({ event });
 };
