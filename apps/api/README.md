@@ -31,7 +31,8 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Check-in and scan events | `apps/api`, `packages/mongo`, `packages/db`, `apps/worker` | Done (Day 19) |
 | Socket.IO live updates | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 21) |
 | Waiting room | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 22) |
-| Caching, load tests, analytics, sponsor reports | all | Planned (Days 23–26) |
+| Caching and query performance | `apps/api`, `packages/db` | Done (Day 23) |
+| Load tests, analytics, sponsor reports | all | Planned (Days 24–26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
 | Security pass, metrics, Dockerfiles, CI | all | Planned (Day 28) |
 
@@ -62,7 +63,7 @@ Locally all four run from `infra/docker-compose.yml` on host ports 5433, 27018, 
 ```
 apps/api/
   src/config/env.ts                 Zod schema for every env var; exits with a readable list if any is invalid
-  src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, Set-Cookie)
+  src/lib/logger.ts                 pino logger (redacts Authorization, Cookie, X-Admission-Token, Set-Cookie)
   src/lib/errors.ts                 AppError + NotFound, Validation, Conflict, Forbidden, Unauthorized, RateLimited
   src/lib/rate-limit.ts             Token bucket (Lua, Redis TIME), rateLimit() middleware, byIp / byUser / byIpAndEmail keys
   src/lib/queues.ts                 `ordersQueue`, `inventoryQueue` from the shared factory, on the fail-fast client (the API only adds jobs)
@@ -70,6 +71,7 @@ apps/api/
   src/lib/redis.ts                  ioredis clients: `redis` (lazy connect, auto-reconnect) and `gateRedis` (no offline queue: fails fast for the booking gate)
   src/lib/slug.ts                   slugify() for org and event URLs
   src/lib/cursor.ts                 Opaque (startsAt, id) cursors for keyset pagination
+  src/lib/cache.ts                  cached() (cache-aside with a generation key and one load per key per process), invalidatePublicEvents(), liveStock()
   src/lib/revalidate.ts             revalidateEventPages(slug): tells the web app to rebuild /e/{slug} and / (fire and forget)
   src/lib/storage.ts                S3 client (AWS SDK v3, path-style), presignPost(), headObject(), publicUrl()
   src/middleware/request-logger.ts  pino-http: one request ID per request, X-Request-Id header
@@ -121,6 +123,7 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
+  scripts/               perf-db.ts (the festpass_perf database, refuses any other), seed-bulk.ts (pnpm perf:seed), explain-hot.ts (pnpm perf:explain)
   src/emails.ts          @festpass/db/emails: claimEmail() (email_log row + 5-minute lease), markEmailSent(), releaseEmailClaim(), findOrderForEmail()
   src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion(),
                          findTicketForGate(), checkInTicket() (the guarded UPDATE that decides entry)
@@ -207,6 +210,18 @@ packages/mongo/
 - **Organizer list and queue settings:** `GET /orgs/:orgId/events` items carry `capacity` and `soldCount` summed over the event's tiers (read with the page, no extra query). Events carry `queueMode` and `admitRatePerSec` (1–1000, default off at 50/s from the database); the create schema leaves them optional and the update schema has no defaults, so a partial update never resets them.
 - **Public page revalidation** (`src/lib/revalidate.ts`): after an event that isn't a draft is edited, published, closed, or has a tier added, changed or removed, the service calls `revalidateEventPages(slug)`, which POSTs `{ slug }` to `WEB_REVALIDATE_URL` with `Authorization: Bearer REVALIDATE_SECRET`. It runs after the database work (never inside a transaction), isn't awaited, times out after 3 s and only logs a warning on failure: the organizer's request has already succeeded, and the page refreshes within 60 s anyway. Banner changes go through the event PATCH, so they're covered.
 - **Public view:** `GET /events` shows `PUBLISHED` events whose `ends_at` is still in the future; `GET /events/:slug` also shows `CLOSED` ones, never drafts. Each tier carries `available = capacity - sold_count`, which is only a hint; booking (Day 11) rechecks in Postgres.
+
+### Caching public reads (`src/lib/cache.ts`)
+
+- **Cache-aside:** `getPublicEvent()` and `listPublicEvents()` in `modules/events/service.ts` call `cached(key, load)`. A Lua script reads the generation (`cache:events:gen`) and the key `<key>:<generation>` in one round trip; on a miss the load runs, and its JSON is stored for 30 s under the generation read *before* loading. The fail-fast client with a 50 ms limit is used, and if Redis doesn't answer the request reads Postgres.
+- **Invalidation:** `refreshPublicPages()` (after an edit, publish, close or tier change commits) bumps the generation, then asks the web app to revalidate, so its rebuild gets fresh data. Bumping instead of deleting means a load that read the old row just before the edit is stored under a generation nobody reads any more.
+- **Stampede:** concurrent misses for the same key in one process share one load (`loading` map), so a popular key expiring costs one query per instance.
+- **Availability:** event pages overlay each tier's `available` (and `soldCount`) from `inv:{tierId}` on every request, hit or miss, keeping the Postgres number where Redis has none. List totals can be up to 30 s old.
+- **HTTP:** `compression()` in `app.ts`; `Cache-Control: public, max-age=5, stale-while-revalidate=25` on the two public reads (only when found); Express's ETags give `304`s.
+
+### Query performance (`packages/db/scripts/`)
+
+`seed-bulk.ts` (`pnpm perf:seed`) creates and migrates `festpass_perf` and fills it with set-based SQL; `perf-db.ts` refuses any other database. `explain-hot.ts` (`pnpm perf:explain`) captures Prisma's SQL from its query log and runs `EXPLAIN (ANALYZE, BUFFERS)` on each hot query. The `hot_query_indexes` migration adds `tickets.event_id` (filled from each ticket's order, then `NOT NULL`), the `(order_id, event_id)` foreign key with its `orders(id, event_id)` unique key, `tickets(event_id, checked_in_at)`, and replaces `orders(status, expires_at)` with a partial index on pending orders (Prisma's `partialIndexes` preview feature, so the schema still describes every index). `issueTickets()` now writes `event_id`, and `listTicketsForGate()` and `countCheckins()` filter on it. Results are in the [project README](../../README.md#performance).
 
 ### Banner uploads (`src/modules/uploads/`, `src/lib/storage.ts`)
 
@@ -411,5 +426,6 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
 - **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
 - **Day 20:** for the scanner: `GET /events/:eventId/checkins/manifest` and `listTicketsForGate()`; `tickets.checked_in_scan_id` (migration) and an optional `clientScanId` on `POST /checkins`, so a re-sent scan gets its original answer instead of a false conflict.
+- **Day 23:** cache-aside for `GET /events/:slug` and `GET /events` (`lib/cache.ts`) with generation-based invalidation, a shared load per key and live stock from `inv:*`; `compression` and `Cache-Control`; `pnpm perf:seed` and `pnpm perf:explain`; `tickets.event_id` with a two-column foreign key, `tickets(event_id, checked_in_at)` and a partial index for the sweeper.
 - **Day 22:** waiting room: `POST /events/:eventId/queue/join`, `GET /queue/status`, the `admit-waiting-rooms` job, admission tokens checked in `createOrder`, user rooms and `queue:admitted`; `ADMISSION_TOKEN_SECRET` and `RATE_LIMIT_QUEUE_JOIN`; fixed the console email provider crashing on `order-expired` and `refund-issued` previews.
 - **Day 21:** Socket.IO with `@socket.io/redis-adapter`, handshake auth, public and staff rooms, a per-event throttle with its claim in Redis, availability announced from booking, cancel, late payment and the worker's expiry and sweep; scans sent to the staff room; `GET /events/:eventId/checkins/summary`; shutdown closes sockets first.

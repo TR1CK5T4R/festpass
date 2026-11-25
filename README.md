@@ -56,7 +56,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Exactly-once check-in and an offline-capable scanner PWA | Done (check-in API on Day 19, scanner PWA on Day 20): see [Scanner app](#scanner-app) |
 | Live availability and check-in dashboards | Done (Day 21): tiers update live on event pages, and organizers get a live counter and scan feed |
 | Virtual waiting room for flash sales | Done (Day 22): a fair line with a live position, admission at the organizer's rate, and signed tokens required to book |
-| Caching and load-tested performance | Planned (Days 23–24) |
+| Caching and load-tested performance | Done (Day 23): cached public reads, compression, and indexes chosen from measured query plans; load tests planned (Day 24) |
 | Organizer analytics, sponsor booth analytics and reports | Planned (Days 25–26) |
 | AI organizer copilot with permission-scoped tools | Planned (Day 27) |
 | Security hardening, observability and CI | Planned (Day 28) |
@@ -123,7 +123,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | Layer | Technology |
 |---|---|
 | Web | Next.js 16.4 (App Router), React 19.3, TypeScript 6.0, Tailwind CSS 4.3, react-hook-form 7.91 with the shared Zod schemas |
-| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, bcrypt 6, jsonwebtoken 9, Socket.IO 4.8 with `@socket.io/redis-adapter` |
+| API | Node.js 22, Express 5.3, Zod 4.6, pino 10.4 + pino-http 11, compression 1.8, bcrypt 6, jsonwebtoken 9, Socket.IO 4.8 with `@socket.io/redis-adapter` |
 | Jobs | BullMQ worker |
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
 | Storage and email | S3-compatible storage via AWS SDK v3 (SeaweedFS 4.50 locally, Cloudflare R2 in production), SendGrid dynamic templates |
@@ -604,6 +604,7 @@ erDiagram
   tickets {
     uuid id PK
     uuid order_id FK
+    uuid event_id FK "with order_id: must match the order's event"
     int seq "unique with order_id"
     text code UK
     int qr_version
@@ -620,7 +621,7 @@ erDiagram
 
 - **Orders vs tickets:** an order is a purchase (amount, hold expiry, payment status). A ticket is one entry right (QR code, owner, check-in). An order for 3 tickets has one order row and three ticket rows, and a ticket can later change owner without touching the payment.
 - **Idempotency keys:** `idempotency_keys(user_id, key UNIQUE, request_hash, status, response jsonb)` stores the answer to each booking request (HTTP status and body) in the same transaction as the order, so a retry gets exactly that answer.
-- **Hot-path indexes:** `orders(user_id, status)`, `orders(status, expires_at)` for the hold-expiry sweep, `tickets(owner_user_id)`, `events(org_id, status)`, `events(status, starts_at, id)` for the public event list. `tickets(order_id)` is served by the unique `(order_id, seq)` index, so it has no separate index.
+- **Hot-path indexes:** `orders(user_id, status)`, `orders(expires_at) WHERE status = 'PENDING'` for the hold-expiry sweep (partial, Day 23), `tickets(event_id, checked_in_at)` for the scanner's ticket list and the live counter (Day 23), `tickets(owner_user_id)`, `events(org_id, status)`, `events(status, starts_at, id)` for the public event list. `tickets(order_id)` is served by the unique `(order_id, seq)` index, so it has no separate index.
 
 ## Getting started
 
@@ -752,6 +753,8 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `pnpm db:reset` | Drops the database and re-applies every migration (destroys local data) |
 | `pnpm db:seed` | Inserts demo data; safe to run repeatedly |
 | `pnpm db:studio` | Opens Prisma Studio to browse the tables |
+| `pnpm perf:seed` | Builds a separate `festpass_perf` database (created and migrated if needed) with 50 events, 58,300 orders and 100,142 tickets for realistic query plans; refuses any other database, so dev data is never touched |
+| `pnpm perf:explain` | Runs `EXPLAIN (ANALYZE, BUFFERS)` on the hot queries against `festpass_perf` and prints each plan with its median time over 7 runs |
 | `pnpm storage:init` | Creates the bucket, makes `orgs/*/events/*/banner/*` publicly readable and allows `WEB_ORIGINS` to POST uploads (CORS); safe to run repeatedly |
 | `pnpm keys:generate` | Prints a new Ed25519 key pair for ticket QR codes as `.env` lines (`TICKET_SIGNING_PRIVATE_KEY`, `NEXT_PUBLIC_TICKET_PUBLIC_KEY`) |
 | `pnpm webhook:simulate <orderId> [paymentId]` | Sends the local API a `payment.captured` webhook for the order, signed with `RAZORPAY_WEBHOOK_SECRET`; pass the printed payment ID again to send a duplicate |
@@ -776,6 +779,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 - **Idempotency:** `POST /events/:eventId/orders` requires an `Idempotency-Key` header (a UUID the client generates once per booking attempt). Retrying with the same key and body returns the stored answer, with `Idempotent-Replayed: true`, and books nothing new; the same key with a different body is a `422`.
 - **Dates:** ISO 8601 with a timezone, e.g. `2026-12-12T10:00:00+05:30`; stored and returned in UTC.
 - **Banners:** every event response includes `bannerKey` and `bannerUrl` (a public URL, or `null`).
+- **Caching:** `GET /events` and `GET /events/:slug` send `Cache-Control: public, max-age=5, stale-while-revalidate=25` (not on a 404) and, like every JSON answer, an `ETag`, so a repeat request with `If-None-Match` gets an empty `304`. Responses over 1 KB are gzip- or brotli-compressed when the client sends `Accept-Encoding`.
 
 ### Endpoints
 
@@ -842,6 +846,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
+- `apps/api/test/cache.test.ts` (real Redis and test database): a change made behind the API isn't seen while cached, and an update, tier change, publish or close through the API shows on the next read; tickets left come from `inv:*` and fall back to Postgres; Redis failing still answers from Postgres; a 404 isn't cached; 50 requests missing one key run one load; a load that started before an invalidation is never served afterwards; hits and misses have the same shape; `Cache-Control`, `304` and gzip. Breaking each guard by hand (no invalidation, no cache read, no shared load, no generation, no live stock) made these tests fail. `packages/db/test/constraints.test.ts` also checks that a ticket can't name another event than its order's.
 - `apps/api/test/waiting-room.test.ts` and `apps/worker/test/waiting-room.test.ts` (real Redis and test database), plus `apps/web/src/lib/waiting-room.test.ts` (wait text, check interval): see [Virtual waiting room](#virtual-waiting-room-day-22).
 - `apps/api/test/realtime.test.ts` and `apps/api/test/availability-throttle.test.ts`: see [Real-time updates](#real-time-updates-day-21). `apps/worker/test/expiry.test.ts` also checks that an expiry and the sweeper announce the change.
 - `apps/worker/test/emails.test.ts` (fake email provider and storage): the PDF builder returns a real PDF; `send-tickets` stores the PDF outside the public prefix, emails a 24-hour link and each QR inline, and records it; a retry, and two runs at once, send once; a failed send is retried and still sent once; issuing tickets and an expired hold queue their emails keyed by the order; no "hold expired" email after a late payment re-reserved the tickets; the console provider writes an HTML preview with its images. `apps/api/test/tickets.test.ts` also covers the PDF link: a 5-minute pre-signed GET for the owner, `404` for anyone else, `409 PDF_NOT_READY` before the worker has stored it.
@@ -870,6 +875,116 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 | Event page served from the ISR cache | `x-nextjs-cache: HIT` on the second request; a title changed directly in the database (bypassing the API) stays hidden until revalidation, proving the page is cached |
 | Edit through the API → public page updated | new title visible 137 ms after the PATCH was sent (first poll that saw it) |
 | Edit saved in the dashboard → public page updated | visible on the first check after "Changes saved", 27 ms later |
+
+### Database and caching (Day 23), measured
+
+**Setup:** the same MacBook Air (Apple M2, 8 GB, macOS 27.2), PostgreSQL 16.15 in Docker (OrbStack), default settings, all data in memory. `pnpm perf:seed` builds a separate `festpass_perf` database with 50 events, 30,000 users, 58,300 orders and 100,142 tickets, the same data on every run. `pnpm perf:explain` runs `EXPLAIN (ANALYZE, BUFFERS)` on each hot query: one warm-up, then the median of 7 runs. Writes are rolled back. Prisma's queries are captured from its query log, so the plan is for the SQL the app actually sends. "Before" ran the old schema and the SQL Prisma generated before the change, on the same data, in a transaction that was rolled back.
+
+| Query | Before | After | Change |
+|---|---|---|---|
+| Scanner's ticket list for an event (2,698 tickets) | 10.86 ms | 0.53 ms | `tickets.event_id` with an index, instead of a join through `orders` that read all 100,142 tickets |
+| Live check-in counter (event with 1,964 check-ins) | 6.27 ms | 0.12 ms | The same index, read as an index-only scan |
+| Live check-in counter (upcoming event, none yet) | 6.17 ms | 0.01 ms | The same index |
+| Hold-expiry sweeper | 0.13 ms | 0.15 ms | No change in time. Its index went from 1,824 kB to 16 kB: a partial index on `PENDING` orders only |
+| Booking (per-user check and the conditional `UPDATE`), check-in `UPDATE`, My Tickets, public event list | under 0.08 ms each | unchanged | Already index scans; nothing to fix |
+
+The slow queries weren't the ones expected. Booking, check-in and the sweeper were already fast. The two queries behind "this event's tickets" (the scanner's list and the live counter) had no usable index. An index on `orders(event_id)` alone only took them to 8.4 and 4.7 ms, because the cost was in scanning `tickets`. The copy of `event_id` on tickets can't drift: the foreign key covers `(order_id, event_id)`, so a ticket's event must be its order's. That costs a 3.7 MB unique key on `orders(id, event_id)` at this size, and the tickets table grew from 13 to 14 MB.
+
+<details>
+<summary>Plans: the scanner's ticket list, before and after</summary>
+
+Before (10.86 ms median):
+
+```
+Hash Join  (cost=1580.24..4687.55 rows=2540 width=28) (actual time=1.848..10.642 rows=2698 loops=1)
+  Hash Cond: (tickets.order_id = j0.id)
+  Buffers: shared hit=2676
+  ->  Seq Scan on tickets  (cost=0.00..2844.42 rows=100142 width=44) (actual time=0.001..4.667 rows=100142 loops=1)
+        Buffers: shared hit=1843
+  ->  Hash  (cost=1561.75..1561.75 rows=1479 width=16) (actual time=1.835..1.835 rows=1527 loops=1)
+        Buckets: 2048  Batches: 1  Memory Usage: 88kB
+        Buffers: shared hit=833
+        ->  Seq Scan on orders j0  (cost=0.00..1561.75 rows=1479 width=16) (actual time=0.003..1.757 rows=1527 loops=1)
+              Filter: ((id IS NOT NULL) AND (event_id = '86fe1ded-3e33-4487-8ead-d4998ca4763d'::uuid))
+              Rows Removed by Filter: 56773
+              Buffers: shared hit=833
+Planning Time: 0.068 ms
+Execution Time: 10.715 ms
+```
+
+After (0.53 ms median):
+
+```
+Bitmap Heap Scan on tickets  (cost=33.04..2001.99 rows=2677 width=28) (actual time=0.115..0.422 rows=2698 loops=1)
+  Recheck Cond: (event_id = '86fe1ded-3e33-4487-8ead-d4998ca4763d'::uuid)
+  Heap Blocks: exact=850
+  Buffers: shared hit=855
+  ->  Bitmap Index Scan on tickets_event_id_checked_in_at_idx  (cost=0.00..32.37 rows=2677 width=0) (actual time=0.068..0.068 rows=2722 loops=1)
+        Index Cond: (event_id = '86fe1ded-3e33-4487-8ead-d4998ca4763d'::uuid)
+        Buffers: shared hit=5
+Planning Time: 0.012 ms
+Execution Time: 0.485 ms
+```
+
+</details>
+
+<details>
+<summary>Plans: the hold-expiry sweeper, before and after</summary>
+
+Before (`orders(status, expires_at)`, 1,824 kB):
+
+```
+Limit  (cost=606.13..606.84 rows=284 width=24) (actual time=0.109..0.123 rows=248 loops=1)
+  Buffers: shared hit=224
+  ->  Sort  (cost=606.13..606.84 rows=284 width=24) (actual time=0.109..0.115 rows=248 loops=1)
+        Sort Key: expires_at
+        Sort Method: quicksort  Memory: 42kB
+        Buffers: shared hit=224
+        ->  Bitmap Heap Scan on orders  (cost=11.33..594.56 rows=284 width=24) (actual time=0.037..0.092 rows=248 loops=1)
+              Recheck Cond: ((status = 'PENDING'::order_status) AND (expires_at <= now()))
+              Heap Blocks: exact=221
+              Buffers: shared hit=224
+              ->  Bitmap Index Scan on orders_status_expires_at_idx  (cost=0.00..11.26 rows=284 width=0) (actual time=0.022..0.022 rows=248 loops=1)
+                    Index Cond: ((status = 'PENDING'::order_status) AND (expires_at <= now()))
+                    Buffers: shared hit=3
+Planning Time: 0.015 ms
+Execution Time: 0.138 ms
+```
+
+After (`orders(expires_at) WHERE status = 'PENDING'`, 16 kB):
+
+```
+Limit  (cost=640.77..641.56 rows=315 width=24) (actual time=0.098..0.112 rows=249 loops=1)
+  Buffers: shared hit=222
+  ->  Sort  (cost=640.77..641.56 rows=315 width=24) (actual time=0.097..0.103 rows=249 loops=1)
+        Sort Key: expires_at
+        Sort Method: quicksort  Memory: 42kB
+        Buffers: shared hit=222
+        ->  Bitmap Heap Scan on orders  (cost=10.59..627.70 rows=315 width=24) (actual time=0.023..0.077 rows=249 loops=1)
+              Recheck Cond: ((expires_at <= now()) AND (status = 'PENDING'::order_status))
+              Heap Blocks: exact=221
+              Buffers: shared hit=222
+              ->  Bitmap Index Scan on orders_pending_expires_at_idx  (cost=0.00..10.51 rows=315 width=0) (actual time=0.011..0.011 rows=249 loops=1)
+                    Index Cond: (expires_at <= now())
+                    Buffers: shared hit=1
+Planning Time: 0.021 ms
+Execution Time: 0.132 ms
+```
+
+</details>
+
+**Cache-aside** for `GET /events/:slug` and `GET /events`. Measured with the API in dev mode against `festpass_perf`, one client, 300 sequential requests after 20 warm-up requests, with a miss forced before each request:
+
+| Request | Miss p50 / p95 | Hit p50 / p95 |
+|---|---|---|
+| `GET /events/perf-fest-35` | 5.26 / 9.48 ms | 3.51 / 6.81 ms |
+| `GET /events?limit=48` | 3.76 / 6.16 ms | 3.40 / 5.36 ms |
+
+The saving per request is small, because the queries take well under a millisecond; most of the time is Node, Express and Prisma. The point is what a sale does to Postgres: a crowd on one event page costs one query per API instance per 30 seconds, not one per visitor. Concurrent load is measured on Day 24.
+
+**Compression:** `GET /events?limit=48` (40 events) is 17,924 bytes uncompressed, 2,483 gzip and 2,041 brotli (`curl`, same server).
+
+**Not measured yet:** concurrent load (Day 24), production hardware, and data too big to stay in memory (every read above is a cache hit inside Postgres).
 
 **Lighthouse:** not measured yet. To record it, run against the production build with a published event:
 
@@ -915,7 +1030,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 20 (Wed 18 Nov): Scanner PWA with offline mode
 - [x] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
 - [x] Day 22 (Fri 20 Nov): Virtual waiting room
-- [ ] Day 23 (Sat 21 Nov): Caching and query performance
+- [x] Day 23 (Sat 21 Nov): Caching and query performance
 - [ ] Day 24 (Sun 22 Nov): Load testing with k6
 - [ ] Day 25 (Mon 23 Nov): Analytics pipelines and dashboards
 - [ ] Day 26 (Tue 24 Nov): Sponsor portal, booth scans and reports
@@ -1162,6 +1277,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** read the next users, sign, then remove them and store their tokens in one Lua step, rather than `ZPOPMIN` first, so a crash loses nobody's place and a retried job admits nobody extra.
 **Verify:** `pnpm test`; with `pnpm dev` running, set an event's rate to 1 with the waiting room on, open its booking link as three users, and watch them get through one at a time.
 **Next:** Day 23 adds caching and query tuning: Redis cache-aside for public event reads, indexes for the hot queries, and measured before-and-after timings.
+
+### Day 23: Caching and query performance (2026-11-21)
+**Built:**
+- Cache-aside in Redis for `GET /events/:slug` and `GET /events` (30 s), with tickets left from `inv:*` (Postgres when Redis has no number), invalidated before the web app rebuilds its pages, one load per instance when many requests miss at once.
+- `pnpm perf:seed` (a separate `festpass_perf` database: 50 events, 58,300 orders, 100,142 tickets) and `pnpm perf:explain` (`EXPLAIN (ANALYZE, BUFFERS)` on the hot queries, median of 7 runs).
+- `tickets.event_id` with an `(order_id, event_id)` foreign key and an index: the scanner's ticket list went from 10.86 to 0.53 ms and the live counter from 6.27 to 0.12 ms. The sweeper's index is now partial: 1,824 kB down to 16 kB.
+- Compression, `Cache-Control` on public reads, and a 304 for an unchanged `ETag`.
+
+**Key decision:** copy `event_id` onto tickets, guarded by a two-column foreign key, rather than only indexing `orders(event_id)`. That index was measured too and only reached 8.4 ms, because the time went on scanning tickets.
+**Verify:** `pnpm test`, then `pnpm perf:seed` and `pnpm perf:explain`.
+**Next:** Day 24 load-tests the booking path with k6: a flash sale against the two-layer gate, with measured results.
 
 <!-- BUILD-LOG:END -->
 
