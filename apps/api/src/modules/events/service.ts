@@ -4,12 +4,15 @@ import {
   tierWindowIssues,
   type CreateEventInput,
   type CreateTierInput,
+  type EventSummary,
   type Page,
   type PublicEventsQuery,
+  type PublicEventView,
   type TierView,
   type UpdateEventInput,
   type UpdateTierInput,
 } from '@festpass/shared';
+import { cached, invalidatePublicEvents, liveStock } from '../../lib/cache.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { bodyFieldErrors, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { slugify } from '../../lib/slug.js';
@@ -109,13 +112,18 @@ export async function updateEvent(orgId: string, eventId: string, input: UpdateE
   // shortcut: a replaced banner's old object stays in storage; add a cleanup job if that ever costs money.
   if (input.bannerKey) await verifyBanner(orgId, eventId, input.bannerKey);
   const updated = toEventView(await repo.updateEvent(eventId, input));
-  refreshPublicPages(updated);
+  await refreshPublicPages(updated);
   return updated;
 }
 
-/** Drafts have no public page, so only published or closed events need their cached pages rebuilt. */
-function refreshPublicPages(event: { slug: string; status: repo.EventRecord['status'] }) {
-  if (event.status !== 'DRAFT') revalidateEventPages(event.slug);
+/**
+ * Drafts have no public page, so only published or closed events need refreshing. The API's cache goes
+ * first: the web app's rebuild reads from the API, so it must not be handed the old cached answer.
+ */
+async function refreshPublicPages(event: { slug: string; status: repo.EventRecord['status'] }) {
+  if (event.status === 'DRAFT') return;
+  await invalidatePublicEvents();
+  revalidateEventPages(event.slug);
 }
 
 const statusChanged = () =>
@@ -137,7 +145,7 @@ export async function publishEvent(orgId: string, eventId: string) {
   // Guarded update: if a parallel request already published it, this one matches nothing.
   if (!(await repo.transitionStatus(eventId, 'DRAFT', 'PUBLISHED'))) throw statusChanged();
   // Also clears a cached 404 from anyone who opened the link while it was still a draft.
-  refreshPublicPages({ slug: event.slug, status: 'PUBLISHED' });
+  await refreshPublicPages({ slug: event.slug, status: 'PUBLISHED' });
   // Redis learns each tier's stock before the first booking arrives.
   await syncInventory(eventId);
   return getEvent(orgId, eventId);
@@ -148,7 +156,7 @@ export async function closeEvent(orgId: string, eventId: string) {
   const event = await loadEvent(orgId, eventId);
   assertTransition(event.status, 'CLOSED');
   if (!(await repo.transitionStatus(eventId, 'PUBLISHED', 'CLOSED'))) throw statusChanged();
-  refreshPublicPages({ slug: event.slug, status: 'CLOSED' });
+  await refreshPublicPages({ slug: event.slug, status: 'CLOSED' });
   return getEvent(orgId, eventId);
 }
 
@@ -161,7 +169,7 @@ export async function createTier(orgId: string, eventId: string, input: CreateTi
   const tier = await repo.createTier({ ...input, eventId });
   if (!tier)
     throw new ConflictError('TIER_NAME_TAKEN', 'This event already has a tier with that name');
-  refreshPublicPages(event);
+  await refreshPublicPages(event);
   await syncInventory(eventId); // capacity changed (or a tier came or went)
   return toTierView(tier);
 }
@@ -195,7 +203,7 @@ export async function updateTier(
     return input;
   });
   if (!tier) throw new NotFoundError('Tier not found');
-  refreshPublicPages(event);
+  await refreshPublicPages(event);
   await syncInventory(eventId);
   return toTierView(tier);
 }
@@ -207,19 +215,40 @@ export async function deleteTier(orgId: string, eventId: string, tierId: string)
   if (result === 'HAS_SALES') {
     throw new ConflictError('TIER_HAS_SALES', 'A tier with sold tickets cannot be deleted');
   }
-  refreshPublicPages(event);
+  await refreshPublicPages(event);
   await syncInventory(eventId);
 }
 
 // ---- Public side ----
 
+// Public reads are cached for 30 s (lib/cache.ts) and made stale by refreshPublicPages() on every edit.
+// Sold counts change with every booking without an edit, so the list's sold / capacity totals can be up
+// to 30 s old; the event page instead takes tickets left from the booking gate on every request.
+
 /** Published events that haven't ended yet, soonest first. */
-export function listPublicEvents({ cursor, limit, orgId }: PublicEventsQuery) {
-  return listPage({ status: 'PUBLISHED', endsAt: { gt: new Date() }, orgId }, cursor, limit);
+export async function listPublicEvents({ cursor, limit, orgId }: PublicEventsQuery) {
+  const page = await cached<Page<EventSummary>>(
+    `cache:events:list:${orgId ?? 'all'}:${limit}:${cursor ?? ''}`,
+    () => listPage({ status: 'PUBLISHED', endsAt: { gt: new Date() }, orgId }, cursor, limit),
+  );
+  return page!;
 }
 
-export async function getPublicEvent(slug: string) {
-  const event = await repo.findPublicEventBySlug(slug);
+export async function getPublicEvent(slug: string): Promise<PublicEventView> {
+  const event = await cached<PublicEventView>(`cache:events:slug:${slug}`, async () => {
+    const found = await repo.findPublicEventBySlug(slug);
+    return found && toEventView(found);
+  });
   if (!event) throw new NotFoundError('Event not found');
-  return toEventView(event);
+  // Where Redis has no number (or no answer), the count from Postgres stays.
+  const stock = await liveStock(event.tiers.map((t) => t.id));
+  return {
+    ...event,
+    tiers: event.tiers.map((tier, i) => {
+      const left = stock[i];
+      if (left == null) return tier;
+      const available = Math.min(tier.capacity, Math.max(0, left));
+      return { ...tier, available, soldCount: tier.capacity - available };
+    }),
+  };
 }
