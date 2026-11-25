@@ -6,6 +6,8 @@ generator client {
   output              = "../src/generated/prisma"
   moduleFormat        = "esm"
   importFileExtension = "js"
+  // For the partial index on orders below.
+  previewFeatures     = ["partialIndexes"]
 }
 
 datasource db {
@@ -184,8 +186,11 @@ model Order {
   emails   EmailLog[]
 
   @@index([userId, status])
-  // The hold-expiry sweep looks for PENDING orders whose expires_at has passed.
-  @@index([status, expiresAt])
+  // The hold-expiry sweep looks for PENDING orders whose expires_at has passed. Partial: only PENDING rows
+  // are indexed, a few hundred at any time, instead of every order ever placed.
+  @@index([expiresAt], map: "orders_pending_expires_at_idx", where: raw("status = 'PENDING'"))
+  // Target of tickets' (order_id, event_id) foreign key, so a ticket's event always matches its order's.
+  @@unique([id, eventId])
   @@map("orders")
 }
 
@@ -223,6 +228,9 @@ model Payment {
 model Ticket {
   id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   orderId     String    @map("order_id") @db.Uuid
+  // Copied from the order, so the gate's queries ("this event's tickets") don't have to join through
+  // orders. The foreign key below covers both columns, so the copy can never disagree with the order.
+  eventId     String    @map("event_id") @db.Uuid
   tierId      String    @map("tier_id") @db.Uuid
   ownerUserId String    @map("owner_user_id") @db.Uuid
   // 1..qty within the order; unique(order_id, seq) makes ticket issuing safe to retry.
@@ -236,7 +244,7 @@ model Ticket {
   checkedInScanId String? @map("checked_in_scan_id")
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
 
-  order         Order      @relation(fields: [orderId], references: [id])
+  order         Order      @relation(fields: [orderId, eventId], references: [id, eventId])
   tier          TicketTier @relation(fields: [tierId], references: [id])
   owner         User       @relation("TicketOwner", fields: [ownerUserId], references: [id])
   checkedInUser User?      @relation("TicketCheckedInBy", fields: [checkedInBy], references: [id])
@@ -244,6 +252,8 @@ model Ticket {
   // No separate tickets(order_id) index: this unique index starts with order_id, so it already serves those lookups.
   @@unique([orderId, seq])
   @@index([ownerUserId])
+  // The scanner's ticket list and the live counter: one event's tickets, and how many are checked in.
+  @@index([eventId, checkedInAt])
   @@map("tickets")
 }
 

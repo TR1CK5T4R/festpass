@@ -21,8 +21,10 @@ export async function issueTickets(
   orderId: string,
 ): Promise<{ issued: number; status: OrderStatus } | null> {
   return prisma.$transaction(async (tx) => {
-    const [order] = await tx.$queryRaw<{ user_id: string; status: OrderStatus }[]>`
-      SELECT user_id, status FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`;
+    const [order] = await tx.$queryRaw<
+      { user_id: string; event_id: string; status: OrderStatus }[]
+    >`
+      SELECT user_id, event_id, status FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`;
     if (!order) return null;
     if (order.status !== 'PAID') return { issued: 0, status: order.status }; // done before, or not paid
 
@@ -34,8 +36,9 @@ export async function issueTickets(
       for (let unit = 0; unit < item.qty; unit++) {
         seq++;
         issued += await tx.$executeRaw`
-          INSERT INTO tickets (order_id, tier_id, owner_user_id, seq, code)
-          VALUES (${orderId}::uuid, ${item.tier_id}::uuid, ${order.user_id}::uuid, ${seq}, ${ticketCode()})
+          INSERT INTO tickets (order_id, event_id, tier_id, owner_user_id, seq, code)
+          VALUES (${orderId}::uuid, ${order.event_id}::uuid, ${item.tier_id}::uuid, ${order.user_id}::uuid,
+                  ${seq}, ${ticketCode()})
           ON CONFLICT (order_id, seq) DO NOTHING`;
       }
     }
@@ -97,7 +100,7 @@ export async function checkInTicket(
 /** Every ticket of an event, for a scanner to keep offline: IDs and numbers only, no personal data. */
 export async function listTicketsForGate(eventId: string) {
   const tickets = await prisma.ticket.findMany({
-    where: { order: { eventId } },
+    where: { eventId },
     select: { id: true, qrVersion: true, checkedInAt: true },
   });
   return tickets.map((t) => ({ id: t.id, v: t.qrVersion, used: t.checkedInAt !== null }));
@@ -105,7 +108,7 @@ export async function listTicketsForGate(eventId: string) {
 
 /** How many of an event's tickets exist and how many have been used, for the live counter. */
 export async function countCheckins(eventId: string) {
-  const where = { order: { eventId } };
+  const where = { eventId };
   const [totalTickets, checkedIn] = await Promise.all([
     prisma.ticket.count({ where }),
     prisma.ticket.count({ where: { ...where, checkedInAt: { not: null } } }),
