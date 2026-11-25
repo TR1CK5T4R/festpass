@@ -49,7 +49,9 @@
     "postinstall": "prisma generate",
     "build": "prisma generate && tsc -p tsconfig.build.json",
     "typecheck": "prisma generate && tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "perf:seed": "tsx scripts/seed-bulk.ts",
+    "perf:explain": "tsx scripts/explain-hot.ts"
   },
   "dependencies": {
     "@festpass/shared": "workspace:*",

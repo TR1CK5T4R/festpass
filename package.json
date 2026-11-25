@@ -19,6 +19,8 @@
     "db:reset": "pnpm --filter @festpass/db exec prisma migrate reset --force",
     "db:seed": "pnpm --filter @festpass/db exec prisma db seed",
     "db:studio": "pnpm --filter @festpass/db exec prisma studio",
+    "perf:seed": "pnpm --filter @festpass/db perf:seed",
+    "perf:explain": "pnpm --filter @festpass/db perf:explain",
     "storage:init": "pnpm --filter @festpass/api storage:init",
     "storage:upload-banner": "pnpm --filter @festpass/api storage:upload-banner",
     "webhook:simulate": "pnpm --filter @festpass/api webhook:simulate",
