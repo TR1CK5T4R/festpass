@@ -51,7 +51,8 @@
     "typecheck": "prisma generate && tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "perf:seed": "tsx scripts/seed-bulk.ts",
-    "perf:explain": "tsx scripts/explain-hot.ts"
+    "perf:explain": "tsx scripts/explain-hot.ts",
+    "loadtest:verify": "tsx scripts/verify-inventory.ts"
   },
   "dependencies": {
     "@festpass/shared": "workspace:*",

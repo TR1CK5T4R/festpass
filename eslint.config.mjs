@@ -19,4 +19,9 @@ export default tseslint.config(
     files: ['apps/web/**'],
     settings: { next: { rootDir: 'apps/web' } },
   },
+  // k6 scripts run inside k6, not Node: it provides these globals.
+  {
+    files: ['infra/k6/**/*.js'],
+    languageOptions: { globals: { __ENV: 'readonly', __VU: 'readonly', open: 'readonly' } },
+  },
 );

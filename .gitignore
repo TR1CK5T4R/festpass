@@ -17,3 +17,6 @@ packages/db/src/generated/
 
 # HTML previews written by the console email provider (development)
 .email-previews/
+
+# Load-test users' tokens and k6 summaries, written by pnpm loadtest:setup and the k6 runs
+infra/k6/.data/

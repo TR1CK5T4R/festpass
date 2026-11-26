@@ -12,7 +12,9 @@
     "storage:init": "tsx --conditions=development --env-file-if-exists=../../.env scripts/storage-init.ts",
     "storage:upload-banner": "tsx --env-file-if-exists=../../.env scripts/upload-banner.ts",
     "webhook:simulate": "tsx --conditions=development --env-file-if-exists=../../.env scripts/webhook-simulate.ts",
-    "keys:generate": "tsx scripts/generate-ticket-keys.ts"
+    "keys:generate": "tsx scripts/generate-ticket-keys.ts",
+    "loadtest:api": "node --env-file-if-exists=../../.env scripts/loadtest-server.mjs",
+    "loadtest:setup": "tsx --conditions=development --env-file-if-exists=../../.env scripts/loadtest-setup.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1161.0",
