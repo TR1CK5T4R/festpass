@@ -93,6 +93,7 @@ export async function reserveInRedis(
   idempotencyKey: string,
   items: GateItem[],
 ): Promise<GateResult> {
+  if (env.BOOKING_GATE === 'off') return { kind: 'skipped', reason: 'gate turned off' };
   try {
     const [result, index, held] = await withTimeout(
       gateRedis.festpassReserve(

@@ -5,6 +5,7 @@ import { truncateAll } from '@festpass/db/testing';
 import { redisKeys } from '@festpass/shared';
 import request from 'supertest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { env } from '../src/config/env.js';
 import { ordersQueue } from '../src/lib/queues.js';
 import { gateRedis } from '../src/lib/redis.js';
 import { bookingStats } from '../src/modules/orders/stats.js';
@@ -414,6 +415,25 @@ describe('redis gate', () => {
     );
     expect([await stock(regular), await stock(vip)]).toEqual(['6', '3']);
     expect(await reconcileInventory(gateRedis)).toEqual([]); // nothing left to fix
+  });
+  it('BOOKING_GATE=off sends every booking to Postgres, which still sells exactly the capacity', async () => {
+    const { eventId, tierIds } = await saleEvent([{ name: 'Regular', capacity: 3 }]);
+    const tierId = tierIds[0]!;
+    const buyers = await makeUsers(6);
+    const before = { ...bookingStats };
+    env.BOOKING_GATE = 'off';
+    try {
+      const answers = await Promise.all(buyers.map((b) => book(b, eventId, [{ tierId, qty: 1 }])));
+
+      expect(answers.filter((r) => r.status === 201)).toHaveLength(3);
+      expect(answers.filter((r) => r.body.error?.code === 'SOLD_OUT')).toHaveLength(3);
+    } finally {
+      env.BOOKING_GATE = 'on';
+    }
+    expect(bookingStats.gateSkipped - before.gateSkipped).toBe(6);
+    expect(bookingStats.rejectedAtGate - before.rejectedAtGate).toBe(0);
+    expect(bookingStats.rejectedAtPostgres - before.rejectedAtPostgres).toBe(3);
+    expect(await stock(tierId)).toBe('3'); // the gate never touched its stock
   });
 });
 

@@ -48,6 +48,9 @@ const envSchema = z
     // How long a booking holds its tickets before they go back on sale if unpaid. Fractions are allowed
     // so tests can use a 2-second hold (0.034).
     HOLD_MINUTES: z.coerce.number().positive().max(60).default(10),
+    // The Redis booking gate. "off" sends every booking straight to Postgres: only for comparing the two
+    // in load tests. Bookings are correct either way; the gate only refuses a crowd sooner.
+    BOOKING_GATE: z.enum(['on', 'off']).default('on'),
     // Token-bucket limits per endpoint. Login counts per IP + email, register per IP (generous: a whole
     // campus can share one public IP), orders and presign per user.
     RATE_LIMIT_LOGIN: rateLimit('5/5'),
