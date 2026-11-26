@@ -1,5 +1,5 @@
 import { redisKeys } from '@festpass/shared';
-import { prisma } from './index.js';
+import { prisma, type PrismaClient } from './index.js';
 
 /** The two Redis commands reconciliation needs. An ioredis client fits; so does a fake in tests. */
 export interface InventoryStore {
@@ -46,4 +46,38 @@ export async function reconcileInventory(
     }
   }
   return drift;
+}
+
+export interface InventoryProblem {
+  tierId: string;
+  eventId: string;
+  tierName: string;
+  capacity: number;
+  soldCount: number;
+  /** Tickets in orders that still hold them: PENDING, PAID or TICKETED. */
+  held: number;
+}
+
+/**
+ * Tiers whose numbers don't add up: sold_count different from the tickets orders really hold, or more
+ * held than the capacity (an oversell). Empty means every ticket sold is accounted for exactly once.
+ * The CHECK constraint already stops sold_count passing capacity; this also catches orders that took
+ * tickets without sold_count moving, which no constraint can see. Run after load tests (and in tests).
+ */
+export async function findInventoryProblems(
+  db: Pick<PrismaClient, '$queryRaw'> = prisma,
+  eventId?: string,
+): Promise<InventoryProblem[]> {
+  return db.$queryRaw<InventoryProblem[]>`
+    SELECT t.id AS "tierId", t.event_id AS "eventId", t.name AS "tierName", t.capacity,
+           t.sold_count AS "soldCount",
+           COALESCE(SUM(oi.qty) FILTER (WHERE o.status IN ('PENDING', 'PAID', 'TICKETED')), 0)::int AS held
+    FROM ticket_tiers t
+    LEFT JOIN order_items oi ON oi.tier_id = t.id
+    LEFT JOIN orders o ON o.id = oi.order_id
+    WHERE ${eventId ?? null}::uuid IS NULL OR t.event_id = ${eventId ?? null}::uuid
+    GROUP BY t.id
+    HAVING t.sold_count <> COALESCE(SUM(oi.qty) FILTER (WHERE o.status IN ('PENDING', 'PAID', 'TICKETED')), 0)
+        OR COALESCE(SUM(oi.qty) FILTER (WHERE o.status IN ('PENDING', 'PAID', 'TICKETED')), 0) > t.capacity
+    ORDER BY t.event_id, t.name`;
 }
