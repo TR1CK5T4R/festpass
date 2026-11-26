@@ -49,8 +49,8 @@ describe('reserveTickets', () => {
     let booking: Promise<unknown> | undefined;
 
     // Another request (here: a hand-held transaction) has inserted this key but not committed. The
-    // booking can't see that row yet, so it reserves a ticket and then blocks on the unique index
-    // when it inserts its own key. Once the other transaction commits, the booking's INSERT fails.
+    // booking can't see that row yet, so it writes its order and then blocks on the unique index when
+    // it inserts its own key. Once the other transaction commits, the booking's INSERT fails.
     await prisma.$transaction(
       async (tx) => {
         await tx.$executeRaw`
@@ -73,5 +73,40 @@ describe('reserveTickets', () => {
     const tier = await prisma.ticketTier.findUniqueOrThrow({ where: { id: tierId } });
     expect(tier.soldCount).toBe(0); // its UPDATE was rolled back with everything else
     expect(await prisma.order.count({ where: { userId } })).toBe(0);
+  });
+
+  it('books at the new price when the organizer changes it while the booking waits for the tier', async () => {
+    // A hand-held transaction locks the tier, as a parallel price edit would. The booking reads the old
+    // price, writes its order, then waits on its UPDATE. The edit commits a new price, the UPDATE no
+    // longer matches, and the booking is redone at the new price instead of charging the old one.
+    let booking: ReturnType<typeof reserveTickets> | undefined;
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT id FROM ticket_tiers WHERE id = ${tierId}::uuid FOR UPDATE`;
+        booking = reserveTickets({
+          userId,
+          eventId,
+          items: [{ tierId, qty: 1 }],
+          holdSeconds: 600,
+          idempotencyKey: randomUUID(),
+          requestHash: 'price-race',
+        });
+        await new Promise((resolve) => setTimeout(resolve, 500)); // let it reach the UPDATE and wait
+        await tx.ticketTier.update({ where: { id: tierId }, data: { pricePaise: 12_500 } });
+      },
+      { timeout: 5000 },
+    );
+
+    const result = await booking!;
+    if (result === 'key-reused' || result.answer.status !== 201) throw new Error('not booked');
+    expect(result.answer.body.order).toMatchObject({
+      amountPaise: 12_500,
+      items: [expect.objectContaining({ unitPricePaise: 12_500 })],
+    });
+    const orders = await prisma.order.findMany({ where: { userId }, include: { items: true } });
+    expect(orders).toHaveLength(1); // the first attempt's order was undone
+    expect(orders[0]!.items[0]!.unitPricePaise).toBe(12_500);
+    const tier = await prisma.ticketTier.findUniqueOrThrow({ where: { id: tierId } });
+    expect(tier.soldCount).toBe(1);
   });
 });

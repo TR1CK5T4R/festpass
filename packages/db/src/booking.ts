@@ -112,12 +112,20 @@ async function reserveInTransaction(
   ) => ({ answer: await store({ status, body }), outcome: 'rejected' }) as const;
 
   // 3. Per-user limit: tickets this user already holds in each tier (unpaid holds count too, or someone
-  //    could stack holds to block a tier), plus this request, must stay within the tier's limit.
+  //    could stack holds to block a tier), plus this request, must stay within the tier's limit. The
+  //    prices and tickets left are read here too, without a lock; step 5 checks both again.
   const tierIds = items.map((i) => i.tierId);
   const tiers = await tx.$queryRaw<
-    { id: string; name: string; per_user_limit: number; held: number }[]
+    {
+      id: string;
+      name: string;
+      per_user_limit: number;
+      price_paise: number;
+      remaining: number;
+      held: number;
+    }[]
   >`
-    SELECT t.id, t.name, t.per_user_limit,
+    SELECT t.id, t.name, t.per_user_limit, t.price_paise, t.capacity - t.sold_count AS remaining,
            COALESCE((SELECT SUM(oi.qty) FROM order_items oi
                      JOIN orders o ON o.id = oi.order_id
                      WHERE oi.tier_id = t.id AND o.user_id = ${userId}::uuid
@@ -137,62 +145,83 @@ async function reserveInTransaction(
     if (tier.held + item.qty > tier.per_user_limit) {
       return reject(409, perUserLimit({ ...tier, perUserLimit: tier.per_user_limit }, tier.held));
     }
+    // Already sold out: refuse before writing anything. Only a "yes" needs the locked UPDATE below; a
+    // "no" read a moment early is the same as the buyer arriving a moment later. When the Redis gate
+    // is off or bypassed, this is what keeps a sold-out crowd's refusals cheap.
+    if (tier.remaining < item.qty) return reject(409, soldOut(tier));
   }
+  const prices = new Map(tiers.map((t) => [t.id, t.price_paise]));
 
-  // 4. Take the tickets. Each UPDATE locks its tier row; sorting by tier ID makes every transaction lock
-  //    rows in the same order, so two orders for tiers {A, B} and {B, A} can't each hold one row while
-  //    waiting for the other (a deadlock). The WHERE clause is the whole check: there is no "read the
-  //    count, then write" gap for another request to slip into. The savepoint lets a sold-out tier undo
-  //    the tiers already taken while the transaction still commits its stored answer.
-  await tx.$executeRaw`SAVEPOINT reserve`;
-  const sorted = [...items].sort((a, b) => (a.tierId < b.tierId ? -1 : 1));
-  const prices = new Map<string, number>();
-  for (const item of sorted) {
-    const [row] = await tx.$queryRaw<{ price_paise: number }[]>`
-      UPDATE ticket_tiers
-      SET sold_count = sold_count + ${item.qty}, updated_at = now()
-      WHERE id = ${item.tierId}::uuid AND sold_count + ${item.qty} <= capacity
-      RETURNING price_paise`;
-    if (!row) {
-      await tx.$executeRaw`ROLLBACK TO SAVEPOINT reserve`;
-      return reject(409, soldOut(byId.get(item.tierId)!));
+  // A tier's row stays locked from its UPDATE until COMMIT, and in a flash sale every buyer of that tier
+  // queues behind that lock. So the order is written first (4) and the tickets taken last (5): the lock is
+  // then held for the UPDATE and the COMMIT, not also for three INSERTs that are each a round trip from
+  // Node. The flash-sale load test measured the difference (README, Load test results). If a tier is
+  // sold out, the savepoint undoes the order again, and the transaction still commits a stored refusal.
+  for (let attempt = 1; ; attempt++) {
+    await tx.$executeRaw`SAVEPOINT reserve`;
+
+    // 4. The order holds the tickets until expires_at; an expired hold gives them back (Day 13).
+    const amount = items.reduce((sum, i) => sum + i.qty * prices.get(i.tierId)!, 0);
+    const [order] = await tx.$queryRaw<{ id: string; expires_at: Date }[]>`
+      INSERT INTO orders (user_id, event_id, status, amount_paise, expires_at)
+      VALUES (${userId}::uuid, ${eventId}::uuid, 'PENDING', ${amount},
+              now() + make_interval(secs => ${holdSeconds}::double precision))
+      RETURNING id, expires_at`;
+    for (const item of items) {
+      await tx.$executeRaw`
+        INSERT INTO order_items (order_id, tier_id, qty, unit_price_paise)
+        VALUES (${order!.id}::uuid, ${item.tierId}::uuid, ${item.qty}, ${prices.get(item.tierId)!})`;
     }
-    // The price comes from the locked row, so an organizer's edit can't change it mid-booking.
-    prices.set(item.tierId, row.price_paise);
-  }
-
-  // 5. The order holds the tickets until expires_at; an expired hold gives them back (Day 13).
-  const amount = items.reduce((sum, i) => sum + i.qty * prices.get(i.tierId)!, 0);
-  const [order] = await tx.$queryRaw<{ id: string; expires_at: Date }[]>`
-    INSERT INTO orders (user_id, event_id, status, amount_paise, expires_at)
-    VALUES (${userId}::uuid, ${eventId}::uuid, 'PENDING', ${amount},
-            now() + make_interval(secs => ${holdSeconds}::double precision))
-    RETURNING id, expires_at`;
-  for (const item of items) {
-    await tx.$executeRaw`
-      INSERT INTO order_items (order_id, tier_id, qty, unit_price_paise)
-      VALUES (${order!.id}::uuid, ${item.tierId}::uuid, ${item.qty}, ${prices.get(item.tierId)!})`;
-  }
-
-  const created = await store({
-    status: 201,
-    body: {
-      order: {
-        id: order!.id,
-        eventId,
-        status: 'PENDING',
-        amountPaise: amount,
-        expiresAt: order!.expires_at.toISOString(),
-        items: items.map((i) => ({
-          tierId: i.tierId,
-          tierName: byId.get(i.tierId)!.name,
-          qty: i.qty,
-          unitPricePaise: prices.get(i.tierId)!,
-        })),
+    const created = await store({
+      status: 201,
+      body: {
+        order: {
+          id: order!.id,
+          eventId,
+          status: 'PENDING',
+          amountPaise: amount,
+          expiresAt: order!.expires_at.toISOString(),
+          items: items.map((i) => ({
+            tierId: i.tierId,
+            tierName: byId.get(i.tierId)!.name,
+            qty: i.qty,
+            unitPricePaise: prices.get(i.tierId)!,
+          })),
+        },
       },
-    },
-  });
-  return { answer: created, outcome: 'booked' };
+    });
+
+    // 5. Take the tickets. Sorting by tier ID makes every transaction lock rows in the same order, so two
+    //    orders for tiers {A, B} and {B, A} can't each hold one row while waiting for the other (a
+    //    deadlock). The WHERE clause is the whole check: there is no "read the count, then write" gap
+    //    for another request to slip into. It also requires the price read in step 3, so nobody is
+    //    charged a price that changed in between.
+    const sorted = [...items].sort((a, b) => (a.tierId < b.tierId ? -1 : 1));
+    let refused: BookingItem | undefined;
+    for (const item of sorted) {
+      const taken = await tx.$executeRaw`
+        UPDATE ticket_tiers
+        SET sold_count = sold_count + ${item.qty}, updated_at = now()
+        WHERE id = ${item.tierId}::uuid AND sold_count + ${item.qty} <= capacity
+          AND price_paise = ${prices.get(item.tierId)!}`;
+      if (taken === 0) {
+        refused = item;
+        break;
+      }
+    }
+    if (!refused) return { answer: created, outcome: 'booked' };
+
+    await tx.$executeRaw`ROLLBACK TO SAVEPOINT reserve`;
+    // Sold out, or the price changed after step 3 (only possible before the first sale, when the price
+    // isn't locked yet). A changed price is retried with the new one; a third change in a row gives up
+    // with an error, and the client's retry (same Idempotency-Key) starts over.
+    const current = await tx.$queryRaw<{ id: string; price_paise: number }[]>`
+      SELECT id, price_paise FROM ticket_tiers WHERE id = ANY(${tierIds}::uuid[])`;
+    const changed = current.filter((t) => t.price_paise !== prices.get(t.id));
+    if (changed.length === 0) return reject(409, soldOut(byId.get(refused.tierId)!));
+    if (attempt === 3) throw new Error('ticket prices kept changing during the booking');
+    for (const t of changed) prices.set(t.id, t.price_paise);
+  }
 }
 
 /** Saves the answer under the key in the same transaction as the order, so they commit or fail together. */
