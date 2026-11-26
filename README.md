@@ -56,7 +56,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Exactly-once check-in and an offline-capable scanner PWA | Done (check-in API on Day 19, scanner PWA on Day 20): see [Scanner app](#scanner-app) |
 | Live availability and check-in dashboards | Done (Day 21): tiers update live on event pages, and organizers get a live counter and scan feed |
 | Virtual waiting room for flash sales | Done (Day 22): a fair line with a live position, admission at the organizer's rate, and signed tokens required to book |
-| Caching and load-tested performance | Done (Day 23): cached public reads, compression, and indexes chosen from measured query plans; load tests planned (Day 24) |
+| Caching and load-tested performance | Done: cached public reads, compression and measured indexes (Day 23); k6 flash-sale and browse load tests with zero oversells (Day 24), see [Load test results](#load-test-results) |
 | Organizer analytics, sponsor booth analytics and reports | Planned (Days 25–26) |
 | AI organizer copilot with permission-scoped tools | Planned (Day 27) |
 | Security hardening, observability and CI | Planned (Day 28) |
@@ -128,7 +128,7 @@ The [frontend README](apps/web/README.md) covers every screen, how pages are ren
 | Data | PostgreSQL 16 (Prisma 7.10 + raw SQL), MongoDB 7 (Mongoose 9.11), Redis 7 (ioredis 6.0) |
 | Storage and email | S3-compatible storage via AWS SDK v3 (SeaweedFS 4.50 locally, Cloudflare R2 in production), SendGrid dynamic templates |
 | Payments | Razorpay (test mode) |
-| Testing | Vitest 5.0, Supertest 7.3, k6 |
+| Testing | Vitest 5.0, Supertest 7.3, k6 2.3 (in Docker) |
 | CI/CD | GitHub Actions, Docker |
 | Tooling | pnpm 12 workspaces, ESLint 9 + typescript-eslint 8, Prettier 3 |
 
@@ -219,18 +219,22 @@ SELECT pg_advisory_xact_lock(hashtextextended(:userId || ':' || :eventId, 0));
 -- 2. A retry that waited on the lock finds the first request's stored answer and returns it.
 SELECT request_hash, status, response FROM idempotency_keys WHERE user_id = :userId AND key = :key;
 
--- 3. Per-user limit: tickets this user already holds in the tier (PENDING, PAID, TICKETED) + this request.
-SELECT t.id, t.per_user_limit, COALESCE(SUM(held qty), 0) ... FROM ticket_tiers t WHERE t.id = ANY(:tierIds);
+-- 3. Per-user limit: tickets this user already holds in the tier (PENDING, PAID, TICKETED) + this request,
+--    and each tier's price (read without a lock; step 5 checks it again).
+SELECT t.id, t.per_user_limit, t.price_paise, COALESCE(SUM(held qty), 0) ... FROM ticket_tiers t WHERE t.id = ANY(:tierIds);
 
--- 4. For each item, sorted by tier ID: take the tickets only if they still exist.
-UPDATE ticket_tiers SET sold_count = sold_count + :qty
-WHERE id = :tierId AND sold_count + :qty <= capacity
-RETURNING price_paise;          -- no row: sold out, ROLLBACK TO SAVEPOINT, answer 409 SOLD_OUT
-
--- 5. The hold, and the answer stored under the key, in the same transaction.
+-- 4. The hold, and the answer stored under the key, written first (inside a savepoint).
 INSERT INTO orders (..., status, expires_at) VALUES (..., 'PENDING', now() + make_interval(mins => :hold));
 INSERT INTO order_items ...;  INSERT INTO idempotency_keys (..., status, response) VALUES (..., 201, :body);
+
+-- 5. Last, for each item sorted by tier ID: take the tickets only if they still exist, at the price read.
+UPDATE ticket_tiers SET sold_count = sold_count + :qty
+WHERE id = :tierId AND sold_count + :qty <= capacity AND price_paise = :price;
+-- no row: ROLLBACK TO SAVEPOINT (the order is undone); sold out -> store 409 SOLD_OUT,
+-- price changed in between -> redo 4 and 5 with the new price
 ```
+
+- **The tickets are taken last (Day 24).** A tier's row stays locked from its `UPDATE` until `COMMIT`, and in a flash sale every buyer of that tier waits behind it. Writing the order first means the lock covers only the `UPDATE` and the `COMMIT`, not three more inserts that are each a round trip from Node. The load test measured the difference: see the gate comparison below.
 
 - **The conditional UPDATE is the whole check.** The `WHERE` clause is evaluated while holding the tier's row lock, against the latest committed `sold_count`, so there is no gap between reading and writing for another request to slip into. Under READ COMMITTED, a request that waited for the lock re-checks the condition against the winner's committed value.
 - **Tier IDs are sorted** so every transaction locks rows in the same order: two orders for {Day pass, Workshop} and {Workshop, Day pass} can't each hold one row while waiting for the other.
@@ -289,6 +293,22 @@ sequenceDiagram
 - **Refusals from the gate aren't stored** under the Idempotency-Key (that would be a Postgres write per refusal, which is what the gate avoids). Nothing was booked, so a retry simply asks again.
 - **Reconciliation:** `reconcileInventory()` (`packages/db/src/inventory.ts`) sets every `inv:*` of events still on sale from Postgres and reports what it fixed. The worker runs it every minute as a BullMQ job scheduler; the API runs it for one event after publishing or a tier change.
 - **Counters:** the API logs `booked`, `rejectedAtGate`, `rejectedAtPostgres`, `gateSkipped` and `compensated` once a minute. In the 200-buyer test with the gate on: 190 refused at Redis, 0 at Postgres.
+
+#### Gate on vs off, under load (Day 24)
+
+Measured with k6 on one laptop (setup under [Load test results](#load-test-results)), 500 tickets, `BOOKING_GATE=on` or `off`, three runs each:
+
+| Target rate | Gate | p95 | p99 | Attempts completed | Refusals that ran a Postgres transaction |
+|---|---|---|---|---|---|
+| 300/s | on | 8.8 ms | 19.5 ms | 4,499 of 4,500 | 0 |
+| 300/s | off | 9.8 ms | 32.9 ms | 4,499 of 4,500 | 3,999 |
+| 1,000/s | on | 29.7 ms | 110.1 ms | 14,998 of 15,000 | 0 |
+| 1,000/s | off | 1,377 ms | 2,453 ms | 11,374 of 15,000 | 10,874 |
+
+- **At 300/s** the two are close: Postgres keeps up, so the gate mostly saves database work (3,999 transactions per sale) rather than time.
+- **At 1,000/s** the difference is the whole point of the gate. With it, the roughly 14,500 people who arrived after the tickets were gone got a 409 from Redis in milliseconds, and Postgres only saw the 500 bookings. Without it, every one of them ran a transaction (advisory lock, reads, a stored refusal) through a pool of 10 connections, the queue grew faster than it drained, answers took seconds, and 18% to 64% of the attempts were never even sent because every virtual user was still waiting.
+- **Correct either way:** both sold exactly 500 in every run. The gate changes how fast people hear "no", never who gets a ticket.
+- **Two changes came out of the load test:** the tickets are now taken last in the transaction, so the tier's lock is held only for the `UPDATE` and the commit (at 400 bookings a second, p95 went from 404 to 31 ms; see Load test results); and a tier already sold out at step 3 is refused before anything is written, which keeps refusals cheap when the gate is off or bypassed.
 
 #### When Redis is down
 
@@ -712,6 +732,7 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `MONGODB_URI` | api, worker | MongoDB connection string (scan history). Tests use the `festpass_test` database on the same server |
 | `REDIS_PORT` | docker compose | Host port for Redis (default 6380) |
 | `REDIS_URL` | api, worker | Redis connection string (booking gate, BullMQ queues). Tests use database 15 of the same server |
+| `BOOKING_GATE` | api | `on` (default) or `off`. Off sends every booking straight to Postgres, only to compare the two in load tests; bookings are correct either way |
 | `HOLD_MINUTES` | api | How long a booking holds its tickets before they go back on sale if unpaid: minutes, up to 60, default 10. Fractions are allowed (`0.5` = 30 s, handy for watching an expiry) |
 | `RATE_LIMIT_LOGIN` | api | Token bucket for login, per IP + email, as `<burst>/<per minute>` (default `5/5`) |
 | `RATE_LIMIT_REGISTER` | api | Register, per IP (default `20/10`; generous because a campus can share one public IP) |
@@ -755,6 +776,11 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `pnpm db:studio` | Opens Prisma Studio to browse the tables |
 | `pnpm perf:seed` | Builds a separate `festpass_perf` database (created and migrated if needed) with 50 events, 58,300 orders and 100,142 tickets for realistic query plans; refuses any other database, so dev data is never touched |
 | `pnpm perf:explain` | Runs `EXPLAIN (ANALYZE, BUFFERS)` on the hot queries against `festpass_perf` and prints each plan with its median time over 7 runs |
+| `pnpm loadtest:api` | Builds the API and runs its production build against `festpass_perf` and Redis database 3 (`BOOKING_GATE=off` to turn the gate off) |
+| `pnpm loadtest:setup` | With that API running: a published event with one tier (`CAPACITY`, default 500) and `USERS` buyers (default 5,000) with signed tokens, written to `infra/k6/.data/sale.json` (gitignored) |
+| `pnpm loadtest:flash` | k6 (Docker) flash sale: arrivals ramp to `RATE` booking attempts a second (default 300); fails on any status other than 201, 409 or 429 |
+| `pnpm loadtest:browse` | k6 (Docker): `GET /events/:slug` at `RATE` requests a second (default 1,000) for 30 s |
+| `pnpm loadtest:verify` | Checks in SQL that every tier's `sold_count` equals the tickets its live orders hold and never exceeds capacity, and that the sale sold what k6 saw booked; exit code 1 otherwise |
 | `pnpm storage:init` | Creates the bucket, makes `orgs/*/events/*/banner/*` publicly readable and allows `WEB_ORIGINS` to POST uploads (CORS); safe to run repeatedly |
 | `pnpm keys:generate` | Prints a new Ed25519 key pair for ticket QR codes as `.env` lines (`TICKET_SIGNING_PRIVATE_KEY`, `NEXT_PUBLIC_TICKET_PUBLIC_KEY`) |
 | `pnpm webhook:simulate <orderId> [paymentId]` | Sends the local API a `payment.captured` webhook for the order, signed with `RAZORPAY_WEBHOOK_SECRET`; pass the printed payment ID again to send a duplicate |
@@ -846,6 +872,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/worker/test/expiry.test.ts` and the cancel tests: see [Hold expiry](#hold-expiry-day-13).
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
+- `packages/db/test/verify-inventory.test.ts`: the load-test check (`findInventoryProblems()`) passes on consistent data and fails when `sold_count` disagrees with the orders or orders hold more than the capacity. `packages/db/test/booking.test.ts`: a price edit committed while a booking waits for the tier books at the new price (removing the price condition from the `UPDATE` makes it fail). `apps/api/test/orders.test.ts`: with `BOOKING_GATE=off`, 6 buyers for 3 tickets get 3 bookings and 3 refusals, all decided in Postgres.
 - `apps/api/test/cache.test.ts` (real Redis and test database): a change made behind the API isn't seen while cached, and an update, tier change, publish or close through the API shows on the next read; tickets left come from `inv:*` and fall back to Postgres; Redis failing still answers from Postgres; a 404 isn't cached; 50 requests missing one key run one load; a load that started before an invalidation is never served afterwards; hits and misses have the same shape; `Cache-Control`, `304` and gzip. Breaking each guard by hand (no invalidation, no cache read, no shared load, no generation, no live stock) made these tests fail. `packages/db/test/constraints.test.ts` also checks that a ticket can't name another event than its order's.
 - `apps/api/test/waiting-room.test.ts` and `apps/worker/test/waiting-room.test.ts` (real Redis and test database), plus `apps/web/src/lib/waiting-room.test.ts` (wait text, check interval): see [Virtual waiting room](#virtual-waiting-room-day-22).
 - `apps/api/test/realtime.test.ts` and `apps/api/test/availability-throttle.test.ts`: see [Real-time updates](#real-time-updates-day-21). `apps/worker/test/expiry.test.ts` also checks that an expiry and the sweeper announce the change.
@@ -997,7 +1024,52 @@ and note the Lighthouse version, mobile or desktop preset, throttling and machin
 
 ## Load test results
 
-_Day 24. Only measured numbers, with the exact setup used._
+**Setup (all runs):** one MacBook Air (Apple M2, 4 performance + 4 efficiency cores, 8 GB RAM, macOS 27.2). Postgres 16.15, Redis 7 and k6 2.3.0 run in Docker (OrbStack, its VM given 8 CPUs and 4 GB); the API runs outside Docker as one Node 22.23 process from its production build (`pnpm loadtest:api`: `NODE_ENV=production`, the default `info` logging written to a file, the default database pool of 10 connections). No worker, no web app. The database is `festpass_perf` (`pnpm perf:seed`: 50 events, 58,300 orders, 100,142 tickets) and Redis database 3, so dev data is never touched. Each run gets a fresh event with one 500-ticket tier and fresh buyers from `pnpm loadtest:setup`, and the API is restarted for each run. The load generator, the API and both databases share the same 8 cores.
+
+**Flash sale** (`infra/k6/flash-sale.js`): booking attempts ramp from 0 to the target rate over 10 s, then stay there for 10 s, which is 15 attempts per second of target. Every attempt is a different buyer asking for 1 ticket, so 4,500 or 15,000 buyers compete for 500 tickets. Only `201`, `409` and `429` are accepted. Three runs per row; each column shows the median of the three runs, with the range in brackets.
+
+| Target rate | Gate | Attempts completed | Throughput | p50 | p95 | p99 | Refused inside Postgres | Unexpected status | Oversold |
+|---|---|---|---|---|---|---|---|---|---|
+| 300/s | on | 4,499 of 4,500 (all 3 runs) | 224.9 req/s | 3.1 ms | 8.8 ms (8.4–9.4) | 19.5 ms (19.1–20.8) | 0 | 0 | 0 |
+| 300/s | off | 4,499 (4,499–4,499) | 224.9 req/s | 4.0 ms | 9.8 ms (8.9–13.7) | 32.9 ms (26.3–62.4) | 3,999 | 0 | 0 |
+| 1,000/s | on | 14,998 of 15,000 (14,996–14,998) | 749.6 req/s | 1.6 ms | 29.7 ms (7.2–128.1) | 110.1 ms (48.8–263.4) | 0 | 0 | 0 |
+| 1,000/s | off | 11,374 of 15,000 (5,362–12,247) | 532.6 req/s | 141.0 ms | 1,377 ms (1,080–6,832) | 2,453 ms (1,899–8,367) | 10,874 | 0 | 0 |
+
+- **Correct in every run:** each of the 12 sold exactly 500 tickets. The 201s k6 counted, the orders and `sold_count` were equal, and `pnpm loadtest:verify` found every tier's `sold_count` equal to the tickets its live orders hold, never above capacity. No request got a status other than `201` or `409`; no `429` either, since each buyer booked once. Attempts are uncompleted when k6 has no free virtual user (3,000 at most) because answers are too slow; they were never sent, so they are not errors.
+- **Gate on vs off:** see [Preventing oversells](#preventing-oversells-day-11).
+- **Run-to-run spread is large** at 1,000/s, even with the gate on (p95 from 7.2 to 128 ms), because the load generator and the databases compete with the API for the same cores.
+
+**Bottleneck found and fixed: the tier's row lock.** With every attempt a booking (capacity 100,000, gate on, one run each), the API held 400 bookings a second before the fix but with a long tail, and collapsed at 800:
+
+| Booking-only rate | Before | After |
+|---|---|---|
+| 400/s | p50 13.0 ms, p95 404 ms, p99 439 ms; up to 8 of the 10 pool connections waiting on a row lock | p50 5.1 ms, p95 31.0 ms, p99 91.7 ms; at most 5 waiting |
+| 800/s | 4,753 of 12,000 completed, p50 1.8 s, p95 10.8 s | 6,112 of 12,000 completed, p50 1.1 s, p95 4.6 s |
+
+Every booking takes the one tier row's lock, and it was held from the `UPDATE` through three inserts and the commit, each a round trip from Node. Writing the order first and taking the tickets last holds it for the `UPDATE` and the commit only (`packages/db/src/booking.ts`, see Preventing oversells). At 800/s the API is still overloaded, but now the single Node process is the busiest part rather than the lock; more API instances would be the next step (Day 29).
+
+**Browse** (`infra/k6/browse.js`): `GET /events/:slug` at a constant rate for 30 s, one run each. Answers come from the Redis cache (Day 23), 758 bytes gzipped.
+
+| Rate | Requests | p50 | p95 | p99 | Failed | Not sent (no free virtual user) |
+|---|---|---|---|---|---|---|
+| 1,000/s | 30,004 | 0.9 ms | 2.2 ms | 7.8 ms | 0 | 0 |
+| 2,000/s | 60,000 | 0.6 ms | 1.4 ms | 3.5 ms | 0 | 0 |
+| 3,000/s | 87,875 (2,929/s) | 0.9 ms | 14.3 ms | 80.7 ms | 0 | 2,130 |
+
+**How to run it** (Docker running; the API in one terminal, the rest in another):
+
+```bash
+pnpm perf:seed
+pnpm loadtest:api
+USERS=15000 pnpm loadtest:setup
+RATE=1000 pnpm loadtest:flash
+pnpm loadtest:verify
+RATE=2000 pnpm loadtest:browse
+```
+
+For the gate off, start the API with `BOOKING_GATE=off pnpm loadtest:api` and run `loadtest:setup` again (a sale is used once). `loadtest:verify` exits with code 1 on any mismatch or oversell.
+
+**Limits of these numbers:** one laptop, so the load generator steals CPU from the system it measures and there is no network between them; one API process; data that fits in memory; 20-second runs, so nothing about hours of load (connection churn, vacuum, memory growth). They show the design holds and where it breaks on this machine, not what a production deployment will do.
 
 ## Deployment
 
@@ -1031,7 +1103,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 21 (Thu 19 Nov): Real-time updates with Socket.IO
 - [x] Day 22 (Fri 20 Nov): Virtual waiting room
 - [x] Day 23 (Sat 21 Nov): Caching and query performance
-- [ ] Day 24 (Sun 22 Nov): Load testing with k6
+- [x] Day 24 (Sun 22 Nov): Load testing with k6
 - [ ] Day 25 (Mon 23 Nov): Analytics pipelines and dashboards
 - [ ] Day 26 (Tue 24 Nov): Sponsor portal, booth scans and reports
 - [ ] Day 27 (Wed 25 Nov): AI organizer copilot
@@ -1288,6 +1360,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** copy `event_id` onto tickets, guarded by a two-column foreign key, rather than only indexing `orders(event_id)`. That index was measured too and only reached 8.4 ms, because the time went on scanning tickets.
 **Verify:** `pnpm test`, then `pnpm perf:seed` and `pnpm perf:explain`.
 **Next:** Day 24 load-tests the booking path with k6: a flash sale against the two-layer gate, with measured results.
+
+### Day 24: Load testing with k6 (2026-11-22)
+**Built:**
+- `pnpm loadtest:setup` (an event with a 500-ticket tier and thousands of buyers with tokens), k6 `flash-sale.js` and `browse.js` in Docker, and `pnpm loadtest:verify`, which fails on any oversell and is itself tested.
+- Runs against the production build: at 1,000 attempts a second, 500 sold in every run with zero oversells and no unexpected status; p95 29.7 ms with the Redis gate, 1,377 ms without it.
+- `BOOKING_GATE=on|off`, to compare the two.
+- Two booking fixes found by the load test: the tickets are taken last, so the tier lock covers only the `UPDATE` and the commit (400 bookings/s: p95 404 → 31 ms), and an already sold-out tier is refused before anything is written.
+
+**Key decision:** reorder the booking transaction to hold the hot row lock for as little as possible, rather than add connections or queue in the API, because the measured wait was on the lock, and Postgres still makes the final decision exactly as before.
+**Verify:** `pnpm test`; then `pnpm perf:seed`, `pnpm loadtest:api`, `USERS=15000 pnpm loadtest:setup`, `RATE=1000 pnpm loadtest:flash`, `pnpm loadtest:verify`.
+**Next:** Day 25 builds the analytics pipelines and dashboards.
 
 <!-- BUILD-LOG:END -->
 

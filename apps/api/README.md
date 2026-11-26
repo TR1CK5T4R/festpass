@@ -32,7 +32,8 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Socket.IO live updates | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 21) |
 | Waiting room | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 22) |
 | Caching and query performance | `apps/api`, `packages/db` | Done (Day 23) |
-| Load tests, analytics, sponsor reports | all | Planned (Days 24–26) |
+| Load tests | `apps/api`, `packages/db`, `infra/k6` | Done (Day 24) |
+| Analytics, sponsor reports | all | Planned (Days 25–26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
 | Security pass, metrics, Dockerfiles, CI | all | Planned (Day 28) |
 
@@ -100,6 +101,8 @@ apps/api/
   src/server.ts                     Connects Mongo, listens on API_PORT, attaches sockets, graceful shutdown
   scripts/storage-init.ts           Creates the bucket, public-read policy for banners, CORS for WEB_ORIGINS (idempotent)
   scripts/upload-banner.ts          The whole upload flow from the command line, as the web app will do it
+  scripts/loadtest-server.mjs       Starts the production build against festpass_perf and Redis database 3 (pnpm loadtest:api)
+  scripts/loadtest-setup.ts         A sale for k6: event, one tier, N buyers with signed tokens -> infra/k6/.data/sale.json
   test/                             auth, orgs, events, orders (concurrency, idempotency), uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
   vitest.config.ts                  Loads .env, forces NODE_ENV=test, silent logs, test database, one test file at a time
   tsconfig.json                     Typecheck config (src, test and scripts)
@@ -123,7 +126,7 @@ packages/db/
   prisma.config.ts       Prisma 7 CLI config: schema path, migrations, seed command, DATABASE_URL
   src/index.ts           Exports the PrismaClient singleton (pg driver adapter) and all generated types
   src/seed.ts            Idempotent demo seed; `seed(db)` is also imported by the tests
-  scripts/               perf-db.ts (the festpass_perf database, refuses any other), seed-bulk.ts (pnpm perf:seed), explain-hot.ts (pnpm perf:explain)
+  scripts/               perf-db.ts (the festpass_perf database, refuses any other), seed-bulk.ts (pnpm perf:seed), explain-hot.ts (pnpm perf:explain), verify-inventory.ts (pnpm loadtest:verify)
   src/emails.ts          @festpass/db/emails: claimEmail() (email_log row + 5-minute lease), markEmailSent(), releaseEmailClaim(), findOrderForEmail()
   src/tickets.ts         @festpass/db/tickets: issueTickets() (lock, PAID only, one per unit, ON CONFLICT (order_id, seq), PAID -> TICKETED), bumpQrVersion(),
                          findTicketForGate(), checkInTicket() (the guarded UPDATE that decides entry)
@@ -219,6 +222,13 @@ packages/mongo/
 - **Availability:** event pages overlay each tier's `available` (and `soldCount`) from `inv:{tierId}` on every request, hit or miss, keeping the Postgres number where Redis has none. List totals can be up to 30 s old.
 - **HTTP:** `compression()` in `app.ts`; `Cache-Control: public, max-age=5, stale-while-revalidate=25` on the two public reads (only when found); Express's ETags give `304`s.
 
+### Load tests (`infra/k6/`, `scripts/loadtest-*`, `packages/db/scripts/verify-inventory.ts`)
+
+- **Target:** `loadtest-server.mjs` sets `NODE_ENV=production`, points `DATABASE_URL` at `festpass_perf` and `REDIS_URL` at database 3, sends revalidation to a closed port, and imports `dist/server.js`. `BOOKING_GATE=off` from the shell turns the gate off (`orders/gate.ts` then reports `skipped` without calling Redis).
+- **Setup:** `loadtest-setup.ts` inserts a club and its owner, creates, prices and publishes the event through the API (so publishing loads the gate's stock as in production), inserts the buyers with `createManyAndReturn` and signs a 2-hour token for each with `JWT_ACCESS_SECRET`.
+- **k6** (`grafana/k6:2.3.0` in Docker, reaching the API at `host.docker.internal`): `flash-sale.js` uses a ramping arrival rate with one buyer per attempt (`exec.scenario.iterationInTest`), `http.expectedStatuses(201, 409, 429)` and thresholds that fail the run on any other status; `browse.js` a constant arrival rate. `report.js` prints the summary; the full JSON goes to `infra/k6/.data/`.
+- **Verify:** `findInventoryProblems()` (`packages/db/src/inventory.ts`) groups order items by tier and returns any tier where `sold_count` differs from the quantities in `PENDING`/`PAID`/`TICKETED` orders, or those exceed capacity. `verify-inventory.ts` runs it over every tier, compares the sale's `sold_count` with its orders and with k6's count of `201`s, and exits 1 on any difference.
+
 ### Query performance (`packages/db/scripts/`)
 
 `seed-bulk.ts` (`pnpm perf:seed`) creates and migrates `festpass_perf` and fills it with set-based SQL; `perf-db.ts` refuses any other database. `explain-hot.ts` (`pnpm perf:explain`) captures Prisma's SQL from its query log and runs `EXPLAIN (ANALYZE, BUFFERS)` on each hot query. The `hot_query_indexes` migration adds `tickets.event_id` (filled from each ticket's order, then `NOT NULL`), the `(order_id, event_id)` foreign key with its `orders(id, event_id)` unique key, `tickets(event_id, checked_in_at)`, and replaces `orders(status, expires_at)` with a partial index on pending orders (Prisma's `partialIndexes` preview feature, so the schema still describes every index). `issueTickets()` now writes `event_id`, and `listTicketsForGate()` and `countCheckins()` filter on it. Results are in the [project README](../../README.md#performance).
@@ -253,16 +263,14 @@ Done (Days 11–12): steps 1–5. Planned: hold expiry (Day 13).
 4. **One transaction** (`reserveTickets`, READ COMMITTED, raw SQL):
    1. `pg_advisory_xact_lock(hashtextextended(userId || ':' || eventId, 0))`: one user's requests for one event take turns until COMMIT/ROLLBACK, which releases the lock. Without it, one user's 20 parallel requests got 11 tickets against a limit of 2 in testing.
    2. Re-read the idempotency key: a duplicate that waited on the lock returns the first request's answer.
-   3. Per-user limit: the user's quantities in `PENDING`, `PAID` and `TICKETED` orders per tier, plus this request, must be within `per_user_limit` (else `409 PER_USER_LIMIT`).
-   4. `SAVEPOINT reserve`, then for each item **sorted by tier ID** (one lock order for everyone, so no deadlocks):
+   3. Per-user limit: the user's quantities in `PENDING`, `PAID` and `TICKETED` orders per tier, plus this request, must be within `per_user_limit` (else `409 PER_USER_LIMIT`). The same read returns each tier's price and tickets left; a tier already sold out is refused here (`409 SOLD_OUT`) before anything is written.
+   4. `SAVEPOINT reserve`, then `INSERT` the `PENDING` order (`expires_at = now() + HOLD_MINUTES`), its items (with `unit_price_paise`) and the `201` answer into `idempotency_keys`, so the order and its stored answer commit or fail together.
+   5. Last, for each item **sorted by tier ID** (one lock order for everyone, so no deadlocks):
       ```sql
       UPDATE ticket_tiers SET sold_count = sold_count + $qty, updated_at = now()
-      WHERE id = $tierId AND sold_count + $qty <= capacity
-      RETURNING price_paise;
+      WHERE id = $tierId AND sold_count + $qty <= capacity AND price_paise = $priceReadInStep3;
       ```
-      No row means sold out: `ROLLBACK TO SAVEPOINT reserve` gives back the tiers already taken and the answer is `409 SOLD_OUT` naming the tier. The price comes from the locked row.
-   5. `INSERT` the `PENDING` order (`expires_at = now() + HOLD_MINUTES`) and its items (with `unit_price_paise`).
-   6. `INSERT` the answer (status and body) into `idempotency_keys`, in the same transaction, so the order and its stored answer commit or fail together.
+      No row: `ROLLBACK TO SAVEPOINT reserve` undoes the order and the tiers already taken. If the price is unchanged it was sold out (`409 SOLD_OUT` stored); if an organizer changed the price in between, steps 4–5 run again with the new price (up to 3 attempts). Taking the tickets last holds each tier's row lock only for the `UPDATE` and the `COMMIT` (Day 24: measured under load, see the project README).
 5. **Compensation:** if the gate took stock but the transaction didn't book (refused, a replay, `key-reused` or an exception), the `release` script gives it back (`INCRBY` only on an existing `inv:` key, `DECRBY` the user's count). If that fails, Redis is left too low until reconciliation.
 6. If two requests use the same key for different events at once (different advisory locks), the unique `(user_id, key)` index makes the second one's INSERT fail; its whole transaction rolls back and it answers `422`.
 7. **Reconciliation:** `reconcileInventory()` sets `inv:*` from `capacity - sold_count` for published events whose sale hasn't ended: after publishing and tier changes (one event, 1 s limit) and every minute in the worker (all events). Drift is logged.
@@ -402,7 +410,7 @@ Tests use Vitest and Supertest against `createApp()`, without opening a port. `t
 
 ## Environment variables
 
-See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `TICKET_SIGNING_PRIVATE_KEY` (parsed as an Ed25519 key at startup), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN`, `RATE_LIMIT_QUEUE_JOIN` (`<burst>/<per minute>`), `ADMISSION_TOKEN_SECRET` (32+ characters, different from `JWT_ACCESS_SECRET`, also read by the worker), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
+See the full table in the [project README](../../README.md#environment-variables). The API loads the root `.env` with Node's `--env-file-if-exists` and validates it in `src/config/env.ts`: `NODE_ENV`, `API_PORT`, `LOG_LEVEL`, `DATABASE_URL`, `REDIS_URL`, `MONGODB_URI`, `JWT_ACCESS_SECRET` (32+ characters), `ACCESS_TOKEN_TTL_SECONDS` (default 900), `REFRESH_TOKEN_TTL_DAYS` (default 7), `WEB_ORIGINS` (comma-separated, default `http://localhost:3000`), `WEB_REVALIDATE_URL` (default `http://localhost:3000/api/revalidate`) and `REVALIDATE_SECRET` (32+ characters, shared with the web app), `BOOKING_GATE` (`on` or `off`, default `on`), `HOLD_MINUTES` (minutes, fractions allowed, up to 60, default 10), `ADMIN_EMAILS` (comma-separated), `RAZORPAY_KEY_ID` (must start with `rzp_test_`) and `RAZORPAY_KEY_SECRET` (both or neither; also read by the worker for refunds), `RAZORPAY_WEBHOOK_SECRET` (16+ characters), `TICKET_SIGNING_PRIVATE_KEY` (parsed as an Ed25519 key at startup), `RATE_LIMIT_LOGIN`, `RATE_LIMIT_REGISTER`, `RATE_LIMIT_ORDERS`, `RATE_LIMIT_PRESIGN`, `RATE_LIMIT_QUEUE_JOIN` (`<burst>/<per minute>`), `ADMISSION_TOKEN_SECRET` (32+ characters, different from `JWT_ACCESS_SECRET`, also read by the worker), and storage: `S3_ENDPOINT`, `S3_REGION` (default `us-east-1`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` and `S3_PUBLIC_URL`. If any is missing or malformed, the process prints every problem and exits with code 1 before opening a port. `packages/db` reads `DATABASE_URL` (Prisma CLI, seed), and tests use `DATABASE_URL_TEST`; the Prisma CLI and Vitest load the root `.env` themselves.
 
 ## Change history
 
@@ -426,6 +434,7 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
 - **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
 - **Day 20:** for the scanner: `GET /events/:eventId/checkins/manifest` and `listTicketsForGate()`; `tickets.checked_in_scan_id` (migration) and an optional `clientScanId` on `POST /checkins`, so a re-sent scan gets its original answer instead of a false conflict.
+- **Day 24:** load tests: `scripts/loadtest-server.mjs` (production build against `festpass_perf` and Redis database 3), `scripts/loadtest-setup.ts`, k6 scripts in `infra/k6/`, `findInventoryProblems()` and `pnpm loadtest:verify`; `BOOKING_GATE` env var; the booking transaction takes the tickets last and refuses an already sold-out tier before writing.
 - **Day 23:** cache-aside for `GET /events/:slug` and `GET /events` (`lib/cache.ts`) with generation-based invalidation, a shared load per key and live stock from `inv:*`; `compression` and `Cache-Control`; `pnpm perf:seed` and `pnpm perf:explain`; `tickets.event_id` with a two-column foreign key, `tickets(event_id, checked_in_at)` and a partial index for the sweeper.
 - **Day 22:** waiting room: `POST /events/:eventId/queue/join`, `GET /queue/status`, the `admit-waiting-rooms` job, admission tokens checked in `createOrder`, user rooms and `queue:admitted`; `ADMISSION_TOKEN_SECRET` and `RATE_LIMIT_QUEUE_JOIN`; fixed the console email provider crashing on `order-expired` and `refund-issued` previews.
 - **Day 21:** Socket.IO with `@socket.io/redis-adapter`, handshake auth, public and staff rooms, a per-event throttle with its claim in Redis, availability announced from booking, cancel, late payment and the worker's expiry and sweep; scans sent to the staff room; `GET /events/:eventId/checkins/summary`; shutdown closes sockets first.
