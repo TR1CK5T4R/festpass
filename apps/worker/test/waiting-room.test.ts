@@ -16,7 +16,9 @@ const deps = { redis, log: pino({ level: 'silent' }), admissionSecret: SECRET };
 let n = 0;
 async function makeEvent(data: Record<string, unknown> = {}) {
   n += 1;
-  const org = await prisma.organization.create({ data: { name: 'Club', slug: `club-${n}-${randomUUID()}` } });
+  const org = await prisma.organization.create({
+    data: { name: 'Club', slug: `club-${n}-${randomUUID()}` },
+  });
   const event = await prisma.event.create({
     data: {
       orgId: org.id,

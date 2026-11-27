@@ -218,7 +218,10 @@ export async function admitWaitingRooms(deps: WorkerDeps) {
   results.forEach((result, i) => {
     if (result.status === 'fulfilled') admitted += result.value;
     else
-      deps.log.error({ err: String(result.reason), eventId: eventIds[i] }, 'could not admit a room');
+      deps.log.error(
+        { err: String(result.reason), eventId: eventIds[i] },
+        'could not admit a room',
+      );
   });
   return { admitted };
 }
