@@ -18,7 +18,7 @@ Back to the [project README](../../README.md) · See also the [backend README](.
 | Scanner PWA with offline mode | volunteers | `/scan` | Done (Day 20) |
 | Live availability and check-in counter | attendees, organizers | event page, dashboard | Done (Day 21) |
 | Virtual waiting room | attendees | `/queue/[slug]` | Done (Day 22) |
-| Analytics charts | organizers | dashboard | Planned (Day 25) |
+| Analytics charts | owners, managers | `/dashboard/orgs/[orgId]/events/[eventId]` | Done (Day 25) |
 | Sponsor dashboard and booth-mode scanning | sponsors, volunteers | `/sponsor`, `/scan` | Planned (Day 26) |
 | AI copilot chat | organizers | dashboard | Planned (Day 27) |
 
@@ -64,6 +64,7 @@ apps/web/
     (app)/(dashboard)/dashboard/orgs/new/page.tsx  Create-club form
     (app)/(dashboard)/dashboard/queues/page.tsx    For admins: gets the API's admin cookie, then opens Bull Board (/admin/queues on the API)
   src/components/ui/                Button, Input/Textarea/Select/Checkbox, Card, Badge, Toast, EmptyState, ConfirmDialog
+  src/components/events/event-analytics.tsx  Four Recharts charts (tickets per day, tier fill, entries at the gate, who came in), stat tiles, table views
   src/components/events/live-tiers.tsx, live-checkins.tsx  Tier cards that update live; the organizer's counter and scan feed
   src/components/scan/              GateSetup, GateView (result panel, queue count, Needs a look list), Camera
   public/                           manifest.webmanifest, sw.js (the scanner's service worker), icons/
@@ -145,6 +146,16 @@ Route groups (folders in parentheses) organise pages without appearing in URLs: 
 - **Booking:** the book page fetches the token from `GET /queue/status`, shows the time to book by, and sends it as `X-Admission-Token`. A `403 ADMISSION_REQUIRED` (token expired, or queue mode just turned on) goes back to the waiting page.
 - **Organizer controls:** the event form's existing "Waiting room for the sale" checkbox and "People admitted per second" field, which take effect within a second.
 
+## Analytics (Day 25)
+
+- **Where:** on the organizer's event page, under the live check-ins, for roles with `analytics:read` and events that aren't drafts (`components/events/event-analytics.tsx`).
+- **Data:** `GET .../analytics/sales` and `/analytics/checkins` for both bucket sizes. Both are loaded, so switching between 5 and 15 minutes never blanks the chart while it waits for the API.
+- **Charts (Recharts 3):** each card holds one series in `brand-600`, which passes the dataviz palette checks on the white surface, with no legend because the title says what is plotted.
+  - Columns for tickets per day and for entries per bucket.
+  - Horizontal bars on a `brand-100` track for tier fill, labelled with the percentage.
+  - Horizontal bars for who came in, with a selector for college, branch, year or tier.
+- **Details:** bars are capped at 24 px with 4 px rounded ends and hairline gridlines, and animation is off. Tooltips put the value first. Each card has a "Show as a table" view, so no number needs a mouse. When the entries span more than one day, the time axis adds the date.
+
 ## Rendering strategy
 
 | Page | Rendering | Why |
@@ -221,5 +232,6 @@ The API must list the web app's origin in `WEB_ORIGINS` for CORS.
 - **Day 15:** booking and checkout: **Book** link on public pages, `(buyer)` route group with a login guard and `?next=` return, `/book/[slug]` with a per-attempt Idempotency-Key in `sessionStorage`, `/checkout/[orderId]` with countdown, Razorpay Checkout (test mode) and confirmation polling; the API client can send extra headers.
 - **Day 18:** My Tickets page (`/tickets`) with browser-drawn QR codes and a Download PDF button that fetches a fresh pre-signed link; links to it from checkout and the booking header.
 - **Day 20:** scanner PWA at `/scan`: gate setup, camera scanning with `@zxing/browser` and a paste fallback, online check-in with an offline fallback (signature, event, version and on-this-phone checks; IndexedDB queue via `idb`), ticket list download, sync with a "Needs a look" list, web app manifest and hand-written service worker; the API client tells "unreachable" from "logged out"; Scanner link in the dashboard.
+- **Day 25:** analytics on the organizer's event page: four Recharts charts with stat tiles and table views, for owners and managers.
 - **Day 22:** waiting room at `/queue/[slug]`: place in line, estimated wait, automatic redirect and a place that survives a reload; the book page sends the admission token and redirects when it has none; `onQueueAdmitted` on `useEventSocket`.
 - **Day 21:** live updates: `useEventSocket`, tier cards on `/e/[slug]` that update live (moved into the `LiveTiers` client component), a check-in counter and scan feed on the organizer's event page, `api.accessToken()` for the WebSocket handshake.

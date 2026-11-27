@@ -33,7 +33,8 @@ Back to the [project README](../../README.md) · See also the [frontend README](
 | Waiting room | `apps/api`, `apps/worker`, `packages/shared` | Done (Day 22) |
 | Caching and query performance | `apps/api`, `packages/db` | Done (Day 23) |
 | Load tests | `apps/api`, `packages/db`, `infra/k6` | Done (Day 24) |
-| Analytics, sponsor reports | all | Planned (Days 25–26) |
+| Organizer analytics | `apps/api`, `packages/db`, `packages/mongo` | Done (Day 25) |
+| Sponsor reports | all | Planned (Day 26) |
 | AI copilot with typed tools | `apps/api` | Planned (Day 27) |
 | Security pass, metrics, Dockerfiles, CI | all | Planned (Day 28) |
 
@@ -90,6 +91,7 @@ apps/api/
   src/sockets/index.ts              attachSockets(): Redis adapter, handshake auth, rooms, emitScan()
   src/sockets/availability.ts       announceChange(), the throttle, the shared read of current numbers
   src/modules/queue/                routes (POST /events/:eventId/queue/join, GET /queue/status), controller, service (sale checks, status)
+  src/modules/analytics/            routes (GET /orgs/:orgId/events/:eventId/analytics/sales, /checkins), controller, service (org check, 30 s cache), repository
   src/modules/checkins/             routes (GET /events/:eventId/checkins/manifest, /summary, POST /checkins, /batch), controller, service (verify, decide, persist the scan)
   src/modules/tickets/              routes (GET /me/tickets, GET /tickets/:id, POST /tickets/:id/reissue, GET /orders/:id/tickets-pdf), service (QR signed on read, owner checks, PDF link), repository
   src/modules/webhooks/             routes (express.raw, mounted before express.json), signature (HMAC + timingSafeEqual), service (verify, record, enqueue), repository
@@ -101,6 +103,8 @@ apps/api/
   src/server.ts                     Connects Mongo, listens on API_PORT, attaches sockets, graceful shutdown
   scripts/storage-init.ts           Creates the bucket, public-read policy for banners, CORS for WEB_ORIGINS (idempotent)
   scripts/upload-banner.ts          The whole upload flow from the command line, as the web app will do it
+  scripts/seed-analytics-demo.ts    pnpm demo:analytics: demo buyers, orders and gate scans for the seeded event
+  scripts/explain-checkins.ts       pnpm perf:explain-mongo: explain() of the check-in aggregation on 100,000 scans
   scripts/loadtest-server.mjs       Starts the production build against festpass_perf and Redis database 3 (pnpm loadtest:api)
   scripts/loadtest-setup.ts         A sale for k6: event, one tier, N buyers with signed tokens -> infra/k6/.data/sale.json
   test/                             auth, orgs, events, orders (concurrency, idempotency), uploads, cors, errors, health and env tests; helpers.ts (fast users and orgs) (Supertest, no open port); global-setup.ts migrates the test DB
@@ -133,6 +137,7 @@ packages/db/
   src/payments.ts        @festpass/db/payments: recordCapturedPayment() (insert once, lock, transition, re-reserve or refund_pending),
                          markPaymentRefunded(), findPayment(), findPendingRefunds()
   src/order-state.ts     @festpass/db/order-state: ORDER_TRANSITIONS, canTransition(), guarded transition()
+  src/analytics.ts       @festpass/db/analytics: tierSales(), salesByDay() (date_trunc in India time, generate_series)
   src/inventory.ts       @festpass/db/inventory: reconcileInventory(store) sets inv:{tierId} from Postgres and reports drift
   src/booking.ts         @festpass/db/booking: reserveTickets() (the raw-SQL booking transaction), findStoredAnswer(),
                          releaseHold() (guarded transition + sold_count back), findOverdueHolds()
@@ -159,7 +164,8 @@ packages/shared/
   test/money.test.ts     rupee/paise edge cases (₹99.99, ₹0.29, 3 decimals rejected) and a round trip up to ₹1,000
 packages/mongo/
   src/index.ts           connectMongo() (also creates the time-series collection), pingMongo(), disconnectMongo()
-  src/scan-event.ts      ScanEvent model on a time-series collection, recordScanEvent()
+  src/scan-event.ts      ScanEvent model on a time-series collection, the { meta.eventId, ts } index, recordScanEvent()
+  src/analytics.ts       checkinPipeline() ($match, $facet, $dateTrunc, $sortArray) and checkinAnalytics()
 ```
 
 **How packages are imported:** each package's `exports` has a `development` condition pointing at `src/index.ts`. The API's dev server (`tsx --conditions=development`), Vitest and TypeScript (`customConditions` in `tsconfig.base.json`) all use it, so a change in `packages/db` is picked up without a build step. `pnpm build` and `node dist/server.js` ignore it and use each package's compiled `dist/`.
@@ -221,6 +227,12 @@ packages/mongo/
 - **Stampede:** concurrent misses for the same key in one process share one load (`loading` map), so a popular key expiring costs one query per instance.
 - **Availability:** event pages overlay each tier's `available` (and `soldCount`) from `inv:{tierId}` on every request, hit or miss, keeping the Postgres number where Redis has none. List totals can be up to 30 s old.
 - **HTTP:** `compression()` in `app.ts`; `Cache-Control: public, max-age=5, stale-while-revalidate=25` on the two public reads (only when found); Express's ETags give `304`s.
+
+### Analytics (`src/modules/analytics/`, `packages/db/src/analytics.ts`, `packages/mongo/src/analytics.ts`)
+
+- **Route:** `requireAuth`, then the `eventParamsSchema` params, then `requireOrgPermission('analytics:read')`. The service then checks that the event belongs to the org (`404` otherwise) and wraps each answer in `cached()` for 30 s.
+- **Sales:** `tierSales()` sums order items per tier with `FILTER (WHERE status ...)`: paid is `PAID`/`TICKETED`, held is `PENDING`, and revenue is quantity times the price paid. `salesByDay()` groups paid orders by `date_trunc('day', created_at AT TIME ZONE 'Asia/Kolkata')` and fills quiet days with `generate_series`. Revenue comes back as `bigint` and is turned into a number. Both take the client as an argument, so `pnpm perf:explain` measures the same SQL.
+- **Check-ins:** `checkinPipeline()` does the gate scans' `$match`, then `$facet` (`$dateTrunc` timeline, results, top-10 college and branch, year, tier, entered count), then `$project` with `$sortArray` for the peak. `checkinAnalytics()` runs it and turns dates into ISO strings. The `{ 'meta.eventId': 1, ts: 1 }` index is declared on the schema and built by `ScanEvent.init()`.
 
 ### Load tests (`infra/k6/`, `scripts/loadtest-*`, `packages/db/scripts/verify-inventory.ts`)
 
@@ -434,6 +446,7 @@ See the full table in the [project README](../../README.md#environment-variables
 - **Day 18:** PDF tickets and email: `email_log` (migration) with claim/sent for once-only sending; worker `EmailProvider` (SendGrid dynamic templates, console preview), `send-tickets` (pdfkit + qrcode PDF in a private prefix, 24-hour pre-signed link, inline QR), `send-order-expired`, `send-refund-issued`; processors take a `WorkerDeps` object; `GET /orders/:id/tickets-pdf`; worker env for keys, storage and email.
 - **Day 19:** check-in: `POST /events/:eventId/checkins` and `/batch`, `requireEventPermission`, `checkInTicket()` (guarded `UPDATE` with `qr_version`), `ScanEvent` on a MongoDB time-series collection written after the commit, `write-scan-event` retry job, `MONGODB_URI` in the worker; every queue (including `emails`) now shows in Bull Board.
 - **Day 20:** for the scanner: `GET /events/:eventId/checkins/manifest` and `listTicketsForGate()`; `tickets.checked_in_scan_id` (migration) and an optional `clientScanId` on `POST /checkins`, so a re-sent scan gets its original answer instead of a false conflict.
+- **Day 25:** analytics endpoints (`/analytics/sales`, `/analytics/checkins`) with the `analytics:read` permission and a 30 s cache; `tierSales()`/`salesByDay()` in `@festpass/db/analytics`; `checkinPipeline()` and the scan index in `@festpass/mongo`; `pnpm demo:analytics` and `pnpm perf:explain-mongo`.
 - **Day 24:** load tests: `scripts/loadtest-server.mjs` (production build against `festpass_perf` and Redis database 3), `scripts/loadtest-setup.ts`, k6 scripts in `infra/k6/`, `findInventoryProblems()` and `pnpm loadtest:verify`; `BOOKING_GATE` env var; the booking transaction takes the tickets last and refuses an already sold-out tier before writing.
 - **Day 23:** cache-aside for `GET /events/:slug` and `GET /events` (`lib/cache.ts`) with generation-based invalidation, a shared load per key and live stock from `inv:*`; `compression` and `Cache-Control`; `pnpm perf:seed` and `pnpm perf:explain`; `tickets.event_id` with a two-column foreign key, `tickets(event_id, checked_in_at)` and a partial index for the sweeper.
 - **Day 22:** waiting room: `POST /events/:eventId/queue/join`, `GET /queue/status`, the `admit-waiting-rooms` job, admission tokens checked in `createOrder`, user rooms and `queue:admitted`; `ADMISSION_TOKEN_SECRET` and `RATE_LIMIT_QUEUE_JOIN`; fixed the console email provider crashing on `order-expired` and `refund-issued` previews.

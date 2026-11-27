@@ -9,7 +9,9 @@
 ![Organizer dashboard: a club's events with status and sold / capacity](.github/screenshots/organizer-events.png)
 
 <details>
-<summary>More screenshots: public event page, checkout, my tickets, event editor, team, job queues</summary>
+<summary>More screenshots: analytics, public event page, checkout, my tickets, event editor, team, job queues</summary>
+
+![Event analytics: tickets per day, tier fill, entries at the gate in 15-minute buckets, and who came in by college](.github/screenshots/analytics.png)
 
 ![Public event page: server-rendered with the banner, times in IST and ticket tiers](.github/screenshots/public-event.png)
 
@@ -57,7 +59,7 @@ As Sponsorship Coordinator at MAIT's Alumni Cell, I watched fest registrations r
 | Live availability and check-in dashboards | Done (Day 21): tiers update live on event pages, and organizers get a live counter and scan feed |
 | Virtual waiting room for flash sales | Done (Day 22): a fair line with a live position, admission at the organizer's rate, and signed tokens required to book |
 | Caching and load-tested performance | Done: cached public reads, compression and measured indexes (Day 23); k6 flash-sale and browse load tests with zero oversells (Day 24), see [Load test results](#load-test-results) |
-| Organizer analytics, sponsor booth analytics and reports | Planned (Days 25–26) |
+| Organizer analytics, sponsor booth analytics and reports | Organizer analytics done (Day 25): sales per day and per tier from Postgres, entries over time and who came from MongoDB, charted on the event page. Sponsor analytics and reports planned (Day 26) |
 | AI organizer copilot with permission-scoped tools | Planned (Day 27) |
 | Security hardening, observability and CI | Planned (Day 28) |
 | Live deployment | Planned (Day 29) |
@@ -558,9 +560,56 @@ Any move not drawn here throws in `transition()`, and every move is a guarded `U
 
 **Tested by:** `apps/api/test/waiting-room.test.ts`: positions follow join order and joining again keeps the place; 10 users are admitted in join order; a booking with no token is refused and takes no stock; expired, another user's, another event's and wrongly signed tokens are refused; a token doesn't get past a sold-out tier; a retry whose token has expired still gets its order; join is rate-limited; two overlapping admission runs admit nobody twice; `queue:admitted` reaches only the admitted user, once, across two API instances; admission tokens are redacted from logs. `apps/worker/test/waiting-room.test.ts`: the rate per tick, a new rate on the next tick, each event at its own rate, and the line being deleted when queue mode goes off, the event closes or the sale ends. Removing the token check, the subject check, the ordering or `io.local` by hand each made these tests fail. Live, on one laptop with one API instance and one worker: three browsers at position 1, 2 and 3 with the rate set to 1 in the organizer form, a reload that kept position 3, and arrival at booking 1.6, 2.6 and 3.5 seconds after the worker started, each through to checkout. Turning queue mode off sent a waiting fourth user to booking with no worker running.
 
+### Analytics (Day 25)
+
+**Problem:** organizers want to know how the sale went and who came, while it happens. The data is in two places: orders in Postgres, scans in MongoDB. Loading every order or scan into Node to count them would move thousands of documents to produce a handful of numbers, on every refresh.
+
+**Approach:** every number is computed by the database that holds it, and only the result travels.
+
+- **Sales (Postgres, `packages/db/src/analytics.ts`):** per tier, paid and held tickets and revenue, using `SUM ... FILTER (WHERE status ...)` over order items. Per day, `date_trunc('day', created_at AT TIME ZONE 'Asia/Kolkata')`, so a sale at 00:30 India time counts for that day, not the UTC day before. `generate_series` fills the days with no sales, so a quiet day shows as zero instead of disappearing from the chart.
+- **Check-ins (MongoDB, `packages/mongo/src/analytics.ts`):** one aggregation. A `$match` on the event's gate scans is served by the new `{ meta.eventId: 1, ts: 1 }` index. Then a `$facet` runs the timeline (`$dateTrunc` into 5- or 15-minute buckets), the results and the college, branch, year and tier breakdowns over the same documents in one round trip. A final `$sortArray` picks the peak bucket. No join back to Postgres is needed, because the attendee's college, branch, year and tier were copied onto each scan when it was written (Day 19).
+- **Endpoints:** `GET /orgs/:orgId/events/:eventId/analytics/sales` and `/analytics/checkins?bucket=5|15`, for owners and managers only (`analytics:read`: gate scanners don't see revenue). Answers are cached for 30 s with the same cache-aside as public pages (`lib/cache.ts`).
+- **Dashboard:** four Recharts charts on the organizer's event page (`apps/web/src/components/events/event-analytics.tsx`): tickets per day, tier fill, entries at the gate and who came in. Each is a single series in the brand blue, checked against the white surface for contrast, and each has a table view.
+
+The check-in pipeline (`checkinPipeline()`):
+
+```js
+[
+  { $match: { 'meta.eventId': eventId, 'meta.type': 'GATE' } },
+  { $facet: {
+      timeline: [
+        { $match: { result: 'ACCEPTED' } },
+        { $group: { _id: { $dateTrunc: { date: '$ts', unit: 'minute', binSize: 15 } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ],
+      results: [{ $group: { _id: '$result', count: { $sum: 1 } } }, { $sort: { count: -1, _id: 1 } }],
+      college: [{ $match: { result: 'ACCEPTED' } }, { $group: { _id: '$college', count: { $sum: 1 } } },
+                { $sort: { count: -1, _id: 1 } }, { $limit: 10 }],
+      // branch, graduationYear and tier: the same shape
+      entered: [{ $match: { result: 'ACCEPTED' } }, { $count: 'n' }],
+  } },
+  { $project: { /* ... */ peak: { $first: { $sortArray: { input: '$timeline', sortBy: { count: -1, at: 1 } } } } } },
+]
+```
+
+**Measured** (MacBook Air M2; MongoDB 7.0.45 in Docker; `pnpm perf:explain-mongo`: 100,000 generated scans for 50 events, inserted in time order as real scans arrive, which packs them into 1,386 time-series buckets; the sample event has 9,957 scans; median of 7 runs):
+
+| | Plan | Buckets read | Whole aggregation |
+|---|---|---|---|
+| With `{ meta.eventId: 1, ts: 1 }` | `IXSCAN` then `FETCH` | 156 of 1,386 | 13.1 ms |
+| Forced to ignore it (`$natural`) | `COLLSCAN` | 1,386 | 13.3 ms |
+
+The index cuts the buckets read by about 9 times, but at this size the time is the same, because most of the work is unpacking and grouping the event's 9,957 scans, not finding them. The gap grows with the number of events in the collection. On the Postgres side (`pnpm perf:explain`, 58,300 orders), sales per tier takes 5.5 ms and sales per day 7.6 ms. Both read every order item, because the planner prefers one hash join over 1,500 index lookups. Indexes on `order_items(tier_id)` (unused by the planner) and `orders(event_id, status)` (7.6 → 5.0 ms) were measured and left out: with a 30 s cache, they aren't worth the extra writes on every booking.
+
+**Tested by:** `apps/api/test/analytics.test.ts`, with fixtures worked out by hand:
+- Sales: 3 paid Regular and 2 paid VIP tickets, ₹2,895.00 in all; a sale at 00:30 India time counted on the next day; a quiet day reported as zero; held, expired and refunded orders not counted as revenue.
+- Check-ins: 6 entries in buckets of 2, 3 and 1, with the peak at 04:45 UTC (0.2 a minute); 5-minute buckets with the earliest bucket winning a tie; refusals counted only in the results; booth scans and another event's scans left out; exact college, branch, year and tier counts.
+- Access: answers are cached for 30 s, owners and managers can read them, scanners get `403`, other clubs `404`.
+
+**Limits:** numbers can be up to 30 s old, and there is no date-range filter yet.
+
 **Planned:**
 
-- Load test of the two-layer design (Day 24)
 - Sponsor analytics and privacy (Day 26)
 - AI copilot safety (Day 27)
 
@@ -575,6 +624,7 @@ A college club is an **organization**; each member has one role in it. The matri
 | `event:create` / `event:update` | ✓ | ✓ | |
 | `event:publish` | ✓ | ✓ | |
 | `checkin:scan`: scan tickets at the gate | ✓ | ✓ | ✓ |
+| `analytics:read`: sales and check-in analytics, including revenue | ✓ | ✓ | |
 
 - Enforced by `requireOrgPermission(action)` (`apps/api/src/middleware/require-org-permission.ts`) on every org route. The UI may hide buttons, but the API is the boundary.
 - Not a member of the org: **404**, exactly like an org that doesn't exist, so org IDs can't be probed. A member without the permission: **403**.
@@ -773,9 +823,11 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | `pnpm db:migrate` | Applies pending Prisma migrations (and creates a new one if the schema changed) |
 | `pnpm db:reset` | Drops the database and re-applies every migration (destroys local data) |
 | `pnpm db:seed` | Inserts demo data; safe to run repeatedly |
+| `pnpm demo:analytics` | After `pnpm db:seed`: gives the seeded event 160 demo buyers, paid orders over ten days and gate scans on the event day, so its analytics have something to show. Deterministic, and safe to run again |
 | `pnpm db:studio` | Opens Prisma Studio to browse the tables |
 | `pnpm perf:seed` | Builds a separate `festpass_perf` database (created and migrated if needed) with 50 events, 58,300 orders and 100,142 tickets for realistic query plans; refuses any other database, so dev data is never touched |
 | `pnpm perf:explain` | Runs `EXPLAIN (ANALYZE, BUFFERS)` on the hot queries against `festpass_perf` and prints each plan with its median time over 7 runs |
+| `pnpm perf:explain-mongo` | `explain()` of the check-in aggregation on 100,000 generated scans in a separate `festpass_perf` Mongo database, with the index and forced to ignore it |
 | `pnpm loadtest:api` | Builds the API and runs its production build against `festpass_perf` and Redis database 3 (`BOOKING_GATE=off` to turn the gate off) |
 | `pnpm loadtest:setup` | With that API running: a published event with one tier (`CAPACITY`, default 500) and `USERS` buyers (default 5,000) with signed tokens, written to `infra/k6/.data/sale.json` (gitignored) |
 | `pnpm loadtest:flash` | k6 (Docker) flash sale: arrivals ramp to `RATE` booking attempts a second (default 300); fails on any status other than 201, 409 or 429 |
@@ -820,6 +872,8 @@ The gate app for volunteers, at `/scan`. It needs a club role with `checkin:scan
 | POST | `/api/v1/orgs/:orgId/events` | `event:create` | Body `{ title, description?, venue, startsAt, endsAt, saleStartsAt, saleEndsAt, queueMode?, admitRatePerSec? }` (ends after start, sales end by the event's end; waiting room off and 50/s by default, rate 1–1000). Creates a DRAFT; the slug comes from the title, with a 4-character suffix if taken. `201 { event }` |
 | GET | `/api/v1/orgs/:orgId/events` | `org:read` | All of the org's events, any status, `{ items, nextCursor }`; each item has `capacity` and `soldCount` summed over its tiers |
 | GET | `/api/v1/orgs/:orgId/events/:eventId` | `org:read` | `200 { event }` with its tiers (`soldCount`, `available`) |
+| GET | `/api/v1/orgs/:orgId/events/:eventId/analytics/sales` | `analytics:read` | `200 { sales: { tiers: [{ tierId, name, capacity, paid, held, revenuePaise }], days: [{ day, tickets, revenuePaise }], totals } }`. Days are India-time calendar days, from the first paid order to the last, quiet days included. Cached 30 s; `404` for another club's event |
+| GET | `/api/v1/orgs/:orgId/events/:eventId/analytics/checkins?bucket=15` | `analytics:read` | `bucket` is `5` or `15` (default). `200 { checkins: { bucketMinutes, timeline: [{ at, count }], peak: { at, count, perMinute } \| null, results: [{ value, count }], breakdown: { college, branch, graduationYear, tier }, totals: { entered } } }`, from accepted gate scans. Cached 30 s |
 | PATCH | `/api/v1/orgs/:orgId/events/:eventId` | `event:update` | Partial update; dates re-checked together, tier sale windows must still fit. The slug never changes. `bannerKey` (from presign) is saved only after `HeadObject` confirms the object exists, is JPEG/PNG/WebP and at most 2 MB, else `400` on `bannerKey`; `null` removes the banner. `409 EVENT_CLOSED` once closed |
 | POST | `/api/v1/uploads/presign` | Bearer, `event:update` on the event's org | Body `{ eventId, contentType: image/jpeg \| image/png \| image/webp }`. `201 { upload: { url, fields, key, maxBytes, expiresAt } }`: POST a multipart form to `url` with every `fields` entry, then the file as `file`, within 5 minutes. `400` for another type, `404` for non-members (same as a missing event), `403` for scanners |
 | POST | `/api/v1/orgs/:orgId/events/:eventId/publish` | `event:publish` | DRAFT → PUBLISHED. `409 NO_TIERS` without tiers, `409 EVENT_IN_PAST` if it already started, `409 INVALID_TRANSITION` otherwise |
@@ -873,6 +927,7 @@ Run `pnpm test`. The `packages/db` tests need Postgres running, because constrai
 - `apps/api/test/checkins.test.ts` and `apps/worker/test/scan-events.test.ts`: see [Exactly-once entry](#exactly-once-entry-day-19).
 - `apps/web/src/lib/scan/offline.test.ts`: see [Offline scanning and its limits](#offline-scanning-and-its-limits-day-20).
 - `packages/db/test/verify-inventory.test.ts`: the load-test check (`findInventoryProblems()`) passes on consistent data and fails when `sold_count` disagrees with the orders or orders hold more than the capacity. `packages/db/test/booking.test.ts`: a price edit committed while a booking waits for the tier books at the new price (removing the price condition from the `UPDATE` makes it fail). `apps/api/test/orders.test.ts`: with `BOOKING_GATE=off`, 6 buyers for 3 tickets get 3 bookings and 3 refusals, all decided in Postgres.
+- `apps/api/test/analytics.test.ts` (test database and `festpass_test` in MongoDB): both pipelines against hand-built fixtures with exact expected numbers. See [Analytics](#analytics-day-25).
 - `apps/api/test/cache.test.ts` (real Redis and test database): a change made behind the API isn't seen while cached, and an update, tier change, publish or close through the API shows on the next read; tickets left come from `inv:*` and fall back to Postgres; Redis failing still answers from Postgres; a 404 isn't cached; 50 requests missing one key run one load; a load that started before an invalidation is never served afterwards; hits and misses have the same shape; `Cache-Control`, `304` and gzip. Breaking each guard by hand (no invalidation, no cache read, no shared load, no generation, no live stock) made these tests fail. `packages/db/test/constraints.test.ts` also checks that a ticket can't name another event than its order's.
 - `apps/api/test/waiting-room.test.ts` and `apps/worker/test/waiting-room.test.ts` (real Redis and test database), plus `apps/web/src/lib/waiting-room.test.ts` (wait text, check interval): see [Virtual waiting room](#virtual-waiting-room-day-22).
 - `apps/api/test/realtime.test.ts` and `apps/api/test/availability-throttle.test.ts`: see [Real-time updates](#real-time-updates-day-21). `apps/worker/test/expiry.test.ts` also checks that an expiry and the sweeper announce the change.
@@ -1104,7 +1159,7 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 - [x] Day 22 (Fri 20 Nov): Virtual waiting room
 - [x] Day 23 (Sat 21 Nov): Caching and query performance
 - [x] Day 24 (Sun 22 Nov): Load testing with k6
-- [ ] Day 25 (Mon 23 Nov): Analytics pipelines and dashboards
+- [x] Day 25 (Mon 23 Nov): Analytics pipelines and dashboards
 - [ ] Day 26 (Tue 24 Nov): Sponsor portal, booth scans and reports
 - [ ] Day 27 (Wed 25 Nov): AI organizer copilot
 - [ ] Day 28 (Thu 26 Nov): Security, observability and CI
@@ -1371,6 +1426,17 @@ The project is built in 30 daily slices. Each day ships working, tested code and
 **Key decision:** reorder the booking transaction to hold the hot row lock for as little as possible, rather than add connections or queue in the API, because the measured wait was on the lock, and Postgres still makes the final decision exactly as before.
 **Verify:** `pnpm test`; then `pnpm perf:seed`, `pnpm loadtest:api`, `USERS=15000 pnpm loadtest:setup`, `RATE=1000 pnpm loadtest:flash`, `pnpm loadtest:verify`.
 **Next:** Day 25 builds the analytics pipelines and dashboards.
+
+### Day 25: Analytics pipelines and dashboards (2026-11-23)
+**Built:**
+- Sales analytics in Postgres: per tier and per day in India time (`date_trunc`, with `generate_series` filling quiet days).
+- Check-in analytics in one MongoDB aggregation: a `$dateTrunc` timeline in 5- or 15-minute buckets, the peak, and college, branch, year and tier breakdowns through `$facet`, on a new `{ meta.eventId, ts }` index; `pnpm perf:explain-mongo` explains it on 100,000 scans.
+- `GET .../analytics/sales` and `/analytics/checkins`, cached 30 s, for owners and managers (`analytics:read`).
+- Four Recharts charts on the organizer's event page, and `pnpm demo:analytics` to give the seeded event data to show.
+
+**Key decision:** one `$facet` aggregation over scans that already carry the attendee's details, rather than joining scans to Postgres users, so the whole dashboard is one query in one database.
+**Verify:** `pnpm test`; then `pnpm db:seed`, `pnpm demo:analytics` and `pnpm dev`, and open the seeded event in the organizer dashboard.
+**Next:** Day 26 builds the sponsor portal: booth scans, sponsor analytics and reports.
 
 <!-- BUILD-LOG:END -->
 
