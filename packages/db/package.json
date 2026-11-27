@@ -43,6 +43,11 @@
       "development": "./src/emails.ts",
       "types": "./dist/emails.d.ts",
       "default": "./dist/emails.js"
+    },
+    "./analytics": {
+      "development": "./src/analytics.ts",
+      "types": "./dist/analytics.d.ts",
+      "default": "./dist/analytics.js"
     }
   },
   "scripts": {

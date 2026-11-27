@@ -1,3 +1,4 @@
+import { salesByDay, tierSales } from '../src/analytics.js';
 import { perfClient } from './perf-db.js';
 
 // EXPLAIN (ANALYZE, BUFFERS) for the hot queries, against festpass_perf (pnpm perf:seed first).
@@ -235,5 +236,9 @@ for (const [label, eventId] of [
     await sqlOf(() => db.ticket.count({ where: { eventId, checkedInAt: { not: null } } })),
   );
 }
+
+// packages/db/src/analytics.ts: the organizer's sales dashboard (largest event)
+await measure('analytics: sales per tier', await sqlOf(() => tierSales(sample.event_id, db)));
+await measure('analytics: sales per day', await sqlOf(() => salesByDay(sample.event_id, db)));
 
 await db.$disconnect();
