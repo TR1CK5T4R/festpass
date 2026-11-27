@@ -48,6 +48,11 @@ const scanEventSchema = new Schema<ScanEventData>(
   },
 );
 
+// The dashboards ask for one event's scans, usually over a time range: eventId first (equality), then
+// ts (range and order). On a time-series collection this index is built on the buckets, so a query for
+// one event reads only that event's buckets.
+scanEventSchema.index({ 'meta.eventId': 1, ts: 1 });
+
 export const ScanEvent = mongoose.model<ScanEventData>('ScanEvent', scanEventSchema);
 
 export async function recordScanEvent(event: ScanEventData): Promise<void> {

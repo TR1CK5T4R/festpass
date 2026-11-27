@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { ScanEvent } from './scan-event.js';
 
+export * from './analytics.js';
 export * from './scan-event.js';
 
 // The shared Mongo connection. Models (scan events, later copilot conversations) live in this package.
