@@ -6,6 +6,7 @@ import { useParams } from 'next/navigation';
 import { useEffect } from 'react';
 import { BannerUploader } from '@/components/events/banner-uploader';
 import { EventActions } from '@/components/events/event-actions';
+import { EventAnalytics } from '@/components/events/event-analytics';
 import { EventForm } from '@/components/events/event-form';
 import { LiveCheckins } from '@/components/events/live-checkins';
 import { StatusBadge } from '@/components/events/status-badge';
@@ -77,6 +78,9 @@ export default function EventPage() {
       )}
 
       {event.status !== 'DRAFT' && <LiveCheckins eventId={event.id} />}
+      {event.status !== 'DRAFT' && can(role, 'analytics:read') && (
+        <EventAnalytics orgId={orgId} eventId={event.id} />
+      )}
       <BannerUploader event={event} canEdit={canEdit} onChange={setEvent} />
       <TierEditor event={event} canEdit={canEdit} onChanged={reload} />
       <Card>
