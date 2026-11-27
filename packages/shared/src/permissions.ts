@@ -11,13 +11,21 @@ export const ORG_ACTIONS = [
   'event:update',
   'event:publish',
   'checkin:scan',
+  'analytics:read',
 ] as const;
 export type OrgAction = (typeof ORG_ACTIONS)[number];
 
 export const PERMISSIONS: Record<OrgRole, readonly OrgAction[]> = {
   OWNER: ORG_ACTIONS,
-  MANAGER: ['org:read', 'event:create', 'event:update', 'event:publish', 'checkin:scan'],
-  // Gate volunteers: they see which org they scan for, and scan. Nothing else.
+  MANAGER: [
+    'org:read',
+    'event:create',
+    'event:update',
+    'event:publish',
+    'checkin:scan',
+    'analytics:read',
+  ],
+  // Gate volunteers: they see which org they scan for, and scan. Nothing else (no revenue).
   SCANNER: ['org:read', 'checkin:scan'],
 };
 

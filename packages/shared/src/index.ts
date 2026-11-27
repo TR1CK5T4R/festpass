@@ -31,3 +31,4 @@ export * from './qr.ts';
 export * from './checkins.ts';
 export * from './realtime.ts';
 export * from './waiting-room.ts';
+export * from './analytics.ts';

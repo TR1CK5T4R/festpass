@@ -22,6 +22,7 @@ const EXPECTED: Record<OrgRole, Record<OrgAction, boolean>> = {
     'event:update': true,
     'event:publish': true,
     'checkin:scan': true,
+    'analytics:read': true,
   },
   MANAGER: {
     'org:read': true,
@@ -30,6 +31,7 @@ const EXPECTED: Record<OrgRole, Record<OrgAction, boolean>> = {
     'event:update': true,
     'event:publish': true,
     'checkin:scan': true,
+    'analytics:read': true,
   },
   SCANNER: {
     'org:read': true,
@@ -38,6 +40,7 @@ const EXPECTED: Record<OrgRole, Record<OrgAction, boolean>> = {
     'event:update': false,
     'event:publish': false,
     'checkin:scan': true,
+    'analytics:read': false,
   },
 };
 
