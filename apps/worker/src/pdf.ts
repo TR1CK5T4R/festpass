@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit';
 import QRCode from 'qrcode';
+import type { SponsorAnalytics } from '@festpass/shared';
 
 export interface PdfTicket {
   code: string;
@@ -55,6 +56,84 @@ export async function buildTicketsPdf(input: TicketsPdfInput): Promise<Buffer> {
       .fillColor('#5b6577')
       .text('Show this QR at the entrance. Each ticket gets in once.', { align: 'center' });
   });
+  doc.end();
+  return done;
+}
+
+const percent = (share: number | null) => (share === null ? 'n/a' : `${Math.round(share * 100)}%`);
+
+/**
+ * The sponsor's post-event report, one A4 page of counts. Like the dashboard it holds no names, emails
+ * or ticket IDs, and small groups are already folded into "Other" by the aggregation.
+ */
+export async function buildSponsorReportPdf(
+  report: SponsorAnalytics,
+  eventDate: string,
+): Promise<Buffer> {
+  const doc = new PDFDocument({
+    size: 'A4',
+    margin: 50,
+    info: { Title: `${report.sponsor.name} at ${report.event.title}` },
+  });
+  const chunks: Buffer[] = [];
+  doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+  const done = new Promise<Buffer>((resolve) =>
+    doc.on('end', () => resolve(Buffer.concat(chunks))),
+  );
+  const ink = '#0f172a';
+  const muted = '#5b6577';
+  const heading = (text: string) => doc.moveDown(1.2).fontSize(13).fillColor(ink).text(text);
+  const row = (label: string, value: string | number) =>
+    doc
+      .fontSize(11)
+      .fillColor(muted)
+      .text(`${label}: `, { continued: true })
+      .fillColor(ink)
+      .text(String(value));
+  const { totals } = report;
+
+  doc.fontSize(10).fillColor(muted).text('FESTPASS SPONSOR REPORT', { characterSpacing: 2 });
+  doc.moveDown(0.5).fontSize(22).fillColor(ink).text(report.sponsor.name);
+  doc.fontSize(12).fillColor(muted).text(`${report.event.title} · ${eventDate}`);
+
+  heading('Visitors');
+  row('People who visited your booths', totals.uniqueVisitors);
+  row('Share of everyone who came', `${percent(totals.shareOfAttendance)} of ${totals.attendance}`);
+  row('Came back more than once', totals.repeatVisitors);
+  row('Visits in all', totals.visits);
+
+  heading('Booths');
+  for (const booth of report.booths) {
+    row(booth.name, `${booth.uniqueVisitors} visitors, ${booth.visits} visits`);
+  }
+
+  const perHour = new Map<string, number>();
+  for (const cell of report.heatmap)
+    perHour.set(cell.hour, (perHour.get(cell.hour) ?? 0) + cell.visits);
+  const busiest = [...perHour].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+  if (busiest) {
+    const hour = new Date(busiest[0]).toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: 'numeric',
+      hour12: true,
+    });
+    heading('Busiest hour');
+    row(`From ${hour}`, `${busiest[1]} visits`);
+  }
+
+  const label = (value: string | number | null) => (value === null ? 'Not given' : String(value));
+  heading('Visitors by branch');
+  for (const b of report.breakdown.branch) row(label(b.value), b.count);
+  heading('Visitors by graduation year');
+  for (const y of report.breakdown.graduationYear) row(label(y.value), y.count);
+
+  doc
+    .moveDown(2)
+    .fontSize(9)
+    .fillColor(muted)
+    .text(
+      `Counts only: no names or contact details are shared. Groups smaller than ${report.minGroupSize} people are counted under "Other".`,
+    );
   doc.end();
   return done;
 }

@@ -12,12 +12,20 @@ export interface InlineImage {
   type: 'image/png';
 }
 
+/** A file sent with the email, e.g. a PDF report. */
+export interface Attachment {
+  filename: string;
+  content: Buffer;
+  type: 'application/pdf';
+}
+
 export interface EmailMessage {
   to: { email: string; name: string };
   template: EmailTemplate;
   /** The dynamic template data: the fields each SendGrid template uses (see README "Email setup"). */
   data: Record<string, unknown>;
   inlineImages?: InlineImage[];
+  attachments?: Attachment[];
 }
 
 export interface EmailProvider {

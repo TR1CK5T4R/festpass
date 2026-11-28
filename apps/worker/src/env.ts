@@ -53,6 +53,7 @@ const schema = z
     SENDGRID_TEMPLATE_TICKET_CONFIRMATION: optional(z.string().startsWith('d-')),
     SENDGRID_TEMPLATE_ORDER_EXPIRED: optional(z.string().startsWith('d-')),
     SENDGRID_TEMPLATE_REFUND_ISSUED: optional(z.string().startsWith('d-')),
+    SENDGRID_TEMPLATE_SPONSOR_REPORT: optional(z.string().startsWith('d-')),
   })
   .superRefine((env, ctx) => {
     if (env.EMAIL_PROVIDER !== 'sendgrid') return;
@@ -61,6 +62,7 @@ const schema = z
       'SENDGRID_TEMPLATE_TICKET_CONFIRMATION',
       'SENDGRID_TEMPLATE_ORDER_EXPIRED',
       'SENDGRID_TEMPLATE_REFUND_ISSUED',
+      'SENDGRID_TEMPLATE_SPONSOR_REPORT',
     ] as const) {
       if (!env[name])
         ctx.addIssue({

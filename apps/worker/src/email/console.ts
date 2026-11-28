@@ -25,6 +25,10 @@ function render({ template, data }: EmailMessage, imageSrc: (cid: string) => str
       <h1>Your hold on ${escape(d.eventTitle)} ended</h1>
       <p>Hi ${escape(d.name)}, the tickets you held went back on sale because the payment didn't arrive in time. You weren't charged.</p>
       <p><a href="${escape(d.bookAgainUrl)}">Book again</a></p>`,
+    'sponsor-report': () => `
+      <h1>Your booth report for ${escape(d.eventTitle)}</h1>
+      <p>Hi ${escape(d.name)}, here is how ${escape(d.sponsorName)} did: ${escape(d.uniqueVisitors)} visitors (${escape(d.shareOfAttendance)} of everyone who came), ${escape(d.repeatVisitors)} of them more than once, ${escape(d.visits)} visits in all.</p>
+      <p>The full report is attached as a PDF.</p>`,
     'refund-issued': () => `
       <h1>Refund issued for ${escape(d.eventTitle)}</h1>
       <p>Hi ${escape(d.name)}, we refunded ${escape(d.amount)}: ${escape(d.reason)}.</p>
@@ -42,6 +46,9 @@ export function consoleProvider(dir: string, log: Logger): EmailProvider {
       await mkdir(dir, { recursive: true });
       for (const img of message.inlineImages ?? []) {
         await writeFile(join(dir, `${base}-${img.filename}`), img.content);
+      }
+      for (const file of message.attachments ?? []) {
+        await writeFile(join(dir, `${base}-${file.filename}`), file.content);
       }
       const file = join(dir, `${base}.html`);
       await writeFile(

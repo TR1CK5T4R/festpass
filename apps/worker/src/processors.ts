@@ -15,7 +15,14 @@ import { reconcileInventory } from '@festpass/db/inventory';
 import { orderStatus } from '@festpass/db/order-state';
 import { findPayment, markPaymentRefunded } from '@festpass/db/payments';
 import { issueTickets } from '@festpass/db/tickets';
-import { recordScanEvent } from '@festpass/mongo';
+import {
+  claimSponsorReport,
+  findSponsorForReport,
+  markSponsorReportSent,
+  releaseSponsorReportClaim,
+  type SponsorForReport,
+} from '@festpass/db/sponsors';
+import { recordScanEvent, sponsorAnalytics } from '@festpass/mongo';
 import {
   expireOrderJobSchema,
   formatPaise,
@@ -24,6 +31,7 @@ import {
   orderEmailJobSchema,
   refundPaymentJobSchema,
   scanEventJobSchema,
+  sponsorReportJobSchema,
   storageKeys,
   ticketQrPayload,
   type EmailTemplate,
@@ -40,7 +48,7 @@ import type { Job, Queue } from 'bullmq';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
 import type { EmailMessage, EmailProvider } from './email/provider.js';
-import { buildTicketsPdf, qrPng } from './pdf.js';
+import { buildSponsorReportPdf, buildTicketsPdf, qrPng } from './pdf.js';
 import type { RefundGateway } from './refunds.js';
 import type { TicketStorage } from './storage.js';
 
@@ -365,6 +373,69 @@ export function sendRefundIssued(data: unknown, deps: WorkerDeps) {
   }));
 }
 
+/**
+ * send-sponsor-report: after the event closes, one PDF of counts for the sponsor, emailed to each of its
+ * users. Runs in the worker because it reads every scan of the event, renders a PDF and calls an email
+ * provider: none of that should hold up the organizer's "close event" request, and a failure here is
+ * retried with backoff instead of failing that request. Safe to run any number of times: each
+ * recipient is claimed in sponsor_report_log before sending and marked after, so they get it once.
+ */
+export async function sendSponsorReport(data: unknown, deps: WorkerDeps) {
+  const { sponsorId, requestId } = sponsorReportJobSchema.parse(data);
+  const sponsor = await findSponsorForReport(sponsorId);
+  // The numbers are only final once the event is over; a job queued by mistake does nothing.
+  if (!sponsor || sponsor.event.status !== 'CLOSED') return { sent: 0 };
+
+  const claimed: SponsorForReport['members'][number]['user'][] = [];
+  for (const { user } of sponsor.members) {
+    if (await claimSponsorReport(sponsorId, user.id)) claimed.push(user);
+  }
+  if (claimed.length === 0) return { sent: 0 };
+
+  let sent = 0;
+  try {
+    const report = await sponsorAnalytics(sponsor);
+    const eventDate = formatEventDate(sponsor.event.startsAt);
+    const pdf = await buildSponsorReportPdf(report, eventDate);
+    const { totals } = report;
+    for (const user of claimed) {
+      await need(deps, 'email').send({
+        to: user,
+        template: 'sponsor-report',
+        data: {
+          name: user.name,
+          sponsorName: sponsor.name,
+          eventTitle: sponsor.event.title,
+          eventDate,
+          uniqueVisitors: totals.uniqueVisitors,
+          repeatVisitors: totals.repeatVisitors,
+          visits: totals.visits,
+          attendance: totals.attendance,
+          shareOfAttendance:
+            totals.shareOfAttendance === null
+              ? 'n/a'
+              : `${Math.round(totals.shareOfAttendance * 100)}%`,
+        },
+        attachments: [
+          {
+            filename: `festpass-${sponsor.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-report.pdf`,
+            content: pdf,
+            type: 'application/pdf',
+          },
+        ],
+      });
+      await markSponsorReportSent(sponsorId, user.id);
+      sent++;
+    }
+  } catch (err) {
+    // Whoever didn't get it yet can be claimed again by the retry straight away.
+    for (const user of claimed.slice(sent)) await releaseSponsorReportClaim(sponsorId, user.id);
+    throw err;
+  }
+  deps.log.info({ sponsorId, requestId, sent }, 'sponsor report sent');
+  return { sent };
+}
+
 /** Routes a job to its processor by name. */
 export function processJob(job: Job, deps: WorkerDeps) {
   const jobDeps = {
@@ -392,6 +463,8 @@ export function processJob(job: Job, deps: WorkerDeps) {
       return sendRefundIssued(job.data, jobDeps);
     case JOBS.admitWaitingRooms:
       return admitWaitingRooms(jobDeps);
+    case JOBS.sendSponsorReport:
+      return sendSponsorReport(job.data, jobDeps);
     default:
       throw new Error(`unknown job ${job.name}`);
   }

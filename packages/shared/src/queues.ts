@@ -12,6 +12,7 @@ export const QUEUES = {
   emails: 'emails',
   scans: 'scans',
   waitingRoom: 'waiting-room',
+  reports: 'reports',
 } as const;
 
 export const JOBS = {
@@ -25,10 +26,16 @@ export const JOBS = {
   sendRefundIssued: 'send-refund-issued',
   writeScanEvent: 'write-scan-event',
   admitWaitingRooms: 'admit-waiting-rooms',
+  sendSponsorReport: 'send-sponsor-report',
 } as const;
 
 /** The emails an order can get; each is sent at most once per order (email_log). */
-export const EMAIL_TEMPLATES = ['ticket-confirmation', 'order-expired', 'refund-issued'] as const;
+export const EMAIL_TEMPLATES = [
+  'ticket-confirmation',
+  'order-expired',
+  'refund-issued',
+  'sponsor-report',
+] as const;
 export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
 
 export const expireOrderJobSchema = z.object({
@@ -76,3 +83,10 @@ export const scanEventJobSchema = z.object({
   graduationYear: z.number().int().nullable(),
   tierName: z.string().nullable(),
 });
+
+/** A sponsor's post-event report, queued when its event closes (jobId = sponsor-report-{sponsorId}). */
+export const sponsorReportJobSchema = z.object({
+  sponsorId: z.uuid(),
+  requestId: z.string().optional(),
+});
+export type SponsorReportJob = z.infer<typeof sponsorReportJobSchema>;

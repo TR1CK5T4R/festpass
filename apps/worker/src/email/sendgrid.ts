@@ -13,19 +13,27 @@ export function sendGridProvider(options: {
 }): EmailProvider {
   sgMail.setApiKey(options.apiKey);
   return {
-    async send({ to, template, data, inlineImages = [] }: EmailMessage) {
+    async send({ to, template, data, inlineImages = [], attachments = [] }: EmailMessage) {
       await sgMail.send({
         to,
         from: options.from,
         templateId: options.templateIds[template],
         dynamicTemplateData: data,
-        attachments: inlineImages.map((img) => ({
-          content: img.content.toString('base64'),
-          filename: img.filename,
-          type: img.type,
-          disposition: 'inline',
-          contentId: img.contentId,
-        })),
+        attachments: [
+          ...inlineImages.map((img) => ({
+            content: img.content.toString('base64'),
+            filename: img.filename,
+            type: img.type,
+            disposition: 'inline',
+            contentId: img.contentId,
+          })),
+          ...attachments.map((file) => ({
+            content: file.content.toString('base64'),
+            filename: file.filename,
+            type: file.type,
+            disposition: 'attachment',
+          })),
+        ],
       });
     },
   };

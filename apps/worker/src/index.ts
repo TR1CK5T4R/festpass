@@ -51,6 +51,7 @@ const deps: WorkerDeps = {
             'ticket-confirmation': env.SENDGRID_TEMPLATE_TICKET_CONFIRMATION!,
             'order-expired': env.SENDGRID_TEMPLATE_ORDER_EXPIRED!,
             'refund-issued': env.SENDGRID_TEMPLATE_REFUND_ISSUED!,
+            'sponsor-report': env.SENDGRID_TEMPLATE_SPONSOR_REPORT!,
           },
         })
       : consoleProvider(env.EMAIL_PREVIEW_DIR, logger),
