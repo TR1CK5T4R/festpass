@@ -14,6 +14,7 @@ const DEVICE = 'demo-analytics';
 const { prisma } = await import('@festpass/db');
 const { reconcileInventory } = await import('@festpass/db/inventory');
 const { connectMongo, disconnectMongo, ScanEvent } = await import('@festpass/mongo');
+type ScanEventData = import('@festpass/mongo').ScanEventData;
 
 let seed = 2026;
 const random = () => {
@@ -116,7 +117,7 @@ const arrival = () => {
   return new Date(opens + Math.floor((0.15 + spread * 0.85) * 3 * 3_600_000) - 30 * 60_000);
 };
 const byId = new Map(buyers.map((b) => [b.id, b]));
-const scans = [];
+const scans: ScanEventData[] = [];
 for (const t of tickets) {
   if (random() > 0.85) continue;
   const owner = byId.get(t.userId)!;
@@ -160,6 +161,35 @@ for (let i = 0; i < 5; i++) {
     tierName: null,
   });
 }
+// Sponsor booths: the seeded sponsor gets a second booth, and about half the people who came in stop
+// by, some twice, mostly mid-morning, so the sponsor dashboard and its heatmap have something to show.
+const sponsor = await prisma.sponsor.findFirst({
+  where: { eventId: event.id },
+  orderBy: { name: 'asc' },
+});
+if (sponsor) {
+  await prisma.booth.upsert({
+    where: { sponsorId_name: { sponsorId: sponsor.id, name: 'Demo corner' } },
+    update: {},
+    create: { sponsorId: sponsor.id, name: 'Demo corner' },
+  });
+  const booths = await prisma.booth.findMany({
+    where: { sponsorId: sponsor.id },
+    orderBy: { name: 'asc' },
+  });
+  for (const entry of scans.filter((s) => s.result === 'ACCEPTED')) {
+    if (random() > 0.5) continue;
+    const trips = random() < 0.2 ? 2 : 1;
+    for (let trip = 0; trip < trips; trip++) {
+      scans.push({
+        ...entry,
+        ts: new Date(entry.ts.getTime() + (20 + Math.floor(random() * 150)) * 60_000),
+        meta: { eventId: event.id, type: 'BOOTH' as const, gateOrBoothId: pick(booths).id },
+        offline: false,
+      });
+    }
+  }
+}
 await ScanEvent.insertMany(scans);
 
 // The booking gate learns the new stock, so the event page shows the right numbers at once.
@@ -167,9 +197,10 @@ const redis = new Redis(process.env.REDIS_URL!);
 await reconcileInventory(redis, { eventId: event.id });
 await redis.quit();
 
-const entered = scans.filter((s) => s.result === 'ACCEPTED').length;
+const entered = scans.filter((s) => s.result === 'ACCEPTED' && s.meta.type === 'GATE').length;
+const boothVisits = scans.filter((s) => s.meta.type === 'BOOTH').length;
 console.log(
-  `demo analytics for ${SLUG}: ${buyers.length} buyers, ${tickets.length} tickets, ${entered} entries, ${scans.length} gate scans`,
+  `demo analytics for ${SLUG}: ${buyers.length} buyers, ${tickets.length} tickets, ${entered} entries, ${scans.length - boothVisits} gate scans, ${boothVisits} booth visits`,
 );
 await disconnectMongo();
 await prisma.$disconnect();
