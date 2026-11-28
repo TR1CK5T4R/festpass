@@ -48,6 +48,11 @@
       "development": "./src/analytics.ts",
       "types": "./dist/analytics.d.ts",
       "default": "./dist/analytics.js"
+    },
+    "./sponsors": {
+      "development": "./src/sponsors.ts",
+      "types": "./dist/sponsors.d.ts",
+      "default": "./dist/sponsors.js"
     }
   },
   "scripts": {

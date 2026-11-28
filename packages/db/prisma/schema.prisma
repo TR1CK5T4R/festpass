@@ -66,6 +66,7 @@ model User {
   tickets           Ticket[]        @relation("TicketOwner")
   checkedInTickets  Ticket[]        @relation("TicketCheckedInBy")
   sponsorMembership SponsorMember[]
+  sponsorReports    SponsorReportLog[]
   idempotencyKeys   IdempotencyKey[]
 
   @@map("users")
@@ -267,6 +268,7 @@ model Sponsor {
   event   Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
   members SponsorMember[]
   booths  Booth[]
+  reports SponsorReportLog[]
 
   @@unique([eventId, name])
   @@map("sponsors")
@@ -329,4 +331,21 @@ model EmailLog {
 
   @@unique([orderId, template])
   @@map("email_log")
+}
+
+// The post-event report, sent once to each of a sponsor's users. Same idea as email_log: sent_at records
+// success, claimed_at is a short lease so a retry racing a slow first run doesn't send twice.
+model SponsorReportLog {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sponsorId String    @map("sponsor_id") @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  claimedAt DateTime? @map("claimed_at") @db.Timestamptz
+  sentAt    DateTime? @map("sent_at") @db.Timestamptz
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  sponsor Sponsor @relation(fields: [sponsorId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([sponsorId, userId])
+  @@map("sponsor_report_log")
 }
