@@ -152,7 +152,7 @@ async function decide(
  * with long backoff (the worker). The check-in is never undone: a gate must keep working during a
  * MongoDB outage, and a late analytics row is far better than a person sent back.
  */
-async function persistScan(event: ScanEventData) {
+export async function persistScan(event: ScanEventData) {
   try {
     await recordScanEvent(event);
   } catch (err) {

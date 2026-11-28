@@ -10,6 +10,12 @@ import { orgEventRoutes, publicEventRoutes } from './modules/events/routes.js';
 import { healthRoutes } from './modules/health/routes.js';
 import { adminApiRoutes, queueDashboard } from './modules/admin/routes.js';
 import { analyticsRoutes } from './modules/analytics/routes.js';
+import {
+  boothRoutes,
+  eventBoothRoutes,
+  orgSponsorRoutes,
+  sponsorPortalRoutes,
+} from './modules/sponsors/routes.js';
 import { checkinRoutes } from './modules/checkins/routes.js';
 import { orderActionRoutes, orderRoutes } from './modules/orders/routes.js';
 import { paymentRoutes } from './modules/payments/routes.js';
@@ -61,11 +67,15 @@ export function createApp({ readinessChecks = defaultReadinessChecks, rateLimits
   app.use('/api/v1/health', healthRoutes(readinessChecks));
   app.use('/api/v1/auth', authRoutes(limits));
   app.use('/api/v1/orgs/:orgId/events/:eventId/analytics', analyticsRoutes());
+  app.use('/api/v1/orgs/:orgId/events/:eventId/sponsors', orgSponsorRoutes());
   app.use('/api/v1/orgs/:orgId/events', orgEventRoutes());
   app.use('/api/v1/orgs', orgRoutes());
   app.use('/api/v1/events/:eventId/orders', orderRoutes(limits.orders));
   app.use('/api/v1/events/:eventId/queue', queueRoutes(limits.queueJoin));
   app.use('/api/v1/events/:eventId/checkins', checkinRoutes());
+  app.use('/api/v1/events/:eventId/booths', eventBoothRoutes());
+  app.use('/api/v1/booths', boothRoutes());
+  app.use('/api/v1/sponsors', sponsorPortalRoutes());
   app.use('/api/v1/orders', orderActionRoutes());
   app.use('/api/v1/orders', paymentRoutes());
   app.use('/api/v1/orders', orderTicketRoutes());

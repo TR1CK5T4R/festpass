@@ -13,3 +13,5 @@ export const emailsQueue = createQueue(QUEUES.emails, gateRedis);
 export const scansQueue = createQueue(QUEUES.scans, gateRedis);
 // The API adds nothing here (the worker schedules its own ticks); this puts failed ticks in Bull Board.
 export const waitingRoomQueue = createQueue(QUEUES.waitingRoom, gateRedis);
+// Sponsor reports, queued when an event closes (the worker builds and emails them).
+export const reportsQueue = createQueue(QUEUES.reports, gateRedis);

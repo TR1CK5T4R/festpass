@@ -19,6 +19,7 @@ import { slugify } from '../../lib/slug.js';
 import { revalidateEventPages } from '../../lib/revalidate.js';
 import { publicUrl } from '../../lib/storage.js';
 import { syncInventory } from '../orders/inventory.js';
+import { queueSponsorReports } from '../sponsors/service.js';
 import { verifyBanner } from '../uploads/service.js';
 import * as repo from './repository.js';
 import { assertTransition } from './status.js';
@@ -157,6 +158,8 @@ export async function closeEvent(orgId: string, eventId: string) {
   assertTransition(event.status, 'CLOSED');
   if (!(await repo.transitionStatus(eventId, 'PUBLISHED', 'CLOSED'))) throw statusChanged();
   await refreshPublicPages({ slug: event.slug, status: 'CLOSED' });
+  // After the commit: the sale and the booths are over, so each sponsor's report can be built now.
+  await queueSponsorReports(eventId);
   return getEvent(orgId, eventId);
 }
 

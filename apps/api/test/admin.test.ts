@@ -51,6 +51,7 @@ describe('job dashboard (Bull Board) access', () => {
       'inventory',
       'orders',
       'payments',
+      'reports',
       'scans',
       'tickets',
       'waiting-room',
