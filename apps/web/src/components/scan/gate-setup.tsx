@@ -1,6 +1,12 @@
 'use client';
 
-import { can, type EventSummary, type OrgSummary, type Page } from '@festpass/shared';
+import {
+  can,
+  type BoothOption,
+  type EventSummary,
+  type OrgSummary,
+  type Page,
+} from '@festpass/shared';
 import { useState, type FormEvent } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -22,6 +28,13 @@ export function GateSetup({ onOpen }: { onOpen: (gate: SavedGate) => void }) {
   const [pickedEvent, setPickedEvent] = useState<string | null>(null);
   const eventId = open.some((e) => e.id === pickedEvent) ? pickedEvent : (open[0]?.id ?? null);
   const [gateId, setGateId] = useState('main');
+  const [mode, setMode] = useState<'gate' | 'booth'>('gate');
+  const booths = useApiData<{ booths: BoothOption[] }>(
+    mode === 'booth' && eventId ? `/events/${eventId}/booths` : null,
+  );
+  const [pickedBooth, setPickedBooth] = useState<string | null>(null);
+  const boothList = booths.data?.booths ?? [];
+  const booth = boothList.find((b) => b.id === pickedBooth) ?? boothList[0];
 
   const error = orgs.error ?? events.error;
   if (error) return <p className="text-sm text-danger">{errorMessage(error)}</p>;
@@ -38,8 +51,12 @@ export function GateSetup({ onOpen }: { onOpen: (gate: SavedGate) => void }) {
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const event = open.find((candidate) => candidate.id === eventId);
-    if (event)
-      onOpen({ eventId: event.id, eventTitle: event.title, gateId: gateId.trim() || 'main' });
+    if (!event) return;
+    if (mode === 'booth') {
+      if (booth) onOpen({ eventId: event.id, eventTitle: event.title, gateId: booth.id, booth });
+      return;
+    }
+    onOpen({ eventId: event.id, eventTitle: event.title, gateId: gateId.trim() || 'main' });
   };
 
   return (
@@ -70,15 +87,39 @@ export function GateSetup({ onOpen }: { onOpen: (gate: SavedGate) => void }) {
             ))}
           </Select>
         )}
-        <Input
-          label="Gate"
-          value={gateId}
-          maxLength={100}
-          hint="Any name, e.g. north-gate. Reports count scans per gate."
-          onChange={(e) => setGateId(e.target.value)}
-        />
-        <Button type="submit" disabled={!eventId}>
-          Open gate
+        <Select
+          label="Scan for"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as 'gate' | 'booth')}
+        >
+          <option value="gate">Entry gate</option>
+          <option value="booth">A sponsor booth (counts visits)</option>
+        </Select>
+        {mode === 'gate' ? (
+          <Input
+            label="Gate"
+            value={gateId}
+            maxLength={100}
+            hint="Any name, e.g. north-gate. Reports count scans per gate."
+            onChange={(e) => setGateId(e.target.value)}
+          />
+        ) : booths.data && boothList.length === 0 ? (
+          <p className="text-sm text-muted">This event has no sponsor booths yet.</p>
+        ) : (
+          <Select
+            label="Booth"
+            value={booth?.id ?? ''}
+            onChange={(e) => setPickedBooth(e.target.value)}
+          >
+            {boothList.map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.sponsorName}: {b.name}
+              </option>
+            ))}
+          </Select>
+        )}
+        <Button type="submit" disabled={!eventId || (mode === 'booth' && !booth)}>
+          {mode === 'gate' ? 'Open gate' : 'Open booth'}
         </Button>
       </form>
     </Card>

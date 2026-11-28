@@ -8,6 +8,7 @@ import { BannerUploader } from '@/components/events/banner-uploader';
 import { EventActions } from '@/components/events/event-actions';
 import { EventAnalytics } from '@/components/events/event-analytics';
 import { EventForm } from '@/components/events/event-form';
+import { SponsorManager } from '@/components/events/sponsor-manager';
 import { LiveCheckins } from '@/components/events/live-checkins';
 import { StatusBadge } from '@/components/events/status-badge';
 import { TierEditor } from '@/components/events/tier-editor';
@@ -83,6 +84,7 @@ export default function EventPage() {
       )}
       <BannerUploader event={event} canEdit={canEdit} onChange={setEvent} />
       <TierEditor event={event} canEdit={canEdit} onChanged={reload} />
+      {can(role, 'event:update') && <SponsorManager orgId={orgId} eventId={event.id} />}
       <Card>
         <h2 className="mb-4 font-semibold">Details</h2>
         <EventForm

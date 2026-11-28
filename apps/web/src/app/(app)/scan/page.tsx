@@ -2,6 +2,7 @@
 
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import { BoothView } from '@/components/scan/booth-view';
 import { GateSetup } from '@/components/scan/gate-setup';
 import { GateView } from '@/components/scan/gate-view';
 import { useAuth } from '@/lib/auth';
@@ -45,6 +46,17 @@ export default function ScanPage() {
     setSettings({ ...settings, gate });
   };
 
+  const { gate } = settings;
+  if (gate?.booth) {
+    return (
+      <BoothView
+        key={gate.booth.id}
+        gate={{ ...gate, booth: gate.booth }}
+        deviceId={settings.deviceId}
+        onChangeGate={() => void choose(null)}
+      />
+    );
+  }
   if (settings.gate) {
     return (
       <GateView

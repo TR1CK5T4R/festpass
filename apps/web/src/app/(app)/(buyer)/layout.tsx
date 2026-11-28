@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { Suspense, useEffect, type ReactNode } from 'react';
 import { useAuth } from '@/lib/auth';
+import { useApiData } from '@/lib/use-api-data';
 
 /**
  * Booking and checkout need a logged-in buyer. A logged-out visitor is sent to log in and comes back
@@ -13,6 +14,10 @@ export default function BuyerLayout({ children }: { children: ReactNode }) {
   const auth = useAuth();
   const router = useRouter();
   const pathname = usePathname();
+  // Only sponsor users see the link; for everyone else this answers an empty list.
+  const sponsorships = useApiData<{ sponsorships: unknown[] }>(
+    auth.status === 'authenticated' ? '/sponsors/mine' : null,
+  );
 
   useEffect(() => {
     if (auth.status === 'anonymous') {
@@ -35,7 +40,15 @@ export default function BuyerLayout({ children }: { children: ReactNode }) {
           <Link href="/" className="text-lg font-bold tracking-tight">
             FestPass
           </Link>
-          <Link href="/tickets" className="ml-auto text-sm text-muted hover:text-ink">
+          {(sponsorships.data?.sponsorships.length ?? 0) > 0 && (
+            <Link href="/sponsor" className="ml-auto text-sm text-muted hover:text-ink">
+              Sponsor portal
+            </Link>
+          )}
+          <Link
+            href="/tickets"
+            className={`text-sm text-muted hover:text-ink ${(sponsorships.data?.sponsorships.length ?? 0) > 0 ? '' : 'ml-auto'}`}
+          >
             My tickets
           </Link>
           <span className="text-sm text-muted">{auth.user.name}</span>

@@ -7,6 +7,8 @@ export interface SavedGate {
   eventId: string;
   eventTitle: string;
   gateId: string;
+  /** Set in booth mode: this phone counts visits to a sponsor's booth instead of letting people in. */
+  booth?: { id: string; name: string; sponsorName: string };
 }
 
 interface ScannerDb extends DBSchema {
